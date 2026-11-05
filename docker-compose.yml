@@ -64,7 +64,7 @@ services:
       labels:
         - "traefik.enable=true"
         # Authentik SSO for web/browser API requests under /api/*
-        - "traefik.http.routers.plutus-api.rule=Host(`plutus.${DOMAIN_NAME}`) && PathPrefix(`/api`)"
+        - "traefik.http.routers.plutus-api.rule=Host(`plutus.${DOMAIN_NAME}`, `midas.${DOMAIN_NAME}`) && PathPrefix(`/api`)"
         - "traefik.http.routers.plutus-api.entrypoints=websecure"
         - "traefik.http.routers.plutus-api.tls=true"
         - "traefik.http.routers.plutus-api.tls.certresolver=cloudflare"
