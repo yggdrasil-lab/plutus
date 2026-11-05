@@ -116,9 +116,11 @@ class RunwayTierBreakdown(BaseModel):
     total_liquid_balance: float
     emergency_weeks: float
     growth_weeks: Optional[float] = None
+    locked_weeks: Optional[float] = None
     is_perpetual: bool
     perpetual_threshold_weekly_income: float
     weekly_burn_rate: float
+    tier_labels: dict[str, str] = Field(default_factory=dict)
 
 
 class RunwayResponse(BaseModel):

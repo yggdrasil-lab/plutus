@@ -128,6 +128,24 @@ def get_current_runway(
     # Time banked this week
     time_banked = calculate_time_banked(target_budget, this_week_spend)
 
+    # Locked runway: weeks of expenses preserved in locked/pension tier
+    locked_weeks = round(locked_bal / weekly_burn, 1) if weekly_burn > 0 else 0.0
+
+    # Resolve dynamic tier labels from actual active accounts
+    active_accounts = db.scalars(select(Account).where(Account.is_active == True)).all()
+    locked_accs = [a.name for a in active_accounts if a.tier.lower() == "locked"]
+    locked_label = locked_accs[0] if len(locked_accs) == 1 else "Locked Reserve"
+    growth_accs = [a.name for a in active_accounts if a.tier.lower() == "growth"]
+    growth_label = growth_accs[0] if len(growth_accs) == 1 else "Growth"
+    cash_accs = [a.name for a in active_accounts if a.tier.lower() == "cash" and a.account_type != "credit_card"]
+    cash_label = cash_accs[0] if len(cash_accs) == 1 else "Cash Floor"
+
+    tier_labels = {
+        "cash": cash_label,
+        "growth": growth_label,
+        "locked": locked_label,
+    }
+
     breakdown = RunwayTierBreakdown(
         cash_balance=cash_bal,
         growth_balance=growth_bal,
@@ -135,9 +153,11 @@ def get_current_runway(
         total_liquid_balance=total_liquid,
         emergency_weeks=emergency_weeks,
         growth_weeks=growth_weeks,
+        locked_weeks=locked_weeks,
         is_perpetual=is_perpetual,
         perpetual_threshold_weekly_income=perpetual_threshold_income,
         weekly_burn_rate=weekly_burn,
+        tier_labels=tier_labels,
     )
 
     # Categories for quick spend tagging
