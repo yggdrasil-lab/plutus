@@ -27,6 +27,7 @@ from app.services.runway import (
     calculate_time_banked,
     calculate_weekly_growth_rate,
 )
+from app.services.seed import clear_all_data, seed_initial_data
 from app.services.statement_parser import generate_transaction_hash
 
 
@@ -193,6 +194,18 @@ def build_mcp_server() -> MCPServer:
             db.add(snap)
             db.commit()
             return json.dumps({"status": "created", "account": account.name, "balance": balance, "date": snap_dt.isoformat()})
+
+    @server.tool(name="plutus_seed_test_data", description="Seed initial realistic financial baseline dataset for testing.")
+    def plutus_seed_test_data() -> str:
+        with mcp_session() as db:
+            result = seed_initial_data(db)
+            return json.dumps(result, indent=2)
+
+    @server.tool(name="plutus_clear_data", description="Clear all transactions, snapshots, and budgets to prepare for real data.")
+    def plutus_clear_data(clear_accounts: bool = False) -> str:
+        with mcp_session() as db:
+            result = clear_all_data(db, clear_accounts=clear_accounts)
+            return json.dumps(result, indent=2)
 
     return server
 

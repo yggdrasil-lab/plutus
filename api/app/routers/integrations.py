@@ -32,8 +32,14 @@ router = APIRouter(prefix="/integrations", tags=["Integrations"])
 def verify_integration_token(
     authorization: Optional[str] = Header(None),
     secret: Optional[str] = Query(None),
+    x_authentik_username: Optional[str] = Header(None, alias="X-authentik-username"),
+    x_authentik_email: Optional[str] = Header(None, alias="X-authentik-email"),
 ) -> bool:
-    """Validate bearer token from Authorization header or secret query parameter."""
+    """Validate bearer token from Authorization header, secret query parameter, or Authentik SSO forwarded session."""
+    if x_authentik_username or x_authentik_email:
+        # Authenticated through Traefik Authentik forward-auth proxy
+        return True
+
     valid_tokens = [t for t in (settings.mcp_token, settings.webhook_secret) if t]
     if not valid_tokens:
         # Development mode without configured tokens
@@ -149,10 +155,34 @@ async def upload_statement(
             detail="Unsupported file format. Please upload a .pdf or .csv statement.",
         )
 
-    if commit and account_id:
-        account = db.get(Account, account_id)
+    if commit:
+        account = None
+        if account_id:
+            account = db.get(Account, account_id)
+        if not account and institution:
+            account = db.scalar(
+                select(Account).where(
+                    Account.institution.ilike(f"%{institution}%"),
+                    Account.is_active == True,
+                )
+            )
         if not account:
-            raise HTTPException(status_code=404, detail="Target account for commit not found")
+            inst_lower = institution.lower()
+            tier = "locked" if "simplicity" in inst_lower or "kiwi" in inst_lower else "growth" if "sharesies" in inst_lower or "kernel" in inst_lower else "cash"
+            account = Account(
+                name=f"{institution} Account",
+                account_type="savings" if tier == "cash" else "brokerage" if tier == "growth" else "kiwisaver",
+                tier=tier,
+                institution=institution,
+                currency=parse_result.currency,
+                expected_annual_return=0.06 if tier == "growth" else 0.05 if tier == "locked" else 0.0,
+                is_active=True,
+            )
+            db.add(account)
+            db.commit()
+            db.refresh(account)
+
+        target_account_id = account.id
 
         # 1. Commit transactions with deduplication
         for ptx in parse_result.transactions:
@@ -160,13 +190,13 @@ async def upload_statement(
                 tx_date=ptx.transaction_date,
                 amount=ptx.amount,
                 merchant=ptx.merchant,
-                account_id=account_id,
+                account_id=target_account_id,
             )
             existing = db.scalar(select(Transaction).where(Transaction.raw_hash == raw_hash))
             if not existing:
                 tx = Transaction(
                     transaction_date=ptx.transaction_date,
-                    account_id=account_id,
+                    account_id=target_account_id,
                     amount=ptx.amount,
                     currency=parse_result.currency,
                     merchant=ptx.merchant,
@@ -181,7 +211,7 @@ async def upload_statement(
             bal_nzd = parse_result.closing_balance
             existing_snap = db.scalar(
                 select(AssetSnapshot).where(
-                    AssetSnapshot.account_id == account_id,
+                    AssetSnapshot.account_id == target_account_id,
                     AssetSnapshot.snapshot_date == parse_result.end_date,
                 )
             )
@@ -191,7 +221,7 @@ async def upload_statement(
                 existing_snap.source = "statement_pdf" if filename.endswith(".pdf") else "statement_csv"
             else:
                 snap = AssetSnapshot(
-                    account_id=account_id,
+                    account_id=target_account_id,
                     snapshot_date=parse_result.end_date,
                     balance=parse_result.closing_balance,
                     currency=parse_result.currency,

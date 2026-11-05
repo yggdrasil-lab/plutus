@@ -64,10 +64,12 @@ services:
       labels:
         - "traefik.enable=true"
         # Authentik SSO for web/browser API requests under /api/*
-        - "traefik.http.routers.plutus-api.rule=Host(`plutus.${DOMAIN_NAME}`, `midas.${DOMAIN_NAME}`) && PathPrefix(`/api`)"
+        - "traefik.http.routers.plutus-api.rule=(Host(`plutus.${DOMAIN_NAME}`) || Host(`midas.${DOMAIN_NAME}`)) && PathPrefix(`/api`)"
         - "traefik.http.routers.plutus-api.entrypoints=websecure"
         - "traefik.http.routers.plutus-api.tls=true"
         - "traefik.http.routers.plutus-api.tls.certresolver=cloudflare"
+        - "traefik.http.routers.plutus-api.priority=20"
+        - "traefik.http.routers.plutus-api.service=plutus-api"
         - "traefik.http.routers.plutus-api.middlewares=authentik@docker,plutus-api-strip"
         - "traefik.http.middlewares.plutus-api-strip.stripprefix.prefixes=/api"
         # Machine-to-machine integrations endpoint (iOS Shortcuts, Siri, Apple Pay webhooks)
