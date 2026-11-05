@@ -140,6 +140,19 @@ def get_current_runway(
         weekly_burn_rate=weekly_burn,
     )
 
+    # Categories for quick spend tagging
+    active_categories = db.scalars(
+        select(BudgetRule.category)
+        .where(BudgetRule.is_active == True)
+        .order_by(BudgetRule.category)
+    ).all()
+    categories = list(active_categories)
+    if not categories:
+        tx_cats = db.scalars(select(Transaction.category).distinct()).all()
+        categories = sorted(list(set(c for c in tx_cats if c)))
+    if not categories:
+        categories = ["Groceries", "Dining", "Transport", "Subscriptions", "Housing", "General"]
+
     return RunwayResponse(
         as_of_date=today,
         primary_runway_weeks=primary_weeks,
@@ -149,6 +162,7 @@ def get_current_runway(
         weekly_spend_this_week=this_week_spend,
         weekly_budget_target=target_budget,
         breakdown=breakdown,
+        categories=categories,
     )
 
 

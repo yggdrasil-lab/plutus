@@ -55,6 +55,18 @@ class TestStatementParser(unittest.TestCase):
         self.assertEqual(result.transactions[1].category, "Transport")
         self.assertEqual(result.transactions[2].category, "Food")
 
+    def test_parse_sample_statement_format(self):
+        """Verify sample statement format parses correctly."""
+        from app.routers.integrations import get_sample_statement
+
+        sample_csv = get_sample_statement(institution="ASB")
+        result = parse_csv_statement(sample_csv, institution="ASB")
+        self.assertEqual(result.transaction_count, 5)
+        self.assertGreater(len(result.transactions), 0)
+        self.assertEqual(result.transactions[0].merchant, "PAK N SAVE ALBANY")
+        self.assertEqual(result.transactions[0].category, "Groceries")
+        self.assertEqual(result.transactions[0].amount, -142.50)
+
 
 if __name__ == "__main__":
     unittest.main()
