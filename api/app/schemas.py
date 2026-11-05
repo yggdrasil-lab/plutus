@@ -130,6 +130,7 @@ class RunwayResponse(BaseModel):
     weekly_spend_this_week: float
     weekly_budget_target: float
     breakdown: RunwayTierBreakdown
+    categories: list[str] = Field(default_factory=list)
 
 
 class RunwayScenarioRequest(BaseModel):
