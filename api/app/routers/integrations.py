@@ -21,7 +21,9 @@ from app.config import settings
 from app.db import get_db
 from app.models import Account, AssetSnapshot, Transaction
 from app.schemas import QuickLogRequest, StatementParseResult, TransactionRead
+from app.services.jev_client import classify_transaction_jev
 from app.services.statement_parser import (
+    auto_categorize,
     generate_transaction_hash,
     parse_csv_statement,
     parse_pdf_statement,
@@ -115,16 +117,29 @@ def quick_log_expense(
     if existing:
         return existing
 
+    # Category resolution via Jev System One or rule-based fallback
+    category = payload.category
+    notes = payload.notes
+    if not category or category == "General":
+        jev_cat, is_anomaly = classify_transaction_jev(payload.merchant, payload.amount, payload.notes)
+        if jev_cat and jev_cat != "General":
+            category = jev_cat
+        else:
+            category = auto_categorize(payload.merchant)
+        if is_anomaly:
+            anomaly_tag = "[Anomaly Detected]"
+            notes = f"{notes} {anomaly_tag}".strip() if notes else anomaly_tag
+
     tx = Transaction(
         transaction_date=tx_date,
         account_id=target_account.id,
         amount=spend_amount,
         currency="NZD",
         merchant=payload.merchant,
-        category=payload.category,
+        category=category,
         raw_description=f"QuickLog: {payload.merchant}",
         raw_hash=raw_hash,
-        notes=payload.notes,
+        notes=notes,
     )
     db.add(tx)
     db.commit()
@@ -219,13 +234,17 @@ async def upload_statement(
             )
             existing = db.scalar(select(Transaction).where(Transaction.raw_hash == raw_hash))
             if not existing:
+                tx_cat = ptx.category
+                if not tx_cat or tx_cat == "General":
+                    jev_cat, _ = classify_transaction_jev(ptx.merchant, ptx.amount)
+                    tx_cat = jev_cat if jev_cat and jev_cat != "General" else auto_categorize(ptx.merchant)
                 tx = Transaction(
                     transaction_date=ptx.transaction_date,
                     account_id=target_account_id,
                     amount=ptx.amount,
                     currency=parse_result.currency,
                     merchant=ptx.merchant,
-                    category=ptx.category,
+                    category=tx_cat,
                     raw_description=ptx.raw_description,
                     raw_hash=raw_hash,
                 )

@@ -41,6 +41,9 @@ services:
       - PLUTUS_DATABASE_URL=postgresql+psycopg://plutus:plutus@plutus-db:5432/plutus
       - PLUTUS_ENVIRONMENT=production
       - PLUTUS_MCP_TOKEN_FILE=/run/secrets/plutus_mcp_token
+      - PLUTUS_LLM_BASE_URL=${PLUTUS_LLM_BASE_URL}
+      - PLUTUS_LLM_API_KEY=${PLUTUS_LLM_API_KEY}
+      - PLUTUS_LLM_MODEL=${PLUTUS_LLM_MODEL}
       - TZ=Pacific/Auckland
     secrets:
       - plutus_mcp_token
