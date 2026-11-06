@@ -47,6 +47,10 @@ jobs:
           PLUTUS_LLM_BASE_URL: ${{ vars.PLUTUS_LLM_BASE_URL || 'http://muninn:4000/v1' }}
           PLUTUS_LLM_API_KEY: ${{ secrets.MUNINN_MASTER_KEY || vars.PLUTUS_LLM_API_KEY }}
           PLUTUS_LLM_MODEL: ${{ vars.PLUTUS_LLM_MODEL || 'app-synthesize' }}
+          PLUTUS_DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN || secrets.PLUTUS_DISCORD_BOT_TOKEN || '' }}
+          PLUTUS_DISCORD_WEALTH_CHANNEL_ID: ${{ vars.DISCORD_CHANNEL_WEALTH_ID || vars.PLUTUS_DISCORD_WEALTH_CHANNEL_ID || '' }}
+          PLUTUS_DISCORD_USER_ID: ${{ vars.DISCORD_USER_ID || vars.PLUTUS_DISCORD_USER_ID || '' }}
+          PLUTUS_DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEALTH_WEBHOOK_URL || secrets.PLUTUS_DISCORD_WEBHOOK_URL || '' }}
           IMAGE_TAG: plutus
         run: |
           curl -fsSL https://raw.githubusercontent.com/yggdrasil-lab/yggdrasil-os/main/deploy/deploy.sh -o /tmp/deploy.sh

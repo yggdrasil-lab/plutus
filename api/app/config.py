@@ -1,5 +1,6 @@
 """Configuration management for Plutus API."""
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,6 +18,30 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_model: str = "app-synthesize"
     jev_model: str = "jev-decision"
+    discord_bot_token: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("PLUTUS_DISCORD_BOT_TOKEN", "DISCORD_BOT_TOKEN"),
+    )
+    discord_wealth_channel_id: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "PLUTUS_DISCORD_WEALTH_CHANNEL_ID",
+            "DISCORD_CHANNEL_WEALTH_ID",
+            "DISCORD_WEALTH_CHANNEL_ID",
+        ),
+    )
+    discord_user_id: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("PLUTUS_DISCORD_USER_ID", "DISCORD_USER_ID"),
+    )
+    discord_webhook_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "PLUTUS_DISCORD_WEBHOOK_URL",
+            "DISCORD_WEALTH_WEBHOOK_URL",
+            "DISCORD_WEBHOOK_URL",
+        ),
+    )
 
     model_config = SettingsConfigDict(
         env_prefix="PLUTUS_",
