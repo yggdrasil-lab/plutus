@@ -13,6 +13,10 @@ class Settings(BaseSettings):
     timezone: str = "Pacific/Auckland"
     base_currency: str = "NZD"
     default_inflation_rate: float = 0.025
+    llm_base_url: str = "http://muninn:4000/v1"
+    llm_api_key: str = ""
+    llm_model: str = "app-synthesize"
+    jev_model: str = "jev-decision"
 
     model_config = SettingsConfigDict(
         env_prefix="PLUTUS_",

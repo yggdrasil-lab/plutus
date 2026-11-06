@@ -44,6 +44,9 @@ jobs:
           REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
           DOMAIN_NAME: ${{ vars.DOMAIN_NAME }}
           PLUTUS_DB_MOUNT_PATH: ${{ vars.PLUTUS_DB_MOUNT_PATH || '/opt/plutus/data' }}
+          PLUTUS_LLM_BASE_URL: ${{ vars.PLUTUS_LLM_BASE_URL || 'http://muninn:4000/v1' }}
+          PLUTUS_LLM_API_KEY: ${{ secrets.MUNINN_MASTER_KEY || vars.PLUTUS_LLM_API_KEY }}
+          PLUTUS_LLM_MODEL: ${{ vars.PLUTUS_LLM_MODEL || 'app-synthesize' }}
           IMAGE_TAG: plutus
         run: |
           curl -fsSL https://raw.githubusercontent.com/yggdrasil-lab/yggdrasil-os/main/deploy/deploy.sh -o /tmp/deploy.sh

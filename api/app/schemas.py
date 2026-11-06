@@ -148,4 +148,24 @@ class RunwayScenarioResponse(BaseModel):
     delta_weeks_compared_to_baseline: Optional[float]
 
 
+class RunwaySynthesizeRequest(BaseModel):
+    weekly_burn_adjustment: float = Field(default=0.0, description="Proposed adjustment in $/week")
+    custom_annual_return: Optional[float] = Field(default=None, ge=0.0, le=0.5, description="Custom real return rate")
+    lump_sum_adjustment: float = Field(default=0.0, description="One-time asset injection or withdrawal")
+    custom_context: Optional[str] = Field(default=None, description="User notes, lifestyle shifts, or sabbatical goals")
+
+
+class RunwayAiSynthesisRead(BaseModel):
+    headline: str
+    recommendations: list[str] = Field(default_factory=list)
+    rationale: str
+    research_citation: str
+    impact_summary: str
+    is_llm_generated: bool = True
+    simulated_runway_weeks: Optional[float] = None
+    simulated_runway_years: Optional[float] = None
+    is_perpetual: bool = False
+    delta_weeks_compared_to_baseline: Optional[float] = None
+
+
 from app.services.statement_parser import ParsedTransaction, StatementParseResult

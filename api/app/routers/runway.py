@@ -11,11 +11,14 @@ from app.config import settings
 from app.db import get_db
 from app.models import Account, AssetSnapshot, BudgetRule, Transaction
 from app.schemas import (
+    RunwayAiSynthesisRead,
     RunwayResponse,
     RunwayScenarioRequest,
     RunwayScenarioResponse,
+    RunwaySynthesizeRequest,
     RunwayTierBreakdown,
 )
+from app.services.llm_synthesizer import synthesize_runway_scenario_llm
 from app.services.runway import (
     calculate_compounding_runway,
     calculate_emergency_runway,
@@ -228,4 +231,46 @@ def simulate_runway_scenario(
         simulated_runway_years=sim_years,
         is_perpetual=is_perpetual,
         delta_weeks_compared_to_baseline=delta_weeks,
+    )
+
+
+@router.post("/synthesize", response_model=RunwayAiSynthesisRead)
+def trigger_runway_synthesis(
+    payload: RunwaySynthesizeRequest,
+    db: Session = Depends(get_db),
+):
+    """Forces on-demand research-grounded AI synthesis of financial freedom scenario and recommendations."""
+    today = date.today()
+    balances = get_latest_account_balances(db)
+    weekly_burn, _, _ = get_effective_weekly_burn(db, today)
+
+    cash_bal = balances["cash"]
+    growth_bal = balances["growth"]
+    locked_bal = balances["locked"]
+    total_liquid = cash_bal + growth_bal
+
+    emergency_weeks = calculate_emergency_runway(cash_bal, weekly_burn)
+    growth_weeks, is_perpetual = calculate_compounding_runway(
+        accessible_assets=total_liquid,
+        weekly_burn=weekly_burn,
+        annual_real_return=0.05,
+    )
+
+    runway_telemetry = {
+        "cash_balance": cash_bal,
+        "growth_balance": growth_bal,
+        "locked_balance": locked_bal,
+        "total_liquid_balance": total_liquid,
+        "weekly_burn_rate": weekly_burn,
+        "emergency_weeks": emergency_weeks,
+        "growth_weeks": growth_weeks,
+        "is_perpetual": is_perpetual,
+    }
+
+    return synthesize_runway_scenario_llm(
+        runway_data=runway_telemetry,
+        burn_adjustment=payload.weekly_burn_adjustment,
+        annual_return=payload.custom_annual_return,
+        lump_sum=payload.lump_sum_adjustment,
+        custom_context=payload.custom_context,
     )
