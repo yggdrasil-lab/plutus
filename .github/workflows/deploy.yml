@@ -39,14 +39,40 @@ jobs:
           DB_DIR="${PLUTUS_DB_MOUNT_PATH:-/opt/plutus/data}"
           docker run --rm -v "${DB_DIR}":/data alpine mkdir -p /data
 
+      - name: Validate Required Configuration
+        env:
+          DOMAIN_NAME: ${{ vars.DOMAIN_NAME }}
+          REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
+          PLUTUS_MCP_TOKEN: ${{ secrets.PLUTUS_MCP_TOKEN }}
+          MUNINN_MASTER_KEY: ${{ secrets.MUNINN_MASTER_KEY }}
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_CHANNEL_WEALTH_ID: ${{ vars.DISCORD_CHANNEL_WEALTH_ID }}
+          DISCORD_USER_ID: ${{ vars.DISCORD_USER_ID }}
+        run: |
+          MISSING=""
+          [ -z "$DOMAIN_NAME" ] && MISSING="$MISSING DOMAIN_NAME"
+          [ -z "$REGISTRY_PREFIX" ] && MISSING="$MISSING REGISTRY_PREFIX"
+          [ -z "$PLUTUS_MCP_TOKEN" ] && MISSING="$MISSING PLUTUS_MCP_TOKEN"
+          [ -z "$MUNINN_MASTER_KEY" ] && MISSING="$MISSING MUNINN_MASTER_KEY"
+          [ -z "$DISCORD_BOT_TOKEN" ] && MISSING="$MISSING DISCORD_BOT_TOKEN"
+          [ -z "$DISCORD_CHANNEL_WEALTH_ID" ] && MISSING="$MISSING DISCORD_CHANNEL_WEALTH_ID"
+          [ -z "$DISCORD_USER_ID" ] && MISSING="$MISSING DISCORD_USER_ID"
+          if [ -n "$MISSING" ]; then
+            echo "::error::Deployment halted: missing required configuration:$MISSING" >&2
+            exit 1
+          fi
+
       - name: Build and Deploy with Docker Compose
         env:
           REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
           DOMAIN_NAME: ${{ vars.DOMAIN_NAME }}
           PLUTUS_DB_MOUNT_PATH: ${{ vars.PLUTUS_DB_MOUNT_PATH || '/opt/plutus/data' }}
           PLUTUS_LLM_BASE_URL: ${{ vars.PLUTUS_LLM_BASE_URL || 'http://muninn:4000/v1' }}
-          PLUTUS_LLM_API_KEY: ${{ secrets.MUNINN_MASTER_KEY || vars.PLUTUS_LLM_API_KEY }}
+          PLUTUS_LLM_API_KEY: ${{ secrets.MUNINN_MASTER_KEY }}
           PLUTUS_LLM_MODEL: ${{ vars.PLUTUS_LLM_MODEL || 'app-synthesize' }}
+          PLUTUS_DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          PLUTUS_DISCORD_WEALTH_CHANNEL_ID: ${{ vars.DISCORD_CHANNEL_WEALTH_ID }}
+          PLUTUS_DISCORD_USER_ID: ${{ vars.DISCORD_USER_ID }}
           IMAGE_TAG: plutus
         run: |
           curl -fsSL https://raw.githubusercontent.com/yggdrasil-lab/yggdrasil-os/main/deploy/deploy.sh -o /tmp/deploy.sh
