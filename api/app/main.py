@@ -30,25 +30,6 @@ app.include_router(integrations.router)
 app.include_router(admin.router)
 
 
-@app.on_event("startup")
-def init_data_if_empty():
-    """Seed initial mock financial dataset if the database has zero accounts on startup."""
-    try:
-        from sqlalchemy import select
-        from app.db import SessionLocal
-        from app.models import Account
-        from app.services.seed import seed_initial_data
-
-        with SessionLocal() as db:
-            existing_count = len(db.scalars(select(Account)).all())
-            if existing_count == 0:
-                print("Plutus database is empty. Auto-seeding initial mock financial dataset...")
-                seed_initial_data(db)
-                print("Plutus initial mock financial dataset seeded successfully.")
-    except Exception as exc:
-        print(f"Warning: could not check/auto-seed database on startup: {exc}")
-
-
 # Mount Streamable HTTP MCP server at /mcp
 try:
     mcp.install_mcp(app)

@@ -73,8 +73,10 @@ def parse_csv_statement(csv_content: str, institution: str = "Unknown") -> State
     date_idx = col_map.get("date") or col_map.get("transaction date") or 0
     amount_idx = col_map.get("amount") or col_map.get("value")
     payee_idx = col_map.get("payee") or col_map.get("description") or col_map.get("merchant") or 1
+    balance_idx = col_map.get("balance") or col_map.get("running balance")
 
     parsed_list: list[ParsedTransaction] = []
+    balance_rows: list[tuple[date, float]] = []
     earliest_date: Optional[date] = None
     latest_date: Optional[date] = None
 
@@ -106,6 +108,14 @@ def parse_csv_statement(csv_content: str, institution: str = "Unknown") -> State
         else:
             continue
 
+        if balance_idx is not None and balance_idx < len(row):
+            bal_str = row[balance_idx].replace("$", "").replace(",", "").strip()
+            try:
+                bal = float(bal_str)
+                balance_rows.append((parsed_dt, bal))
+            except ValueError:
+                pass
+
         if earliest_date is None or parsed_dt < earliest_date:
             earliest_date = parsed_dt
         if latest_date is None or parsed_dt > latest_date:
@@ -122,10 +132,27 @@ def parse_csv_statement(csv_content: str, institution: str = "Unknown") -> State
             )
         )
 
+    closing_balance: Optional[float] = None
+    opening_balance: Optional[float] = None
+    if balance_rows:
+        if len(balance_rows) == 1:
+            closing_balance = balance_rows[0][1]
+            opening_balance = balance_rows[0][1]
+        elif balance_rows[0][0] >= balance_rows[-1][0]:
+            # Reverse-chronological (top row is newest)
+            closing_balance = balance_rows[0][1]
+            opening_balance = balance_rows[-1][1]
+        else:
+            # Chronological (bottom row is newest)
+            closing_balance = balance_rows[-1][1]
+            opening_balance = balance_rows[0][1]
+
     return StatementParseResult(
         institution=institution,
         start_date=earliest_date,
         end_date=latest_date,
+        opening_balance=opening_balance,
+        closing_balance=closing_balance,
         transaction_count=len(parsed_list),
         transactions=parsed_list,
     )

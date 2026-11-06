@@ -55,6 +55,20 @@ class TestStatementParser(unittest.TestCase):
         self.assertEqual(result.transactions[1].category, "Transport")
         self.assertEqual(result.transactions[2].category, "Food")
 
+    def test_parse_csv_statement_with_balance(self):
+        """Parse standard CSV statement lines with running balance column."""
+        csv_data = """Date,Payee,Amount,Balance
+2026-11-03,COLUMBUS COFFEE,-14.50,4900.50
+2026-11-02,BP CONNECT,-85.00,4915.00
+2026-11-01,PAK N SAVE,-150.25,5000.00
+"""
+        result = parse_csv_statement(csv_data, institution="ASB")
+        self.assertEqual(result.transaction_count, 3)
+        self.assertEqual(result.start_date, date(2026, 11, 1))
+        self.assertEqual(result.end_date, date(2026, 11, 3))
+        self.assertEqual(result.closing_balance, 4900.50)
+        self.assertEqual(result.opening_balance, 5000.00)
+
     def test_parse_sample_statement_format(self):
         """Verify sample statement format parses correctly."""
         from app.routers.integrations import get_sample_statement
@@ -66,6 +80,8 @@ class TestStatementParser(unittest.TestCase):
         self.assertEqual(result.transactions[0].merchant, "PAK N SAVE ALBANY")
         self.assertEqual(result.transactions[0].category, "Groceries")
         self.assertEqual(result.transactions[0].amount, -142.50)
+        self.assertEqual(result.closing_balance, 4250.00)
+        self.assertEqual(result.opening_balance, 4502.99)
 
 
 if __name__ == "__main__":

@@ -161,12 +161,12 @@ def get_sample_statement(
     d5 = (today - timedelta(days=5)).strftime("%Y/%m/%d")
 
     csv_lines = [
-        "Date,Unique Id,Tran Type,Cheque Number,Payee,Memo,Amount",
-        f"{d1},1001,DEBIT,,PAK N SAVE ALBANY,Weekly Groceries,-142.50",
-        f"{d2},1002,DEBIT,,SPOTIFY AUCKLAND,Family Plan,-18.99",
-        f"{d3},1003,DEBIT,,BP CONNECT TAKAPUNA,Fuel,-85.00",
-        f"{d4},1004,DEBIT,,CAFE MIMOSA TAKAPUNA,Morning Coffee,-6.50",
-        f"{d5},1005,CREDIT,,EMPLOYER SALARY,Fortnightly Pay,2850.00",
+        "Date,Unique Id,Tran Type,Cheque Number,Payee,Memo,Amount,Balance",
+        f"{d1},1001,DEBIT,,PAK N SAVE ALBANY,Weekly Groceries,-142.50,4250.00",
+        f"{d2},1002,DEBIT,,SPOTIFY AUCKLAND,Family Plan,-18.99,4392.50",
+        f"{d3},1003,DEBIT,,BP CONNECT TAKAPUNA,Fuel,-85.00,4411.49",
+        f"{d4},1004,DEBIT,,CAFE MIMOSA TAKAPUNA,Morning Coffee,-6.50,4496.49",
+        f"{d5},1005,CREDIT,,EMPLOYER SALARY,Fortnightly Pay,2850.00,4502.99",
     ]
     return "\n".join(csv_lines)
 
@@ -177,6 +177,7 @@ async def upload_statement(
     institution: str = Query(default="Unknown"),
     commit: bool = Query(default=False, description="Whether to commit extracted transactions directly to database"),
     account_id: Optional[int] = Query(default=None),
+    closing_balance: Optional[float] = Query(default=None, description="Optional manual closing balance override"),
     db: Session = Depends(get_db),
     _authorized: bool = Depends(verify_integration_token),
 ):
@@ -195,6 +196,11 @@ async def upload_statement(
             detail="Unsupported file format. Please upload a .pdf or .csv statement.",
         )
 
+    if closing_balance is not None:
+        parse_result.closing_balance = closing_balance
+        if parse_result.end_date is None:
+            parse_result.end_date = date.today()
+
     if commit:
         account = None
         if account_id:
@@ -209,9 +215,10 @@ async def upload_statement(
         if not account:
             inst_lower = institution.lower()
             tier = "locked" if "simplicity" in inst_lower or "kiwi" in inst_lower else "growth" if "sharesies" in inst_lower or "kernel" in inst_lower else "cash"
+            account_type = "checking" if tier == "cash" else "brokerage" if tier == "growth" else "kiwisaver"
             account = Account(
                 name=f"{institution} Account",
-                account_type="savings" if tier == "cash" else "brokerage" if tier == "growth" else "kiwisaver",
+                account_type=account_type,
                 tier=tier,
                 institution=institution,
                 currency=parse_result.currency,
