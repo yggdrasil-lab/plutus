@@ -28,16 +28,15 @@ class TestDiscordService(unittest.TestCase):
         headers_with_token = _get_auth_headers("mock_token_123")
         self.assertEqual(headers_with_token["Authorization"], "Bot mock_token_123")
 
-    def test_post_wealth_update_skipped_without_channel_or_webhook(self):
+    def test_post_wealth_update_skipped_without_channel_or_token(self):
         with patch("app.services.discord.settings") as mock_settings:
             mock_settings.discord_wealth_channel_id = None
-            mock_settings.discord_webhook_url = None
+            mock_settings.discord_bot_token = None
             mock_settings.discord_user_id = None
             result = post_wealth_update_thread(
                 title="Monthly Digest",
                 content="Net worth update",
                 channel_id=None,
-                webhook_url=None,
             )
             self.assertIsNone(result)
 
@@ -51,7 +50,6 @@ class TestDiscordService(unittest.TestCase):
         with patch("app.services.discord.settings") as mock_settings:
             mock_settings.discord_bot_token = "bot_token_abc"
             mock_settings.discord_wealth_channel_id = "channel_123"
-            mock_settings.discord_webhook_url = None
             mock_settings.discord_user_id = "user_456"
 
             thread_id = post_wealth_update_thread(
@@ -62,14 +60,13 @@ class TestDiscordService(unittest.TestCase):
             self.assertTrue(mock_urlopen.called)
 
     @patch("urllib.request.urlopen")
-    def test_post_wealth_reply_via_webhook_fallback(self, mock_urlopen):
+    def test_post_wealth_reply_via_bot_token(self, mock_urlopen):
         mock_response = MagicMock()
         mock_response.__enter__.return_value = mock_response
         mock_urlopen.return_value = mock_response
 
         with patch("app.services.discord.settings") as mock_settings:
-            mock_settings.discord_bot_token = None
-            mock_settings.discord_webhook_url = "https://discord.com/api/webhooks/mock"
+            mock_settings.discord_bot_token = "bot_token_abc"
 
             success = post_wealth_reply(
                 thread_id="thread_999",
@@ -77,6 +74,16 @@ class TestDiscordService(unittest.TestCase):
             )
             self.assertTrue(success)
             self.assertTrue(mock_urlopen.called)
+
+    def test_post_wealth_reply_skipped_without_bot_token(self):
+        with patch("app.services.discord.settings") as mock_settings:
+            mock_settings.discord_bot_token = None
+
+            success = post_wealth_reply(
+                thread_id="thread_999",
+                content="Rebalance executed successfully.",
+            )
+            self.assertFalse(success)
 
 
 if __name__ == "__main__":

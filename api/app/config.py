@@ -34,14 +34,6 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("PLUTUS_DISCORD_USER_ID", "DISCORD_USER_ID"),
     )
-    discord_webhook_url: str | None = Field(
-        default=None,
-        validation_alias=AliasChoices(
-            "PLUTUS_DISCORD_WEBHOOK_URL",
-            "DISCORD_WEALTH_WEBHOOK_URL",
-            "DISCORD_WEBHOOK_URL",
-        ),
-    )
 
     model_config = SettingsConfigDict(
         env_prefix="PLUTUS_",
