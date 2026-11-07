@@ -142,6 +142,27 @@ class CategorizationRule(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
 
+class Product(Base):
+    """Canonical inventory catalog item for cross-domain tracking, notes, and price history."""
+
+    __tablename__ = "products"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    name: Mapped[str] = mapped_column(String(200), nullable=False, unique=True, index=True)
+    brand: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
+    category: Mapped[str] = mapped_column(String(50), nullable=False, default="General", index=True)
+    domain: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)  # e.g. "02-skin", "01-health", "20-home"
+    tags: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON-encoded list of tags e.g. ["skincare", "serum"]
+    volume_ml: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # User notes/observations about the product
+    rating: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # 1-5 scale
+    is_favorite: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+    receipt_items: Mapped[list["ReceiptItem"]] = relationship("ReceiptItem", back_populates="product")
+
+
 class Receipt(Base):
     """Itemized physical or electronic receipt."""
 
@@ -180,6 +201,11 @@ class ReceiptItem(Base):
         nullable=False,
         index=True,
     )
+    product_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("products.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     item_name: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
     brand: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     quantity: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
@@ -188,8 +214,10 @@ class ReceiptItem(Base):
     category: Mapped[str] = mapped_column(String(50), nullable=False, default="General", index=True)
     domain: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)  # e.g. "02-skin", "01-health", "20-home", "general"
     product_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)  # e.g. "serum", "cleanser", "protein"
+    tags: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON-encoded tags e.g. ["skincare", "serum"]
     volume_ml: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)  # e.g. "30ml", "1kg", "60 caps"
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
     receipt: Mapped["Receipt"] = relationship("Receipt", back_populates="items")
+    product: Mapped[Optional["Product"]] = relationship("Product", back_populates="receipt_items")

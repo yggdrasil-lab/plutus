@@ -153,11 +153,36 @@ def upgrade() -> None:
     op.create_index("ix_receipts_receipt_date", "receipts", ["receipt_date"], unique=False)
     op.create_index("ix_receipts_merchant", "receipts", ["merchant"], unique=False)
 
-    # 8. Receipt Items (Line items for cross-domain tracking)
+    # 8. Products (Catalog & Inventory)
+    op.create_table(
+        "products",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("name", sa.String(length=200), nullable=False),
+        sa.Column("brand", sa.String(length=100), nullable=True),
+        sa.Column("category", sa.String(length=50), server_default="General", nullable=False),
+        sa.Column("domain", sa.String(length=50), nullable=True),
+        sa.Column("tags", sa.Text(), nullable=True),
+        sa.Column("volume_ml", sa.String(length=50), nullable=True),
+        sa.Column("notes", sa.Text(), nullable=True),
+        sa.Column("rating", sa.Integer(), nullable=True),
+        sa.Column("is_favorite", sa.Boolean(), server_default=sa.false(), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("name"),
+    )
+    op.create_index("ix_products_id", "products", ["id"], unique=False)
+    op.create_index("ix_products_name", "products", ["name"], unique=True)
+    op.create_index("ix_products_brand", "products", ["brand"], unique=False)
+    op.create_index("ix_products_category", "products", ["category"], unique=False)
+    op.create_index("ix_products_domain", "products", ["domain"], unique=False)
+
+    # 9. Receipt Items (Line items for cross-domain tracking & price history)
     op.create_table(
         "receipt_items",
         sa.Column("id", sa.Integer(), nullable=False),
         sa.Column("receipt_id", sa.Integer(), nullable=False),
+        sa.Column("product_id", sa.Integer(), nullable=True),
         sa.Column("item_name", sa.String(length=200), nullable=False),
         sa.Column("brand", sa.String(length=100), nullable=True),
         sa.Column("quantity", sa.Float(), server_default="1.0", nullable=False),
@@ -166,14 +191,17 @@ def upgrade() -> None:
         sa.Column("category", sa.String(length=50), server_default="General", nullable=False),
         sa.Column("domain", sa.String(length=50), nullable=True),
         sa.Column("product_type", sa.String(length=50), nullable=True),
+        sa.Column("tags", sa.Text(), nullable=True),
         sa.Column("volume_ml", sa.String(length=50), nullable=True),
         sa.Column("notes", sa.Text(), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
         sa.ForeignKeyConstraint(["receipt_id"], ["receipts.id"], ondelete="CASCADE"),
+        sa.ForeignKeyConstraint(["product_id"], ["products.id"], ondelete="SET NULL"),
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_index("ix_receipt_items_id", "receipt_items", ["id"], unique=False)
     op.create_index("ix_receipt_items_receipt_id", "receipt_items", ["receipt_id"], unique=False)
+    op.create_index("ix_receipt_items_product_id", "receipt_items", ["product_id"], unique=False)
     op.create_index("ix_receipt_items_item_name", "receipt_items", ["item_name"], unique=False)
     op.create_index("ix_receipt_items_category", "receipt_items", ["category"], unique=False)
     op.create_index("ix_receipt_items_domain", "receipt_items", ["domain"], unique=False)
@@ -182,6 +210,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_table("receipt_items")
+    op.drop_table("products")
     op.drop_table("receipts")
     op.drop_table("categorization_rules")
     op.drop_table("runway_snapshots")
