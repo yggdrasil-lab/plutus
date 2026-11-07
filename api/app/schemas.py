@@ -105,8 +105,11 @@ class BudgetRuleBase(BaseModel):
     is_active: bool = True
 
 
-class BudgetRuleCreate(BudgetRuleBase):
-    pass
+class BudgetRuleCreate(BaseModel):
+    category: str = Field(..., max_length=50)
+    weekly_limit: Optional[float] = Field(default=None, ge=0.0)
+    monthly_limit: Optional[float] = Field(default=None, ge=0.0)
+    is_active: bool = True
 
 
 class BudgetRuleRead(BudgetRuleBase):
@@ -114,6 +117,28 @@ class BudgetRuleRead(BudgetRuleBase):
 
     class Config:
         from_attributes = True
+
+
+class CategorySpendingReport(BaseModel):
+    category: str
+    total_spend: float
+    transaction_count: int
+    percentage: float
+    budget_limit: Optional[float] = None
+    percent_used: Optional[float] = None
+    is_over_budget: bool = False
+    warning_level: str = "normal"
+
+
+class SpendingBreakdownResponse(BaseModel):
+    period: str
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    total_spend: float
+    total_income: float
+    net_savings: float
+    categories: list[CategorySpendingReport] = Field(default_factory=list)
+    over_budget_count: int = 0
 
 
 # --- Runway & Time-Horizon Schemas ---
