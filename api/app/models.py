@@ -81,10 +81,19 @@ class Transaction(Base):
     category: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
     raw_description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     raw_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
+    linked_transaction_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("transactions.id", ondelete="SET NULL"), nullable=True, index=True)
+    exchange_rate: Mapped[Optional[float]] = mapped_column(Numeric(10, 4), nullable=True)
+    fee_amount: Mapped[Optional[float]] = mapped_column(Numeric(12, 2), nullable=True)
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
     account: Mapped["Account"] = relationship("Account", back_populates="transactions")
+    linked_transaction: Mapped[Optional["Transaction"]] = relationship(
+        "Transaction",
+        remote_side="Transaction.id",
+        foreign_keys=[linked_transaction_id],
+        uselist=False,
+    )
     receipt: Mapped[Optional["Receipt"]] = relationship(
         "Receipt",
         back_populates="transaction",

@@ -10,7 +10,9 @@ from sqlalchemy.orm import Session, joinedload
 from app.db import get_db
 from app.models import Account, Transaction
 from app.schemas import TransactionCreate, TransactionRead, TransactionUpdate
+from app.services.receipt_service import reconcile_unlinked_receipts
 from app.services.statement_parser import generate_transaction_hash
+from app.services.transfer_service import reconcile_transfers
 
 router = APIRouter(prefix="/transactions", tags=["Transactions"])
 
@@ -39,7 +41,10 @@ def list_transactions(
         else:
             raise HTTPException(status_code=400, detail="Invalid period. Choose 'week', 'month', or 'all'.")
 
-    stmt = select(Transaction).options(joinedload(Transaction.account))
+    stmt = select(Transaction).options(
+        joinedload(Transaction.account),
+        joinedload(Transaction.receipt),
+    )
     if start_date:
         stmt = stmt.where(Transaction.transaction_date >= start_date)
     if end_date:
@@ -50,6 +55,7 @@ def list_transactions(
     txs = db.scalars(stmt.order_by(desc(Transaction.transaction_date), desc(Transaction.id)).limit(limit)).all()
     for tx in txs:
         tx.account_name = tx.account.name if tx.account else None
+        tx.has_receipt = bool(tx.receipt)
     return txs
 
 
@@ -62,7 +68,7 @@ def update_transaction(
     """Update category, merchant, or notes of an existing transaction."""
     tx = db.scalar(
         select(Transaction)
-        .options(joinedload(Transaction.account))
+        .options(joinedload(Transaction.account), joinedload(Transaction.receipt))
         .where(Transaction.id == transaction_id)
     )
     if not tx:
@@ -85,6 +91,7 @@ def update_transaction(
     db.commit()
     db.refresh(tx)
     tx.account_name = tx.account.name if tx.account else None
+    tx.has_receipt = bool(tx.receipt)
     return tx
 
 
@@ -105,8 +112,14 @@ def create_transaction(
         account_id=payload.account_id,
     )
 
-    existing = db.scalar(select(Transaction).where(Transaction.raw_hash == raw_hash))
+    existing = db.scalar(
+        select(Transaction)
+        .options(joinedload(Transaction.account), joinedload(Transaction.receipt))
+        .where(Transaction.raw_hash == raw_hash)
+    )
     if existing:
+        existing.account_name = account.name
+        existing.has_receipt = bool(existing.receipt)
         return existing
 
     tx = Transaction(
@@ -118,12 +131,30 @@ def create_transaction(
         category=payload.category,
         raw_description=payload.raw_description or payload.merchant,
         raw_hash=raw_hash,
+        linked_transaction_id=payload.linked_transaction_id,
+        exchange_rate=payload.exchange_rate,
+        fee_amount=payload.fee_amount,
         notes=payload.notes,
     )
     db.add(tx)
     db.commit()
     db.refresh(tx)
+
+    # Automatically reconcile any unlinked receipts and internal/cross-currency transfers
+    reconcile_unlinked_receipts(db)
+    reconcile_transfers(db)
+    db.refresh(tx)
+
+    tx.account_name = account.name
+    tx.has_receipt = bool(tx.receipt)
     return tx
+
+
+@router.post("/reconcile-transfers")
+def trigger_transfer_reconciliation(db: Session = Depends(get_db)):
+    """Trigger automatic transfer reconciliation across accounts."""
+    matched = reconcile_transfers(db)
+    return {"status": "ok", "matched_transfers": matched}
 
 
 @router.get("/summary/categories")

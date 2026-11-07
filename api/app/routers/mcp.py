@@ -21,6 +21,7 @@ from starlette.routing import Route
 from app.config import settings
 from app.models import Account, AssetSnapshot, BudgetRule, Transaction
 from app.routers.runway import get_effective_weekly_burn, get_latest_account_balances
+from app.services.receipt_service import reconcile_unlinked_receipts
 from app.services.runway import (
     calculate_compounding_runway,
     calculate_emergency_runway,
@@ -29,6 +30,7 @@ from app.services.runway import (
 )
 from app.services.seed import clear_all_data, seed_initial_data
 from app.services.statement_parser import generate_transaction_hash
+from app.services.transfer_service import reconcile_transfers
 
 
 class McpAuthMiddleware(BaseHTTPMiddleware):
@@ -164,6 +166,10 @@ def build_mcp_server() -> MCPServer:
             db.add(tx)
             db.commit()
             db.refresh(tx)
+
+            reconcile_unlinked_receipts(db)
+            reconcile_transfers(db)
+            db.refresh(tx)
             return json.dumps({"status": "success", "id": tx.id, "merchant": merchant, "amount": spend_amount, "category": category})
 
     @server.tool(name="plutus_record_snapshot", description="Record or update an asset balance snapshot for an account.")
@@ -206,6 +212,12 @@ def build_mcp_server() -> MCPServer:
         with mcp_session() as db:
             result = clear_all_data(db, clear_accounts=clear_accounts)
             return json.dumps(result, indent=2)
+
+    @server.tool(name="plutus_reconcile_transfers", description="Scan and pair unmatched internal and cross-currency (Wise) account transfers.")
+    def plutus_reconcile_transfers() -> str:
+        with mcp_session() as db:
+            matched = reconcile_transfers(db)
+            return json.dumps({"status": "success", "matched_transfers": matched})
 
     return server
 
