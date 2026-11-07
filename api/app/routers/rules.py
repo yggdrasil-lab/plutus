@@ -35,11 +35,16 @@ def create_rule(
     db: Session = Depends(get_db),
 ):
     """Create a new transaction categorization rule and optionally apply it retroactively."""
+    amt = (
+        float(payload.amount_equals)
+        if (payload.amount_equals is not None and float(payload.amount_equals) > 0)
+        else None
+    )
     rule = CategorizationRule(
         name=payload.name.strip(),
         description_pattern=payload.description_pattern.strip(),
         match_type=payload.match_type.strip(),
-        amount_equals=payload.amount_equals,
+        amount_equals=amt,
         target_category=payload.target_category.strip(),
         rename_merchant=payload.rename_merchant.strip() if payload.rename_merchant else None,
         priority=payload.priority,
@@ -79,21 +84,25 @@ def update_rule(
     if not rule:
         raise HTTPException(status_code=404, detail="Categorization rule not found")
 
-    if payload.name is not None:
+    if "name" in payload.model_fields_set and payload.name is not None:
         rule.name = payload.name.strip()
-    if payload.description_pattern is not None:
+    if "description_pattern" in payload.model_fields_set and payload.description_pattern is not None:
         rule.description_pattern = payload.description_pattern.strip()
-    if payload.match_type is not None:
+    if "match_type" in payload.model_fields_set and payload.match_type is not None:
         rule.match_type = payload.match_type.strip()
-    if payload.amount_equals is not None:
-        rule.amount_equals = payload.amount_equals
-    if payload.target_category is not None:
+    if "amount_equals" in payload.model_fields_set:
+        rule.amount_equals = (
+            float(payload.amount_equals)
+            if (payload.amount_equals is not None and float(payload.amount_equals) > 0)
+            else None
+        )
+    if "target_category" in payload.model_fields_set and payload.target_category is not None:
         rule.target_category = payload.target_category.strip()
-    if payload.rename_merchant is not None:
+    if "rename_merchant" in payload.model_fields_set:
         rule.rename_merchant = payload.rename_merchant.strip() if payload.rename_merchant else None
-    if payload.priority is not None:
+    if "priority" in payload.model_fields_set and payload.priority is not None:
         rule.priority = payload.priority
-    if payload.is_active is not None:
+    if "is_active" in payload.model_fields_set and payload.is_active is not None:
         rule.is_active = payload.is_active
 
     db.commit()
