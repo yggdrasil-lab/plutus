@@ -133,7 +133,7 @@ class TestCategorizationRules(unittest.TestCase):
         self.assertEqual(len(res_list.json()), 1)
         self.assertEqual(res_list.json()[0]["match_count"], 1)
 
-        # 3. Update rule
+        # 3. Update rule category
         res_up = self.client.put(
             f"/rules/{rule_id}",
             json={
@@ -146,6 +146,27 @@ class TestCategorizationRules(unittest.TestCase):
 
         self.db.refresh(tx)
         self.assertEqual(tx.category, "Housing")
+
+        # 3b. Clear amount condition to null
+        res_clear_null = self.client.put(
+            f"/rules/{rule_id}",
+            json={
+                "amount_equals": None,
+            },
+        )
+        self.assertEqual(res_clear_null.status_code, 200)
+        self.assertIsNone(res_clear_null.json()["amount_equals"])
+
+        # 3c. Clear amount condition by passing 0
+        self.client.put(f"/rules/{rule_id}", json={"amount_equals": 250.0})
+        res_clear_zero = self.client.put(
+            f"/rules/{rule_id}",
+            json={
+                "amount_equals": 0,
+            },
+        )
+        self.assertEqual(res_clear_zero.status_code, 200)
+        self.assertIsNone(res_clear_zero.json()["amount_equals"])
 
         # 4. Delete rule
         res_del = self.client.delete(f"/rules/{rule_id}")
