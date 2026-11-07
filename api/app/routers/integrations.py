@@ -19,9 +19,10 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.db import get_db
-from app.models import Account, AssetSnapshot, Transaction
+from app.models import Account, AssetSnapshot, CategorizationRule, Transaction
 from app.schemas import QuickLogRequest, StatementParseResult, TransactionRead
 from app.services.jev_client import classify_transaction_jev
+from app.services.rules_engine import evaluate_rules
 from app.services.statement_parser import (
     auto_categorize,
     generate_transaction_hash,
@@ -262,6 +263,13 @@ async def upload_statement(
         target_account_id = account.id
 
         # 1. Commit transactions with deduplication
+        # 1. Query active user categorization rules to evaluate before heuristics or Jev
+        active_rules = db.scalars(
+            select(CategorizationRule)
+            .where(CategorizationRule.is_active == True)
+            .order_by(CategorizationRule.priority.asc(), CategorizationRule.id.asc())
+        ).all()
+
         for ptx in parse_result.transactions:
             raw_hash = generate_transaction_hash(
                 tx_date=ptx.transaction_date,
@@ -271,16 +279,28 @@ async def upload_statement(
             )
             existing = db.scalar(select(Transaction).where(Transaction.raw_hash == raw_hash))
             if not existing:
-                tx_cat = ptx.category
-                if not tx_cat or tx_cat == "General":
-                    jev_cat, _ = classify_transaction_jev(ptx.merchant, ptx.amount)
-                    tx_cat = jev_cat if jev_cat and jev_cat != "General" else auto_categorize(ptx.merchant)
+                desc = ptx.raw_description or ptx.merchant
+                rule_cat, rename, rule_id = evaluate_rules(desc, ptx.amount, active_rules)
+                merchant_name = rename if rename else ptx.merchant
+
+                if rule_cat:
+                    tx_cat = rule_cat
+                    if rule_id:
+                        matched_rule = next((r for r in active_rules if r.id == rule_id), None)
+                        if matched_rule:
+                            matched_rule.match_count += 1
+                else:
+                    tx_cat = ptx.category
+                    if not tx_cat or tx_cat == "General":
+                        jev_cat, _ = classify_transaction_jev(merchant_name, ptx.amount)
+                        tx_cat = jev_cat if jev_cat and jev_cat != "General" else auto_categorize(merchant_name)
+
                 tx = Transaction(
                     transaction_date=ptx.transaction_date,
                     account_id=target_account_id,
                     amount=ptx.amount,
                     currency=parse_result.currency,
-                    merchant=ptx.merchant,
+                    merchant=merchant_name,
                     category=tx_cat,
                     raw_description=ptx.raw_description,
                     raw_hash=raw_hash,

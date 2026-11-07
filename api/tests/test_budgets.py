@@ -26,22 +26,20 @@ engine = create_engine(
 TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
-def override_get_db():
-    db = TestingSessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
-app.dependency_overrides[get_db] = override_get_db
-
-
 class TestBudgetsRouter(unittest.TestCase):
     def setUp(self):
         Base.metadata.create_all(bind=engine)
-        self.client = TestClient(app)
         self.db = TestingSessionLocal()
+
+        def override_get_db():
+            db = TestingSessionLocal()
+            try:
+                yield db
+            finally:
+                db.close()
+
+        app.dependency_overrides[get_db] = override_get_db
+        self.client = TestClient(app)
 
         # Seed an account
         self.acc = Account(
@@ -56,6 +54,7 @@ class TestBudgetsRouter(unittest.TestCase):
         self.db.refresh(self.acc)
 
     def tearDown(self):
+        app.dependency_overrides.pop(get_db, None)
         self.db.close()
         Base.metadata.drop_all(bind=engine)
 
