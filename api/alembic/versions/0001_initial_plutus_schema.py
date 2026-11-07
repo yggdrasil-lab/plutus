@@ -60,21 +60,31 @@ def upgrade() -> None:
         sa.Column("id", sa.Integer(), nullable=False),
         sa.Column("transaction_date", sa.Date(), nullable=False),
         sa.Column("account_id", sa.Integer(), nullable=False),
-        sa.Column("amount", sa.Numeric(precision=12, scale=2), nullable=False),
+        sa.Column("amount", sa.Numeric(precision=18, scale=8), nullable=False),
         sa.Column("currency", sa.String(length=3), server_default="NZD", nullable=False),
         sa.Column("merchant", sa.String(length=150), nullable=False),
         sa.Column("category", sa.String(length=50), nullable=False),
         sa.Column("raw_description", sa.Text(), nullable=True),
         sa.Column("raw_hash", sa.String(length=64), nullable=False),
+        sa.Column("linked_transaction_id", sa.Integer(), nullable=True),
+        sa.Column("exchange_rate", sa.Numeric(precision=18, scale=8), nullable=True),
+        sa.Column("fee_amount", sa.Numeric(precision=12, scale=2), nullable=True),
         sa.Column("notes", sa.Text(), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
         sa.ForeignKeyConstraint(["account_id"], ["accounts.id"], ondelete="CASCADE"),
+        sa.ForeignKeyConstraint(
+            ["linked_transaction_id"],
+            ["transactions.id"],
+            name="fk_transactions_linked_transaction_id",
+            ondelete="SET NULL",
+        ),
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_index("ix_transactions_id", "transactions", ["id"], unique=False)
     op.create_index("ix_transactions_transaction_date", "transactions", ["transaction_date"], unique=False)
     op.create_index("ix_transactions_category", "transactions", ["category"], unique=False)
     op.create_index("ix_transactions_raw_hash", "transactions", ["raw_hash"], unique=True)
+    op.create_index("ix_transactions_linked_transaction_id", "transactions", ["linked_transaction_id"], unique=False)
 
     # 4. Budget Rules
     op.create_table(
