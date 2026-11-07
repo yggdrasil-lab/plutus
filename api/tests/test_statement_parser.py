@@ -83,6 +83,21 @@ class TestStatementParser(unittest.TestCase):
         self.assertEqual(result.closing_balance, 4250.00)
         self.assertEqual(result.opening_balance, 4502.99)
 
+    def test_auto_detect_institution(self):
+        """Statement parser should auto-detect institution from content if Unknown."""
+        csv_asb = """Date,Unique Id,Tran Type,Cheque Number,Payee,Memo,Amount
+2026-11-01,101,DEBIT,,PAK N SAVE,-150.25
+"""
+        result_asb = parse_csv_statement(csv_asb, institution="Unknown")
+        self.assertEqual(result_asb.institution, "ASB")
+
+        csv_sharesies = """Date,Payee,Amount
+# Sharesies Portfolio Statement
+2026-11-01,US500 ETF,250.00
+"""
+        result_sh = parse_csv_statement(csv_sharesies, institution="Unknown")
+        self.assertEqual(result_sh.institution, "Sharesies")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -57,6 +57,31 @@ def generate_transaction_hash(tx_date: date, amount: float, merchant: str, accou
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+INSTITUTION_DETECTION_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"\bASB\s+Bank\b|\bASB\b", re.I), "ASB"),
+    (re.compile(r"\bANZ\s+Bank\b|\bANZ\b", re.I), "ANZ"),
+    (re.compile(r"\bBank\s+of\s+New\s+Zealand\b|\bBNZ\b", re.I), "BNZ"),
+    (re.compile(r"\bWestpac\b", re.I), "Westpac"),
+    (re.compile(r"\bKiwibank\b", re.I), "Kiwibank"),
+    (re.compile(r"\bRabobank\b", re.I), "Rabobank"),
+    (re.compile(r"\bTSB\s+Bank\b|\bTSB\b", re.I), "TSB"),
+    (re.compile(r"\bSharesies\b", re.I), "Sharesies"),
+    (re.compile(r"\bSimplicity\b", re.I), "Simplicity"),
+    (re.compile(r"\bKernel\s+Wealth\b|\bKernel\b", re.I), "Kernel"),
+    (re.compile(r"\bMilford\s+Asset\s+Management\b|\bMilford\b", re.I), "Milford"),
+    (re.compile(r"\bInvestNow\b", re.I), "InvestNow"),
+    (re.compile(r"\bInteractive\s+Brokers\b|\bIBKR\b", re.I), "Interactive Brokers"),
+]
+
+
+def detect_institution(text: str) -> Optional[str]:
+    """Scan statement text for known banking and investment institution keywords."""
+    for pattern, name in INSTITUTION_DETECTION_PATTERNS:
+        if pattern.search(text):
+            return name
+    return None
+
+
 def parse_csv_statement(csv_content: str, institution: str = "Unknown") -> StatementParseResult:
     """Parse standard New Zealand bank or brokerage CSV exports."""
     reader = csv.reader(io.StringIO(csv_content))
@@ -70,6 +95,16 @@ def parse_csv_statement(csv_content: str, institution: str = "Unknown") -> State
 
     # Normalize header column lookups
     col_map = {col.strip().lower(): idx for idx, col in enumerate(header)}
+
+    detected_inst = institution
+    if not detected_inst or detected_inst.lower() == "unknown":
+        found = detect_institution(csv_content[:1500])
+        if found:
+            detected_inst = found
+        elif "unique id" in col_map and "tran type" in col_map:
+            detected_inst = "ASB"
+        else:
+            detected_inst = "Unknown"
     date_idx = col_map.get("date") or col_map.get("transaction date") or 0
     amount_idx = col_map.get("amount") or col_map.get("value")
     payee_idx = col_map.get("payee") or col_map.get("description") or col_map.get("merchant") or 1
@@ -148,7 +183,7 @@ def parse_csv_statement(csv_content: str, institution: str = "Unknown") -> State
             opening_balance = balance_rows[0][1]
 
     return StatementParseResult(
-        institution=institution,
+        institution=detected_inst,
         start_date=earliest_date,
         end_date=latest_date,
         opening_balance=opening_balance,
@@ -222,8 +257,16 @@ def parse_pdf_statement(file_bytes: bytes, institution: str = "Unknown") -> Stat
         except ValueError:
             pass
 
+    detected_inst = institution
+    if not detected_inst or detected_inst.lower() == "unknown":
+        found = detect_institution(full_text)
+        if found:
+            detected_inst = found
+        else:
+            detected_inst = "Unknown"
+
     return StatementParseResult(
-        institution=institution,
+        institution=detected_inst,
         opening_balance=opening_balance,
         closing_balance=closing_balance,
         transaction_count=len(parsed_transactions),
