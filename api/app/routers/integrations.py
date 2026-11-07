@@ -229,7 +229,10 @@ async def upload_statement(
                 else "brokerage" if resolved_tier == "growth"
                 else "kiwisaver"
             )
-            resolved_name = account_name or f"{institution} {resolved_type.capitalize()}"
+            resolved_name = account_name or (
+                f"{institution} {parse_result.account_name}" if parse_result.account_name
+                else f"{institution} {resolved_type.capitalize()}"
+            )
             expected_return = (
                 0.07 if resolved_tier == "growth"
                 else 0.065 if resolved_tier == "locked"
