@@ -115,3 +115,22 @@ class RunwaySnapshot(Base):
     is_perpetual: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     assumed_real_growth_rate: Mapped[float] = mapped_column(Numeric(6, 4), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class CategorizationRule(Base):
+    """Outlook-style transaction categorization and routing rule."""
+
+    __tablename__ = "categorization_rules"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    description_pattern: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
+    match_type: Mapped[str] = mapped_column(String(20), nullable=False, default="contains")
+    amount_equals: Mapped[Optional[float]] = mapped_column(Numeric(12, 2), nullable=True)
+    target_category: Mapped[str] = mapped_column(String(50), nullable=False)
+    rename_merchant: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    match_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)

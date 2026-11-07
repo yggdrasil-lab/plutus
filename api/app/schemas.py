@@ -150,6 +150,44 @@ class SpendingBreakdownResponse(BaseModel):
     over_budget_count: int = 0
 
 
+# --- Outlook-style Categorization Rule Schemas ---
+class CategorizationRuleBase(BaseModel):
+    name: str = Field(..., max_length=100)
+    description_pattern: str = Field(..., max_length=200)
+    match_type: str = Field(default="contains", description="'contains', 'exact', or 'starts_with'")
+    amount_equals: Optional[float] = Field(default=None, ge=0.0)
+    target_category: str = Field(..., max_length=50)
+    rename_merchant: Optional[str] = Field(default=None, max_length=150)
+    priority: int = Field(default=10, ge=1)
+    is_active: bool = True
+
+
+class CategorizationRuleCreate(CategorizationRuleBase):
+    apply_retroactively: bool = Field(default=True, description="Apply immediately to matching historical transactions")
+
+
+class CategorizationRuleUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, max_length=100)
+    description_pattern: Optional[str] = Field(default=None, max_length=200)
+    match_type: Optional[str] = None
+    amount_equals: Optional[float] = None
+    target_category: Optional[str] = Field(default=None, max_length=50)
+    rename_merchant: Optional[str] = Field(default=None, max_length=150)
+    priority: Optional[int] = None
+    is_active: Optional[bool] = None
+    apply_retroactively: bool = False
+
+
+class CategorizationRuleRead(CategorizationRuleBase):
+    id: int
+    match_count: int
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 # --- Runway & Time-Horizon Schemas ---
 class RunwayTierBreakdown(BaseModel):
     cash_balance: float
