@@ -97,8 +97,15 @@ class TestStatementParser(unittest.TestCase):
 # Sharesies Portfolio Statement
 2026-11-01,US500 ETF,250.00
 """
-        result_sh = parse_csv_statement(csv_sharesies, institution="Unknown")
+        result_sh = parse_csv_statement(csv_sharesies, institution="auto")
         self.assertEqual(result_sh.institution, "Sharesies")
+
+        csv_anz = """Date,Details,Amount,Balance
+ANZ Bank New Zealand
+2026-11-01,Salary,2500.00,5000.00
+"""
+        result_anz = parse_csv_statement(csv_anz, institution="auto")
+        self.assertEqual(result_anz.institution, "ANZ")
 
     def test_clean_merchant_name(self):
         """Banking transaction prefixes like AP, BP, DC, DD, VT should be stripped."""
