@@ -178,6 +178,9 @@ async def upload_statement(
     commit: bool = Query(default=False, description="Whether to commit extracted transactions directly to database"),
     account_id: Optional[int] = Query(default=None),
     closing_balance: Optional[float] = Query(default=None, description="Optional manual closing balance override"),
+    tier: Optional[str] = Query(default=None, description="Asset tier: cash, growth, or locked"),
+    account_type: Optional[str] = Query(default=None, description="Account type: checking, savings, brokerage, kiwisaver"),
+    account_name: Optional[str] = Query(default=None, description="Custom account name"),
     db: Session = Depends(get_db),
     _authorized: bool = Depends(verify_integration_token),
 ):
@@ -206,23 +209,40 @@ async def upload_statement(
         if account_id:
             account = db.get(Account, account_id)
         if not account and institution:
-            account = db.scalar(
-                select(Account).where(
-                    Account.institution.ilike(f"%{institution}%"),
-                    Account.is_active == True,
-                )
+            stmt = select(Account).where(
+                Account.institution.ilike(f"%{institution}%"),
+                Account.is_active == True,
             )
+            if account_name:
+                stmt = stmt.where(Account.name.ilike(f"%{account_name}%"))
+            account = db.scalar(stmt)
+
         if not account:
             inst_lower = institution.lower()
-            tier = "locked" if "simplicity" in inst_lower or "kiwi" in inst_lower else "growth" if "sharesies" in inst_lower or "kernel" in inst_lower else "cash"
-            account_type = "checking" if tier == "cash" else "brokerage" if tier == "growth" else "kiwisaver"
+            resolved_tier = tier or (
+                "locked" if "simplicity" in inst_lower or "kiwi" in inst_lower
+                else "growth" if any(k in inst_lower for k in ("sharesies", "kernel", "milford", "investnow", "hatch", "broker"))
+                else "cash"
+            )
+            resolved_type = account_type or (
+                "checking" if resolved_tier == "cash"
+                else "brokerage" if resolved_tier == "growth"
+                else "kiwisaver"
+            )
+            resolved_name = account_name or f"{institution} {resolved_type.capitalize()}"
+            expected_return = (
+                0.07 if resolved_tier == "growth"
+                else 0.065 if resolved_tier == "locked"
+                else 0.0
+            )
+
             account = Account(
-                name=f"{institution} Account",
-                account_type=account_type,
-                tier=tier,
+                name=resolved_name,
+                account_type=resolved_type,
+                tier=resolved_tier,
                 institution=institution,
                 currency=parse_result.currency,
-                expected_annual_return=0.06 if tier == "growth" else 0.05 if tier == "locked" else 0.0,
+                expected_annual_return=expected_return,
                 is_active=True,
             )
             db.add(account)

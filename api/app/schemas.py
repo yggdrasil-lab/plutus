@@ -30,6 +30,14 @@ class AccountRead(AccountBase):
         from_attributes = True
 
 
+# --- Institution Schemas ---
+class InstitutionInfo(BaseModel):
+    name: str = Field(..., max_length=100)
+    default_tier: str = Field(default="cash", description="cash, growth, locked")
+    default_type: str = Field(default="checking", description="checking, savings, brokerage, kiwisaver, crypto, credit_card")
+    currency: str = Field(default="NZD", max_length=3)
+
+
 # --- Asset Snapshot Schemas ---
 class AssetSnapshotBase(BaseModel):
     snapshot_date: date
