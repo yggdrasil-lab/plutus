@@ -23,6 +23,7 @@ from app.models import Account, AssetSnapshot, CategorizationRule, Transaction
 from app.schemas import QuickLogRequest, StatementParseResult, TransactionRead
 from app.services.jev_client import classify_transaction_jev
 from app.services.receipt_service import reconcile_unlinked_receipts
+from app.services.transfer_service import reconcile_transfers
 from app.services.rules_engine import evaluate_rules
 from app.services.statement_parser import (
     auto_categorize,
@@ -146,6 +147,11 @@ def quick_log_expense(
     db.add(tx)
     db.commit()
     db.refresh(tx)
+
+    # Reconcile any unlinked receipts or pending transfers against this new transaction
+    reconcile_unlinked_receipts(db)
+    reconcile_transfers(db)
+
     return tx
 
 
@@ -300,11 +306,13 @@ async def upload_statement(
                     transaction_date=ptx.transaction_date,
                     account_id=target_account_id,
                     amount=ptx.amount,
-                    currency=parse_result.currency,
+                    currency=ptx.currency or parse_result.currency,
                     merchant=merchant_name,
                     category=tx_cat,
                     raw_description=ptx.raw_description,
                     raw_hash=raw_hash,
+                    exchange_rate=ptx.exchange_rate,
+                    fee_amount=ptx.fee_amount,
                 )
                 db.add(tx)
 
@@ -336,7 +344,8 @@ async def upload_statement(
 
         db.commit()
 
-        # 3. Auto-reconcile with any unlinked receipts
+        # 3. Auto-reconcile with any unlinked receipts and internal transfers
         reconcile_unlinked_receipts(db)
+        reconcile_transfers(db)
 
     return parse_result

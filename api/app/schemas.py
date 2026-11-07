@@ -73,6 +73,9 @@ class TransactionBase(BaseModel):
     category: str = Field(..., max_length=50)
     raw_description: Optional[str] = None
     notes: Optional[str] = None
+    linked_transaction_id: Optional[int] = None
+    exchange_rate: Optional[float] = None
+    fee_amount: Optional[float] = None
 
 
 class TransactionCreate(TransactionBase):

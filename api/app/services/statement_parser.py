@@ -16,6 +16,9 @@ class ParsedTransaction:
     merchant: str
     raw_description: str
     category: str = "General"
+    currency: Optional[str] = None
+    exchange_rate: Optional[float] = None
+    fee_amount: Optional[float] = None
 
 
 @dataclass
@@ -40,7 +43,7 @@ CATEGORIZATION_RULES: list[tuple[re.Pattern, str]] = [
     (re.compile(r"spark\b|one\s*nz|vodafone|2degrees|skinny\b|mercury|contact\s*energy|electric\s*kiwi|watercare|google\s*one|icloud|apple\s*bill|aws|digitalocean", re.I), "Utilities"),
     (re.compile(r"gym\b|fitness|physio|pharmacy|chemist|doctor|health|cityfitness|southern\s*cross", re.I), "Health"),
     (re.compile(r"steam\b|playstation|nintendo|netflix|spotify|cinema|event\s*cinemas|hoyts|disney|movie", re.I), "Leisure"),
-    (re.compile(r"salary|wages|payroll|nzx\b|dividend|interest|ird\b|tax\s*refund", re.I), "Income"),
+    (re.compile(r"salary|wages|payroll|nzx\b|dividend|interest|ird\b|tax\s*refund|invoice|freelance|consulting|client\s*payment", re.I), "Income"),
     (re.compile(r"insurance|aa\s*insurance|iag\b|ami\b|state\s*insurance", re.I), "Insurance"),
     (re.compile(r"air\s*nz|air\s*new\s*zealand|singaporeair|jetstar|flight|airline|qantas|emirates", re.I), "Travel"),
     (
@@ -48,7 +51,10 @@ CATEGORIZATION_RULES: list[tuple[re.Pattern, str]] = [
             r"\b(?:wise|transferwise|investnow|sharesies|kernel|simplicity|hatch|stake|"
             r"transfer\s+to|transfer\s+from|tfr\s+to|tfr\s+from|internal\s+transfer|"
             r"internal\s+tfr|funds\s+transfer|trsf\s+to|trsf\s+from|internet\s+tfr|"
-            r"acc\s+tfr|account\s+transfer|to\s+account|from\s+account)\b",
+            r"acc\s+tfr|account\s+transfer|to\s+account|from\s+account|"
+            r"dbs|posb|bdo|bpi|unionbank|metrobank|paynow|instapay|pesonet|"
+            r"remit|remittance|wire\s+transfer|swift|crypto|bitcoin|btc|sats|"
+            r"binance|easycrypto|coinbase|kraken)\b",
             re.I,
         ),
         "Transfers",
@@ -105,6 +111,12 @@ INSTITUTION_DETECTION_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\bInvestNow\b|investnow\.co\.nz", re.I), "InvestNow"),
     (re.compile(r"\bInteractive\s+Brokers\b|\bIBKR\b", re.I), "Interactive Brokers"),
     (re.compile(r"\bWise\b|\bTransferWise\b|wise\.com", re.I), "Wise"),
+    (re.compile(r"\bDBS\s+Bank\b|\bDBS\b|\bPOSB\b|dbs\.com|posb\.com", re.I), "DBS Bank"),
+    (re.compile(r"\bBDO\s+Unibank\b|\bBDO\b|bdo\.com\.ph", re.I), "BDO Unibank"),
+    (re.compile(r"\bBank\s+of\s+the\s+Philippine\s+Islands\b|\bBPI\b|bpi\.com\.ph|bpiexpressonline", re.I), "BPI"),
+    (re.compile(r"\bUnionBank\b|unionbankph\.com", re.I), "UnionBank"),
+    (re.compile(r"\bMetrobank\b|metrobank\.com\.ph", re.I), "Metrobank"),
+    (re.compile(r"\bBitcoin\b|\bBTC\b|\bBinance\b|\bEasyCrypto\b|\bCoinbase\b|\bKraken\b", re.I), "Crypto"),
 ]
 
 
@@ -137,12 +149,31 @@ def parse_csv_statement(csv_content: str, institution: str = "auto") -> Statemen
             detected_inst = found
         elif "unique id" in col_map and "tran type" in col_map:
             detected_inst = "ASB"
+        elif "transferwise id" in col_map or "source currency" in col_map:
+            detected_inst = "Wise"
+        elif "dbs" in csv_content[:1000].lower():
+            detected_inst = "DBS Bank"
+        elif "bdo" in csv_content[:1000].lower():
+            detected_inst = "BDO Unibank"
+        elif "bpi" in csv_content[:1000].lower():
+            detected_inst = "BPI"
         else:
             detected_inst = "Unknown"
-    date_idx = col_map.get("date") or col_map.get("transaction date") or 0
-    amount_idx = col_map.get("amount") or col_map.get("value")
-    payee_idx = col_map.get("payee") or col_map.get("description") or col_map.get("merchant") or 1
-    balance_idx = col_map.get("balance") or col_map.get("running balance")
+    def _get_col(*candidates: str) -> Optional[int]:
+        for c in candidates:
+            if c in col_map:
+                return col_map[c]
+        return None
+
+    date_cand = _get_col("date", "transaction date", "booking date", "value date")
+    date_idx = date_cand if date_cand is not None else 0
+    amount_idx = _get_col("amount", "value", "net amount", "debit/credit")
+    payee_cand = _get_col("payee", "description", "merchant", "details", "transaction details", "particulars")
+    payee_idx = payee_cand if payee_cand is not None else 1
+    balance_idx = _get_col("balance", "running balance", "available balance")
+    currency_idx = _get_col("currency", "source currency", "txn currency", "account currency", "ccy")
+    rate_idx = _get_col("exchange rate", "rate", "fx rate", "conversion rate")
+    fee_idx = _get_col("total fees", "fee", "fees", "total fee", "charge", "charges", "bank charges", "remittance fee")
 
     parsed_list: list[ParsedTransaction] = []
     balance_rows: list[tuple[date, float]] = []
@@ -190,6 +221,28 @@ def parse_csv_statement(csv_content: str, institution: str = "auto") -> Statemen
         if latest_date is None or parsed_dt > latest_date:
             latest_date = parsed_dt
 
+        row_currency = None
+        if currency_idx is not None and currency_idx < len(row):
+            c_cand = row[currency_idx].strip().upper()
+            if len(c_cand) == 3:
+                row_currency = c_cand
+
+        row_rate = None
+        if rate_idx is not None and rate_idx < len(row):
+            r_str = row[rate_idx].replace("$", "").replace(",", "").strip()
+            try:
+                row_rate = float(r_str) if r_str else None
+            except ValueError:
+                pass
+
+        row_fee = None
+        if fee_idx is not None and fee_idx < len(row):
+            f_str = row[fee_idx].replace("$", "").replace(",", "").strip()
+            try:
+                row_fee = float(f_str) if f_str else None
+            except ValueError:
+                pass
+
         category = auto_categorize(payee_raw)
         merchant = clean_merchant_name(payee_raw)
         parsed_list.append(
@@ -199,6 +252,9 @@ def parse_csv_statement(csv_content: str, institution: str = "auto") -> Statemen
                 merchant=merchant,
                 raw_description=payee_raw,
                 category=category,
+                currency=row_currency,
+                exchange_rate=row_rate,
+                fee_amount=row_fee,
             )
         )
 
@@ -217,6 +273,10 @@ def parse_csv_statement(csv_content: str, institution: str = "auto") -> Statemen
             closing_balance = balance_rows[-1][1]
             opening_balance = balance_rows[0][1]
 
+    stmt_currency = "NZD"
+    if parsed_list and parsed_list[0].currency:
+        stmt_currency = parsed_list[0].currency
+
     return StatementParseResult(
         institution=detected_inst,
         start_date=earliest_date,
@@ -225,6 +285,7 @@ def parse_csv_statement(csv_content: str, institution: str = "auto") -> Statemen
         closing_balance=closing_balance,
         transaction_count=len(parsed_list),
         transactions=parsed_list,
+        currency=stmt_currency,
     )
 
 
