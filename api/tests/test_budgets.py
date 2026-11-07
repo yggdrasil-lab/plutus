@@ -140,6 +140,80 @@ class TestBudgetsRouter(unittest.TestCase):
         self.assertEqual(food_report["percentage"], 25.0)
         self.assertFalse(food_report["is_over_budget"])
 
+    def test_transfer_exclusion_from_spending_breakdown(self):
+        today = date.today()
+        # Add normal expense
+        tx1 = Transaction(
+            transaction_date=today,
+            account_id=self.acc.id,
+            amount=-80.0,
+            merchant="Countdown",
+            category="Groceries",
+            raw_hash="hash_groceries_transfer_test",
+        )
+        # Add transfer to Wise (-$500)
+        tx_transfer = Transaction(
+            transaction_date=today,
+            account_id=self.acc.id,
+            amount=-500.0,
+            merchant="Transfer to Wise",
+            category="Transfers",
+            raw_hash="hash_wise_transfer_1",
+        )
+        self.db.add_all([tx1, tx_transfer])
+        self.db.commit()
+
+        res = self.client.get("/budgets/breakdown?period=month")
+        self.assertEqual(res.status_code, 200)
+        body = res.json()
+        # total_spend must NOT include the $500 transfer!
+        self.assertEqual(body["total_spend"], 80.0)
+        self.assertEqual(body["total_transfers"], 500.0)
+
+        transfer_cat = next((c for c in body["categories"] if c["category"] == "Transfers"), None)
+        self.assertIsNotNone(transfer_cat)
+        self.assertTrue(transfer_cat["is_transfer"])
+        self.assertEqual(transfer_cat["total_spend"], 500.0)
+        self.assertEqual(transfer_cat["percentage"], 0.0)
+        self.assertFalse(transfer_cat["is_over_budget"])
+
+    def test_patch_transaction_category_and_list_filter(self):
+        today = date.today()
+        tx = Transaction(
+            transaction_date=today,
+            account_id=self.acc.id,
+            amount=-45.0,
+            merchant="Unknown Vendor",
+            category="General",
+            raw_hash="hash_unknown_vendor_1",
+        )
+        self.db.add(tx)
+        self.db.commit()
+        self.db.refresh(tx)
+
+        # 1. Patch category to "Food"
+        patch_res = self.client.patch(f"/transactions/{tx.id}", json={"category": "Food"})
+        self.assertEqual(patch_res.status_code, 200)
+        patched_data = patch_res.json()
+        self.assertEqual(patched_data["category"], "Food")
+        self.assertEqual(patched_data["account_name"], "Primary Checking")
+
+        # 2. Filter list by category and period
+        list_res = self.client.get("/transactions?category=food&period=month")
+        self.assertEqual(list_res.status_code, 200)
+        tx_list = list_res.json()
+        self.assertGreaterEqual(len(tx_list), 1)
+        self.assertEqual(tx_list[0]["id"], tx.id)
+        self.assertEqual(tx_list[0]["category"], "Food")
+
+    def test_auto_categorize_transfers(self):
+        from app.services.statement_parser import auto_categorize
+        self.assertEqual(auto_categorize("TRANSFER TO WISE"), "Transfers")
+        self.assertEqual(auto_categorize("TFR TO ASB FREEDOM"), "Transfers")
+        self.assertEqual(auto_categorize("INTERNAL TRANSFER 12-3456"), "Transfers")
+        self.assertEqual(auto_categorize("TRANSFERWISE NZD"), "Transfers")
+        self.assertEqual(auto_categorize("SHARESIES WALLET"), "Transfers")
+
 
 if __name__ == "__main__":
     unittest.main()

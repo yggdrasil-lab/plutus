@@ -162,25 +162,38 @@ def get_spending_breakdown(
 
     total_spend = 0.0
     total_income = 0.0
+    total_transfers = 0.0
     category_spend_map: dict[str, dict] = {}
 
     for tx in txs:
         amt = float(tx.amount)
+        cat = tx.category or "General"
+        cat_lower = cat.lower()
+
+        if cat_lower in ("transfers", "transfer"):
+            # Internal account transfer: track volume, do not count as operational spend or income
+            total_transfers += abs(amt)
+            if "Transfers" not in category_spend_map:
+                category_spend_map["Transfers"] = {"spend": 0.0, "count": 0, "is_transfer": True}
+            category_spend_map["Transfers"]["spend"] += abs(amt)
+            category_spend_map["Transfers"]["count"] += 1
+            continue
+
         if amt < 0:
-            # Expense
+            # Operational Expense
             abs_spend = abs(amt)
             total_spend += abs_spend
-            cat = tx.category or "General"
             if cat not in category_spend_map:
-                category_spend_map[cat] = {"spend": 0.0, "count": 0}
+                category_spend_map[cat] = {"spend": 0.0, "count": 0, "is_transfer": False}
             category_spend_map[cat]["spend"] += abs_spend
             category_spend_map[cat]["count"] += 1
         elif amt > 0:
-            # Income
+            # Operational Income
             total_income += amt
 
     total_spend = round(total_spend, 2)
     total_income = round(total_income, 2)
+    total_transfers = round(total_transfers, 2)
     net_savings = round(total_income - total_spend, 2)
 
     # Compile category reports
@@ -190,7 +203,8 @@ def get_spending_breakdown(
     for cat, data_dict in category_spend_map.items():
         cat_spend = round(data_dict["spend"], 2)
         count = data_dict["count"]
-        pct = round((cat_spend / total_spend * 100), 1) if total_spend > 0 else 0.0
+        is_tx_transfer = data_dict.get("is_transfer", False)
+        pct = round((cat_spend / total_spend * 100), 1) if (total_spend > 0 and not is_tx_transfer) else 0.0
         processed_lower_cats.add(cat.lower())
 
         rule = budget_rules.get(cat.lower())
@@ -199,7 +213,7 @@ def get_spending_breakdown(
         is_over = False
         warning = "normal"
 
-        if rule:
+        if rule and not is_tx_transfer:
             budget_limit = float(rule.weekly_limit if period == "week" else rule.monthly_limit)
             if budget_limit > 0:
                 percent_used = round((cat_spend / budget_limit * 100), 1)
@@ -219,6 +233,7 @@ def get_spending_breakdown(
                 percent_used=percent_used,
                 is_over_budget=is_over,
                 warning_level=warning,
+                is_transfer=is_tx_transfer,
             )
         )
 
@@ -236,13 +251,14 @@ def get_spending_breakdown(
                     percent_used=0.0,
                     is_over_budget=False,
                     warning_level="normal",
+                    is_transfer=False,
                 )
             )
 
-    # Sort: highest spend first, then alphabetical
-    reports.sort(key=lambda r: (-r.total_spend, r.category))
+    # Sort: operational categories by spend descending, transfers grouped at the bottom
+    reports.sort(key=lambda r: (r.is_transfer, -r.total_spend, r.category))
 
-    over_budget_count = sum(1 for r in reports if r.is_over_budget)
+    over_budget_count = sum(1 for r in reports if r.is_over_budget and not r.is_transfer)
 
     return SpendingBreakdownResponse(
         period=period,
@@ -250,6 +266,7 @@ def get_spending_breakdown(
         end_date=end_date,
         total_spend=total_spend,
         total_income=total_income,
+        total_transfers=total_transfers,
         net_savings=net_savings,
         categories=reports,
         over_budget_count=over_budget_count,

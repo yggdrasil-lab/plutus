@@ -43,7 +43,16 @@ CATEGORIZATION_RULES: list[tuple[re.Pattern, str]] = [
     (re.compile(r"salary|wages|payroll|nzx\b|dividend|interest|ird\b|tax\s*refund", re.I), "Income"),
     (re.compile(r"insurance|aa\s*insurance|iag\b|ami\b|state\s*insurance", re.I), "Insurance"),
     (re.compile(r"air\s*nz|air\s*new\s*zealand|singaporeair|jetstar|flight|airline|qantas|emirates", re.I), "Travel"),
-    (re.compile(r"wise\b|transferwise|investnow|sharesies|kernel|simplicity|hatch|stake", re.I), "Transfers"),
+    (
+        re.compile(
+            r"\b(?:wise|transferwise|investnow|sharesies|kernel|simplicity|hatch|stake|"
+            r"transfer\s+to|transfer\s+from|tfr\s+to|tfr\s+from|internal\s+transfer|"
+            r"internal\s+tfr|funds\s+transfer|trsf\s+to|trsf\s+from|internet\s+tfr|"
+            r"acc\s+tfr|account\s+transfer|to\s+account|from\s+account)\b",
+            re.I,
+        ),
+        "Transfers",
+    ),
 ]
 
 MONTH_NAMES: dict[str, int] = {
