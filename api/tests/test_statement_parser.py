@@ -10,8 +10,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.services.statement_parser import (
     auto_categorize,
+    clean_merchant_name,
     generate_transaction_hash,
     parse_csv_statement,
+    parse_pdf_statement,
 )
 
 
@@ -97,6 +99,51 @@ class TestStatementParser(unittest.TestCase):
 """
         result_sh = parse_csv_statement(csv_sharesies, institution="Unknown")
         self.assertEqual(result_sh.institution, "Sharesies")
+
+    def test_clean_merchant_name(self):
+        """Banking transaction prefixes like AP, BP, DC, DD, VT should be stripped."""
+        self.assertEqual(clean_merchant_name("AP MR & MRS E M TIENZO AUTOMATIC PAYMENT"), "MR & MRS E M TIENZO")
+        self.assertEqual(clean_merchant_name("DD Auckland Transport Autoload"), "Auckland Transport Autoload")
+        self.assertEqual(clean_merchant_name("VT Google One"), "Google One")
+        self.assertEqual(clean_merchant_name("DC NZX LIMITED"), "NZX LIMITED")
+
+    @unittest.mock.patch("pdfplumber.open")
+    def test_parse_pdf_anz_statement_unbordered(self, mock_pdf_open):
+        """Verify unbordered bank statement PDFs (like ANZ) parse transactions, balances, and period."""
+        page1_text = """Statement of Accounts
+Your accounts at a glance as at 16 October 2026
+Accounttype Accountnumber Balance
+Freedom 06-0323-0895056-00 7,574.21
+Statementperiod 17 Aug 2026 - 16 Oct 2026
+Date Transactiontypeanddetails Withdrawals Deposits Balance
+17 Aug Openingbalance 453.61
+18 Aug DC TRANSFERWISE RAYMUND TIEN 2051669430TW 300.00 753.61
+19 Aug DC NZX LIMITED PAY A/C B NZX LIMITED 10,097.95 10,851.56
+19 Aug AP MR & MRS E M TIENZO AUTOMATIC PAYMENT 400.00 10,451.56
+26 Aug DD Auckland Transport Autoload 48386545000w 20.00 10,431.56
+Totalsatendofperiod $420.00 $10,397.95 $10,431.56
+Your available credit is $10,431.56 as at the closing date of this statement
+ANZ Bank New Zealand Limited
+"""
+        mock_page = unittest.mock.MagicMock()
+        mock_page.extract_text.return_value = page1_text
+        mock_page.extract_tables.return_value = []
+        mock_pdf = unittest.mock.MagicMock()
+        mock_pdf.pages = [mock_page]
+        mock_pdf_open.return_value.__enter__.return_value = mock_pdf
+
+        result = parse_pdf_statement(b"%PDF-1.4 mock", institution="Unknown")
+        self.assertEqual(result.institution, "ANZ")
+        self.assertEqual(result.account_number_masked, "06-0323-0895056-00")
+        self.assertEqual(result.account_name, "Freedom")
+        self.assertEqual(result.opening_balance, 453.61)
+        self.assertEqual(result.closing_balance, 10431.56)
+        self.assertEqual(result.transaction_count, 4)
+        self.assertEqual(result.transactions[0].amount, 300.00)
+        self.assertEqual(result.transactions[1].amount, 10097.95)
+        self.assertEqual(result.transactions[2].amount, -400.00)
+        self.assertEqual(result.transactions[3].amount, -20.00)
+        self.assertEqual(result.transactions[0].merchant, "TRANSFERWISE RAYMUND TIEN 2051669430TW")
 
 
 if __name__ == "__main__":
