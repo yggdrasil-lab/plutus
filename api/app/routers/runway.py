@@ -60,24 +60,26 @@ def get_effective_weekly_burn(db: Session, as_of: date) -> tuple[float, float, f
     budget_sum = db.scalar(select(func.sum(BudgetRule.weekly_limit)).where(BudgetRule.is_active == True))
     weekly_budget = float(budget_sum or 0.0)
 
-    # 2. Trailing 4-week actual burn rate
+    # 2. Trailing 4-week actual burn rate (excluding internal transfers)
     four_weeks_ago = as_of - timedelta(days=28)
     trailing_spend = db.scalar(
         select(func.sum(Transaction.amount)).where(
             Transaction.transaction_date >= four_weeks_ago,
             Transaction.transaction_date <= as_of,
             Transaction.amount < 0,  # Negative amounts represent expenses
+            func.lower(Transaction.category).not_in(("transfers", "transfer")),
         )
     )
     trailing_weekly_burn = abs(float(trailing_spend or 0.0)) / 4.0
 
-    # 3. Spend in current calendar week (Monday to Sunday)
+    # 3. Spend in current calendar week (Monday to Sunday, excluding internal transfers)
     start_of_week = as_of - timedelta(days=as_of.weekday())
     current_week_spend = db.scalar(
         select(func.sum(Transaction.amount)).where(
             Transaction.transaction_date >= start_of_week,
             Transaction.transaction_date <= as_of,
             Transaction.amount < 0,
+            func.lower(Transaction.category).not_in(("transfers", "transfer")),
         )
     )
     this_week_spend = abs(float(current_week_spend or 0.0))

@@ -1,15 +1,15 @@
 """Transactions and spending router."""
 
-from datetime import date
+from datetime import date, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import desc, func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.db import get_db
 from app.models import Account, Transaction
-from app.schemas import TransactionCreate, TransactionRead
+from app.schemas import TransactionCreate, TransactionRead, TransactionUpdate
 from app.services.statement_parser import generate_transaction_hash
 
 router = APIRouter(prefix="/transactions", tags=["Transactions"])
@@ -20,19 +20,72 @@ def list_transactions(
     start_date: Optional[date] = Query(default=None),
     end_date: Optional[date] = Query(default=None),
     category: Optional[str] = Query(default=None),
-    limit: int = Query(default=50, ge=1, le=500),
+    period: Optional[str] = Query(default=None, description="'week', 'month', or 'all'"),
+    limit: int = Query(default=100, ge=1, le=500),
     db: Session = Depends(get_db),
 ):
-    """List transactions with optional date range and category filters."""
-    stmt = select(Transaction)
+    """List transactions with optional date range, period, and category filters."""
+    if period:
+        today = date.today()
+        if period == "week":
+            start_date = today - timedelta(days=today.weekday())
+            end_date = start_date + timedelta(days=6)
+        elif period == "month":
+            start_date = date(today.year, today.month, 1)
+            end_date = today
+        elif period == "all":
+            start_date = None
+            end_date = None
+        else:
+            raise HTTPException(status_code=400, detail="Invalid period. Choose 'week', 'month', or 'all'.")
+
+    stmt = select(Transaction).options(joinedload(Transaction.account))
     if start_date:
         stmt = stmt.where(Transaction.transaction_date >= start_date)
     if end_date:
         stmt = stmt.where(Transaction.transaction_date <= end_date)
     if category:
-        stmt = stmt.where(Transaction.category == category)
+        stmt = stmt.where(func.lower(Transaction.category) == category.strip().lower())
 
-    return db.scalars(stmt.order_by(desc(Transaction.transaction_date), desc(Transaction.id)).limit(limit)).all()
+    txs = db.scalars(stmt.order_by(desc(Transaction.transaction_date), desc(Transaction.id)).limit(limit)).all()
+    for tx in txs:
+        tx.account_name = tx.account.name if tx.account else None
+    return txs
+
+
+@router.patch("/{transaction_id}", response_model=TransactionRead)
+def update_transaction(
+    transaction_id: int,
+    payload: TransactionUpdate,
+    db: Session = Depends(get_db),
+):
+    """Update category, merchant, or notes of an existing transaction."""
+    tx = db.scalar(
+        select(Transaction)
+        .options(joinedload(Transaction.account))
+        .where(Transaction.id == transaction_id)
+    )
+    if not tx:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+
+    if payload.category is not None:
+        cat = payload.category.strip()
+        if not cat:
+            raise HTTPException(status_code=400, detail="Category name cannot be empty")
+        tx.category = cat
+
+    if payload.merchant is not None:
+        m = payload.merchant.strip()
+        if m:
+            tx.merchant = m
+
+    if payload.notes is not None:
+        tx.notes = payload.notes
+
+    db.commit()
+    db.refresh(tx)
+    tx.account_name = tx.account.name if tx.account else None
+    return tx
 
 
 @router.post("", response_model=TransactionRead, status_code=status.HTTP_201_CREATED)

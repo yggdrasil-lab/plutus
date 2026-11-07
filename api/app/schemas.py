@@ -90,11 +90,18 @@ class QuickLogRequest(BaseModel):
 
 class TransactionRead(TransactionBase):
     id: int
+    account_name: Optional[str] = None
     raw_hash: str
     created_at: datetime
 
     class Config:
         from_attributes = True
+
+
+class TransactionUpdate(BaseModel):
+    category: Optional[str] = Field(default=None, max_length=50)
+    merchant: Optional[str] = Field(default=None, max_length=150)
+    notes: Optional[str] = None
 
 
 # --- Budget Rule Schemas ---
@@ -128,6 +135,7 @@ class CategorySpendingReport(BaseModel):
     percent_used: Optional[float] = None
     is_over_budget: bool = False
     warning_level: str = "normal"
+    is_transfer: bool = False
 
 
 class SpendingBreakdownResponse(BaseModel):
@@ -136,6 +144,7 @@ class SpendingBreakdownResponse(BaseModel):
     end_date: Optional[date] = None
     total_spend: float
     total_income: float
+    total_transfers: float = 0.0
     net_savings: float
     categories: list[CategorySpendingReport] = Field(default_factory=list)
     over_budget_count: int = 0
