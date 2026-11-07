@@ -17,8 +17,15 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    op.alter_column(
+        "transactions",
+        "amount",
+        type_=sa.Numeric(precision=18, scale=8),
+        existing_type=sa.Numeric(precision=12, scale=2),
+        nullable=False,
+    )
     op.add_column("transactions", sa.Column("linked_transaction_id", sa.Integer(), nullable=True))
-    op.add_column("transactions", sa.Column("exchange_rate", sa.Numeric(precision=10, scale=4), nullable=True))
+    op.add_column("transactions", sa.Column("exchange_rate", sa.Numeric(precision=18, scale=8), nullable=True))
     op.add_column("transactions", sa.Column("fee_amount", sa.Numeric(precision=12, scale=2), nullable=True))
     op.create_index("ix_transactions_linked_transaction_id", "transactions", ["linked_transaction_id"], unique=False)
     op.create_foreign_key(
@@ -32,6 +39,13 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    op.alter_column(
+        "transactions",
+        "amount",
+        type_=sa.Numeric(precision=12, scale=2),
+        existing_type=sa.Numeric(precision=18, scale=8),
+        nullable=False,
+    )
     op.drop_constraint("fk_transactions_linked_transaction_id", "transactions", type_="foreignkey")
     op.drop_index("ix_transactions_linked_transaction_id", table_name="transactions")
     op.drop_column("transactions", "fee_amount")

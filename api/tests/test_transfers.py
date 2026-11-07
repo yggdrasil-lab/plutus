@@ -65,11 +65,35 @@ class TestTransfersAndReceiptLinking(unittest.TestCase):
             institution="Sharesies",
             currency="NZD",
         )
-        self.db.add_all([self.acc_asb, self.acc_wise, self.acc_sharesies])
+        self.acc_dbs = Account(
+            name="DBS Singapore Checking",
+            account_type="checking",
+            tier="cash",
+            institution="DBS Bank",
+            currency="SGD",
+        )
+        self.acc_bpi = Account(
+            name="BPI Manila Savings",
+            account_type="savings",
+            tier="cash",
+            institution="BPI",
+            currency="PHP",
+        )
+        self.acc_btc = Account(
+            name="Bitcoin Hardware Vault",
+            account_type="brokerage",
+            tier="growth",
+            institution="Crypto",
+            currency="BTC",
+        )
+        self.db.add_all([self.acc_asb, self.acc_wise, self.acc_sharesies, self.acc_dbs, self.acc_bpi, self.acc_btc])
         self.db.commit()
         self.db.refresh(self.acc_asb)
         self.db.refresh(self.acc_wise)
         self.db.refresh(self.acc_sharesies)
+        self.db.refresh(self.acc_dbs)
+        self.db.refresh(self.acc_bpi)
+        self.db.refresh(self.acc_btc)
 
     def tearDown(self):
         app.dependency_overrides.pop(get_db, None)
@@ -260,8 +284,106 @@ class TestTransfersAndReceiptLinking(unittest.TestCase):
 
         self.assertEqual(tx_out.linked_transaction_id, in_id)
         self.assertEqual(tx_in.linked_transaction_id, out_id)
-        # Implied exchange rate: 1000 / 1650 ~ 0.6061
-        self.assertAlmostEqual(float(tx_out.exchange_rate), 0.6061, places=3)
+        # Implied exchange rate: 1000 / (1650 - 5) = 1000 / 1645 ~ 0.6079
+        self.assertAlmostEqual(float(tx_out.exchange_rate), 0.6079, places=3)
+        self.assertEqual(tx_in.category, "Transfers")
+
+    def test_dbs_singapore_to_philippine_bpi_remittance(self):
+        """Verify cross-border remittance from DBS Singapore (SGD) to Philippine BPI (PHP)."""
+        d_out = date(2026, 11, 2)
+        d_in = date(2026, 11, 3)
+
+        # SGD Outflow: 1,000 SGD with 5.00 SGD remittance fee
+        res_out = self.client.post(
+            "/transactions",
+            json={
+                "transaction_date": d_out.isoformat(),
+                "account_id": self.acc_dbs.id,
+                "amount": -1000.00,
+                "currency": "SGD",
+                "merchant": "DBS Remit to BPI Manila",
+                "category": "Transfers",
+                "fee_amount": 5.00,
+            },
+        )
+        self.assertEqual(res_out.status_code, 201)
+        out_id = res_out.json()["id"]
+
+        # PHP Inflow: 43,500 PHP received
+        res_in = self.client.post(
+            "/transactions",
+            json={
+                "transaction_date": d_in.isoformat(),
+                "account_id": self.acc_bpi.id,
+                "amount": 43500.00,
+                "currency": "PHP",
+                "merchant": "Remittance Credit DBS",
+                "category": "General",
+            },
+        )
+        self.assertEqual(res_in.status_code, 201)
+        in_id = res_in.json()["id"]
+
+        res_recon = self.client.post("/transactions/reconcile-transfers")
+        self.assertEqual(res_recon.status_code, 200)
+
+        tx_out = self.db.get(Transaction, out_id)
+        tx_in = self.db.get(Transaction, in_id)
+        self.db.refresh(tx_out)
+        self.db.refresh(tx_in)
+
+        self.assertEqual(tx_out.linked_transaction_id, in_id)
+        self.assertEqual(tx_in.linked_transaction_id, out_id)
+        # Implied rate: 43500 / (1000 - 5) = 43500 / 995 ~ 43.7186 PHP/SGD
+        self.assertAlmostEqual(float(tx_out.exchange_rate), 43.7186, places=2)
+        self.assertEqual(tx_in.category, "Transfers")
+
+    def test_bitcoin_crypto_conversion_transfer(self):
+        """Verify fiat-to-crypto purchase transfer (NZD outflow paired with BTC inflow)."""
+        d = date(2026, 11, 4)
+
+        # NZD Outflow: $5,000 NZD sent to crypto platform
+        res_out = self.client.post(
+            "/transactions",
+            json={
+                "transaction_date": d.isoformat(),
+                "account_id": self.acc_asb.id,
+                "amount": -5000.00,
+                "currency": "NZD",
+                "merchant": "EasyCrypto Bitcoin Purchase",
+                "category": "Transfers",
+            },
+        )
+        self.assertEqual(res_out.status_code, 201)
+        out_id = res_out.json()["id"]
+
+        # BTC Inflow: 0.035 BTC received in hardware vault
+        res_in = self.client.post(
+            "/transactions",
+            json={
+                "transaction_date": d.isoformat(),
+                "account_id": self.acc_btc.id,
+                "amount": 0.035,
+                "currency": "BTC",
+                "merchant": "Bitcoin Inflow Network",
+                "category": "General",
+            },
+        )
+        self.assertEqual(res_in.status_code, 201)
+        in_id = res_in.json()["id"]
+
+        res_recon = self.client.post("/transactions/reconcile-transfers")
+        self.assertEqual(res_recon.status_code, 200)
+
+        tx_out = self.db.get(Transaction, out_id)
+        tx_in = self.db.get(Transaction, in_id)
+        self.db.refresh(tx_out)
+        self.db.refresh(tx_in)
+
+        self.assertEqual(tx_out.linked_transaction_id, in_id)
+        self.assertEqual(tx_in.linked_transaction_id, out_id)
+        # Implied rate: 0.035 / 5000 = 0.000007 BTC/NZD
+        self.assertAlmostEqual(float(tx_out.exchange_rate), 0.000007, places=6)
         self.assertEqual(tx_in.category, "Transfers")
 
     def test_wise_csv_statement_parser(self):
