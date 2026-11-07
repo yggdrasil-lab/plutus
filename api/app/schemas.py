@@ -92,6 +92,7 @@ class TransactionRead(TransactionBase):
     id: int
     account_name: Optional[str] = None
     raw_hash: str
+    has_receipt: bool = False
     created_at: datetime
 
     class Config:
@@ -186,6 +187,83 @@ class CategorizationRuleRead(CategorizationRuleBase):
 
     class Config:
         from_attributes = True
+
+
+# --- Receipt & Itemized Product Telemetry Schemas ---
+class ReceiptItemBase(BaseModel):
+    item_name: str = Field(..., max_length=200)
+    brand: Optional[str] = Field(default=None, max_length=100)
+    quantity: float = Field(default=1.0, ge=0.01)
+    unit_price: float = Field(..., ge=0.0)
+    total_price: float = Field(..., ge=0.0)
+    category: str = Field(default="General", max_length=50)
+    domain: Optional[str] = Field(default=None, max_length=50)
+    product_type: Optional[str] = Field(default=None, max_length=50)
+    volume_ml: Optional[str] = Field(default=None, max_length=50)
+    notes: Optional[str] = None
+
+
+class ReceiptItemCreate(ReceiptItemBase):
+    pass
+
+
+class ReceiptItemRead(ReceiptItemBase):
+    id: int
+    receipt_id: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ReceiptBase(BaseModel):
+    receipt_date: date
+    merchant: str = Field(..., max_length=150)
+    total_amount: float = Field(..., ge=0.0)
+    currency: str = Field(default="NZD", max_length=3)
+    tax_amount: Optional[float] = Field(default=None, ge=0.0)
+    status: str = Field(default="unlinked", max_length=30)
+    notes: Optional[str] = None
+
+
+class ReceiptCreate(ReceiptBase):
+    items: list[ReceiptItemCreate] = []
+
+
+class ReceiptRead(ReceiptBase):
+    id: int
+    transaction_id: Optional[int] = None
+    image_path: Optional[str] = None
+    raw_text: Optional[str] = None
+    items: list[ReceiptItemRead] = []
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ProductStatisticItem(BaseModel):
+    item_name: str
+    brand: Optional[str] = None
+    category: str
+    domain: Optional[str] = None
+    product_type: Optional[str] = None
+    volume_ml: Optional[str] = None
+    purchase_count: int
+    total_spent: float
+    unit_price_latest: float
+    first_purchased: date
+    last_purchased: date
+    avg_days_between_purchases: Optional[float] = None
+    estimated_depletion_date: Optional[date] = None
+
+
+class ProductStatisticsResponse(BaseModel):
+    domain: Optional[str] = None
+    total_products: int
+    total_spend: float
+    products: list[ProductStatisticItem]
 
 
 # --- Runway & Time-Horizon Schemas ---

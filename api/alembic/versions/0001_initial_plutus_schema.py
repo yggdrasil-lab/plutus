@@ -1,4 +1,4 @@
-"""Initial Plutus schema for accounts, snapshots, transactions, and runway.
+"""Initial consolidated Plutus schema for accounts, transactions, budgets, rules, and receipts.
 
 Revision ID: 0001_initial_plutus_schema
 Revises: 
@@ -68,7 +68,7 @@ def upgrade() -> None:
         sa.Column("raw_hash", sa.String(length=64), nullable=False),
         sa.Column("notes", sa.Text(), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-        sa.ForeignKeyConstraint(["account_id"], ["accounts.id"]),
+        sa.ForeignKeyConstraint(["account_id"], ["accounts.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_index("ix_transactions_id", "transactions", ["id"], unique=False)
@@ -109,8 +109,81 @@ def upgrade() -> None:
     op.create_index("ix_runway_snapshots_id", "runway_snapshots", ["id"], unique=False)
     op.create_index("ix_runway_snapshots_snapshot_date", "runway_snapshots", ["snapshot_date"], unique=False)
 
+    # 6. Categorization Rules
+    op.create_table(
+        "categorization_rules",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("name", sa.String(length=100), nullable=False),
+        sa.Column("description_pattern", sa.String(length=200), nullable=False),
+        sa.Column("match_type", sa.String(length=20), server_default="contains", nullable=False),
+        sa.Column("amount_equals", sa.Numeric(precision=12, scale=2), nullable=True),
+        sa.Column("target_category", sa.String(length=50), nullable=False),
+        sa.Column("rename_merchant", sa.String(length=150), nullable=True),
+        sa.Column("priority", sa.Integer(), server_default="10", nullable=False),
+        sa.Column("is_active", sa.Boolean(), server_default=sa.true(), nullable=False),
+        sa.Column("match_count", sa.Integer(), server_default="0", nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index("ix_categorization_rules_id", "categorization_rules", ["id"], unique=False)
+    op.create_index("ix_categorization_rules_description_pattern", "categorization_rules", ["description_pattern"], unique=False)
+
+    # 7. Receipts
+    op.create_table(
+        "receipts",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("transaction_id", sa.Integer(), nullable=True),
+        sa.Column("receipt_date", sa.Date(), nullable=False),
+        sa.Column("merchant", sa.String(length=150), nullable=False),
+        sa.Column("total_amount", sa.Numeric(precision=12, scale=2), nullable=False),
+        sa.Column("currency", sa.String(length=3), server_default="NZD", nullable=False),
+        sa.Column("tax_amount", sa.Numeric(precision=12, scale=2), nullable=True),
+        sa.Column("status", sa.String(length=30), server_default="unlinked", nullable=False),
+        sa.Column("image_path", sa.String(length=255), nullable=True),
+        sa.Column("raw_text", sa.Text(), nullable=True),
+        sa.Column("notes", sa.Text(), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.ForeignKeyConstraint(["transaction_id"], ["transactions.id"], ondelete="SET NULL"),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index("ix_receipts_id", "receipts", ["id"], unique=False)
+    op.create_index("ix_receipts_transaction_id", "receipts", ["transaction_id"], unique=False)
+    op.create_index("ix_receipts_receipt_date", "receipts", ["receipt_date"], unique=False)
+    op.create_index("ix_receipts_merchant", "receipts", ["merchant"], unique=False)
+
+    # 8. Receipt Items (Line items for cross-domain tracking)
+    op.create_table(
+        "receipt_items",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("receipt_id", sa.Integer(), nullable=False),
+        sa.Column("item_name", sa.String(length=200), nullable=False),
+        sa.Column("brand", sa.String(length=100), nullable=True),
+        sa.Column("quantity", sa.Float(), server_default="1.0", nullable=False),
+        sa.Column("unit_price", sa.Numeric(precision=12, scale=2), nullable=False),
+        sa.Column("total_price", sa.Numeric(precision=12, scale=2), nullable=False),
+        sa.Column("category", sa.String(length=50), server_default="General", nullable=False),
+        sa.Column("domain", sa.String(length=50), nullable=True),
+        sa.Column("product_type", sa.String(length=50), nullable=True),
+        sa.Column("volume_ml", sa.String(length=50), nullable=True),
+        sa.Column("notes", sa.Text(), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.ForeignKeyConstraint(["receipt_id"], ["receipts.id"], ondelete="CASCADE"),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index("ix_receipt_items_id", "receipt_items", ["id"], unique=False)
+    op.create_index("ix_receipt_items_receipt_id", "receipt_items", ["receipt_id"], unique=False)
+    op.create_index("ix_receipt_items_item_name", "receipt_items", ["item_name"], unique=False)
+    op.create_index("ix_receipt_items_category", "receipt_items", ["category"], unique=False)
+    op.create_index("ix_receipt_items_domain", "receipt_items", ["domain"], unique=False)
+    op.create_index("ix_receipt_items_product_type", "receipt_items", ["product_type"], unique=False)
+
 
 def downgrade() -> None:
+    op.drop_table("receipt_items")
+    op.drop_table("receipts")
+    op.drop_table("categorization_rules")
     op.drop_table("runway_snapshots")
     op.drop_table("budget_rules")
     op.drop_table("transactions")

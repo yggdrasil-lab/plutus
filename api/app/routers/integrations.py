@@ -22,6 +22,7 @@ from app.db import get_db
 from app.models import Account, AssetSnapshot, CategorizationRule, Transaction
 from app.schemas import QuickLogRequest, StatementParseResult, TransactionRead
 from app.services.jev_client import classify_transaction_jev
+from app.services.receipt_service import reconcile_unlinked_receipts
 from app.services.rules_engine import evaluate_rules
 from app.services.statement_parser import (
     auto_categorize,
@@ -334,5 +335,8 @@ async def upload_statement(
                 db.add(snap)
 
         db.commit()
+
+        # 3. Auto-reconcile with any unlinked receipts
+        reconcile_unlinked_receipts(db)
 
     return parse_result

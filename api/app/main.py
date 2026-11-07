@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
-from app.routers import accounts, admin, budgets, health, institutions, integrations, mcp, rules, runway, transactions
+from app.routers import accounts, admin, budgets, health, institutions, integrations, mcp, receipts, rules, runway, transactions
 
 app = FastAPI(
     title="Plutus API",
@@ -28,6 +28,7 @@ app.include_router(institutions.router)
 app.include_router(transactions.router)
 app.include_router(budgets.router)
 app.include_router(rules.router)
+app.include_router(receipts.router)
 app.include_router(runway.router)
 app.include_router(integrations.router)
 app.include_router(admin.router)

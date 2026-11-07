@@ -85,6 +85,12 @@ class Transaction(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
     account: Mapped["Account"] = relationship("Account", back_populates="transactions")
+    receipt: Mapped[Optional["Receipt"]] = relationship(
+        "Receipt",
+        back_populates="transaction",
+        uselist=False,
+        primaryjoin="Transaction.id == Receipt.transaction_id",
+    )
 
 
 class BudgetRule(Base):
@@ -134,3 +140,56 @@ class CategorizationRule(Base):
     match_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+
+class Receipt(Base):
+    """Itemized physical or electronic receipt."""
+
+    __tablename__ = "receipts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    transaction_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("transactions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    receipt_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    merchant: Mapped[str] = mapped_column(String(150), nullable=False, index=True)
+    total_amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False, default="NZD")
+    tax_amount: Mapped[Optional[float]] = mapped_column(Numeric(12, 2), nullable=True)
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="unlinked")  # unlinked, matched, verified
+    image_path: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    raw_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+    transaction: Mapped[Optional["Transaction"]] = relationship("Transaction", back_populates="receipt", foreign_keys=[transaction_id])
+    items: Mapped[list["ReceiptItem"]] = relationship("ReceiptItem", back_populates="receipt", cascade="all, delete-orphan")
+
+
+class ReceiptItem(Base):
+    """Granular line item from a receipt for cross-domain product tracking."""
+
+    __tablename__ = "receipt_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    receipt_id: Mapped[int] = mapped_column(
+        ForeignKey("receipts.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    item_name: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
+    brand: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    quantity: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    unit_price: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    total_price: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    category: Mapped[str] = mapped_column(String(50), nullable=False, default="General", index=True)
+    domain: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)  # e.g. "02-skin", "01-health", "20-home", "general"
+    product_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)  # e.g. "serum", "cleanser", "protein"
+    volume_ml: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)  # e.g. "30ml", "1kg", "60 caps"
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    receipt: Mapped["Receipt"] = relationship("Receipt", back_populates="items")
