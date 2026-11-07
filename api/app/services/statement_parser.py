@@ -93,8 +93,9 @@ INSTITUTION_DETECTION_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\bSimplicity\b", re.I), "Simplicity"),
     (re.compile(r"\bKernel\s+Wealth\b|\bKernel\b", re.I), "Kernel"),
     (re.compile(r"\bMilford\s+Asset\s+Management\b|\bMilford\b", re.I), "Milford"),
-    (re.compile(r"\bInvestNow\b", re.I), "InvestNow"),
+    (re.compile(r"\bInvestNow\b|investnow\.co\.nz", re.I), "InvestNow"),
     (re.compile(r"\bInteractive\s+Brokers\b|\bIBKR\b", re.I), "Interactive Brokers"),
+    (re.compile(r"\bWise\b|\bTransferWise\b|wise\.com", re.I), "Wise"),
 ]
 
 
@@ -106,7 +107,7 @@ def detect_institution(text: str) -> Optional[str]:
     return None
 
 
-def parse_csv_statement(csv_content: str, institution: str = "Unknown") -> StatementParseResult:
+def parse_csv_statement(csv_content: str, institution: str = "auto") -> StatementParseResult:
     """Parse standard New Zealand bank or brokerage CSV exports."""
     reader = csv.reader(io.StringIO(csv_content))
     header = next(reader, None)
@@ -121,8 +122,8 @@ def parse_csv_statement(csv_content: str, institution: str = "Unknown") -> State
     col_map = {col.strip().lower(): idx for idx, col in enumerate(header)}
 
     detected_inst = institution
-    if not detected_inst or detected_inst.lower() == "unknown":
-        found = detect_institution(csv_content[:1500])
+    if not detected_inst or detected_inst.lower() in ("auto", "unknown"):
+        found = detect_institution(csv_content[:2000])
         if found:
             detected_inst = found
         elif "unique id" in col_map and "tran type" in col_map:
@@ -218,7 +219,7 @@ def parse_csv_statement(csv_content: str, institution: str = "Unknown") -> State
     )
 
 
-def parse_pdf_statement(file_bytes: bytes, institution: str = "Unknown") -> StatementParseResult:
+def parse_pdf_statement(file_bytes: bytes, institution: str = "auto") -> StatementParseResult:
     """Parse text and tables from an official bank statement PDF."""
     try:
         import pdfplumber
@@ -273,7 +274,7 @@ def parse_pdf_statement(file_bytes: bytes, institution: str = "Unknown") -> Stat
 
     # Institution detection from full document text
     detected_inst = institution
-    if not detected_inst or detected_inst.lower() == "unknown":
+    if not detected_inst or detected_inst.lower() in ("auto", "unknown"):
         found = detect_institution(full_text)
         detected_inst = found if found else "Unknown"
 

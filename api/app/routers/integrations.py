@@ -174,7 +174,7 @@ def get_sample_statement(
 @router.post("/statement", response_model=StatementParseResult)
 async def upload_statement(
     file: UploadFile = File(...),
-    institution: str = Query(default="Unknown"),
+    institution: str = Query(default="auto", description="Institution name, or 'auto' for automatic content detection"),
     commit: bool = Query(default=False, description="Whether to commit extracted transactions directly to database"),
     account_id: Optional[int] = Query(default=None),
     closing_balance: Optional[float] = Query(default=None, description="Optional manual closing balance override"),
@@ -205,12 +205,19 @@ async def upload_statement(
             parse_result.end_date = date.today()
 
     if commit:
+        # Effective institution: use caller override if specific, else use auto-detected from statement
+        target_institution = (
+            institution if institution and institution.lower() not in ("auto", "unknown")
+            else parse_result.institution if parse_result.institution != "Unknown"
+            else "Bank"
+        )
+
         account = None
         if account_id:
             account = db.get(Account, account_id)
-        if not account and institution:
+        if not account and target_institution:
             stmt = select(Account).where(
-                Account.institution.ilike(f"%{institution}%"),
+                Account.institution.ilike(f"%{target_institution}%"),
                 Account.is_active == True,
             )
             if account_name:
@@ -218,7 +225,7 @@ async def upload_statement(
             account = db.scalar(stmt)
 
         if not account:
-            inst_lower = institution.lower()
+            inst_lower = target_institution.lower()
             resolved_tier = tier or (
                 "locked" if "simplicity" in inst_lower or "kiwi" in inst_lower
                 else "growth" if any(k in inst_lower for k in ("sharesies", "kernel", "milford", "investnow", "hatch", "broker"))
@@ -230,8 +237,8 @@ async def upload_statement(
                 else "kiwisaver"
             )
             resolved_name = account_name or (
-                f"{institution} {parse_result.account_name}" if parse_result.account_name
-                else f"{institution} {resolved_type.capitalize()}"
+                f"{target_institution} {parse_result.account_name}" if parse_result.account_name
+                else f"{target_institution} {resolved_type.capitalize()}"
             )
             expected_return = (
                 0.07 if resolved_tier == "growth"
@@ -243,7 +250,7 @@ async def upload_statement(
                 name=resolved_name,
                 account_type=resolved_type,
                 tier=resolved_tier,
-                institution=institution,
+                institution=target_institution,
                 currency=parse_result.currency,
                 expected_annual_return=expected_return,
                 is_active=True,
