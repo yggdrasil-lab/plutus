@@ -31,7 +31,10 @@ TRANSACTION_GATES_SCHEMA = {
                 "Health": "Medical, dental, pharmacy, gym, fitness, physio (e.g. chemist, doctor, gym memberships).",
                 "Leisure": "Entertainment, games, streaming, recreation (e.g. Steam, Netflix, Spotify, cinemas).",
                 "Housing": "Rent, mortgage, home insurance, council rates, hardware, maintenance.",
-                "Income": "Salary, wages, consulting, dividends, transfers in.",
+                "Transfers": "Money moving between own bank accounts, cards, or platforms (e.g. Wise, TransferWise, ASB to ANZ, Sharesies, InvestNow, savings transfers, internal bank transfers).",
+                "Insurance": "Insurance premiums (e.g. AA Insurance, Southern Cross, State, AMI).",
+                "Travel": "Airlines, flights, hotels, overseas accommodations (e.g. Air New Zealand, Qantas, Jetstar).",
+                "Income": "Salary, wages, consulting, dividends, interest earnings.",
                 "General": "Uncategorized retail, miscellaneous supplies, general expenditure.",
             },
         },
@@ -125,7 +128,8 @@ def classify_transaction_jev(
             cat = parsed.get("category", "General")
             valid_cats = {
                 "Groceries", "Transport", "Food", "Utilities",
-                "Health", "Leisure", "Housing", "Income", "General"
+                "Health", "Leisure", "Housing", "Income", "Transfers",
+                "Insurance", "Travel", "General"
             }
             resolved_cat = cat if cat in valid_cats else "General"
             raw_anomaly = parsed.get("is_anomaly", "false")
