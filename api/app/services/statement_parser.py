@@ -289,12 +289,438 @@ def parse_csv_statement(csv_content: str, institution: str = "auto") -> Statemen
     )
 
 
+def _parse_dbs_cashline(full_text: str, detected_inst: str = "DBS Bank") -> StatementParseResult:
+    currency = "SGD"
+    account_name = "DBS Cashline"
+    account_number_masked = None
+    acc_m = re.search(r"CASHLINE\s+ACCOUNT\s+NO[.:\s]*\n?\s*([0-9-]+)", full_text, re.I)
+    if acc_m:
+        account_number_masked = acc_m.group(1).strip()
+    else:
+        m_num = re.search(r"\b([0-9]{3}-[0-9]{6}-[0-9])\b", full_text)
+        if m_num:
+            account_number_masked = m_num.group(1).strip()
+
+    stmt_date = None
+    date_m = re.search(r"STATEMENT\s+PRINTED\s+ON\s*\n?\s*(\d{1,2}\s+[A-Za-z]{3,9}\s+(\d{4}))", full_text, re.I)
+    if date_m:
+        try:
+            stmt_date = datetime.strptime(date_m.group(1).strip(), "%d %b %Y").date()
+        except ValueError:
+            pass
+
+    opening_balance = None
+    prev_m = re.search(r"PREVIOUS\s+BALANCE\s+([0-9,]+\.[0-9]{2})", full_text, re.I)
+    if prev_m:
+        opening_balance = float(prev_m.group(1).replace(",", ""))
+
+    closing_balance = None
+    close_m = re.search(r"Total\s+Outstanding\s+Balance\s*\n?\s*S?\$?\s*([0-9,]+\.[0-9]{2})", full_text, re.I)
+    if not close_m:
+        close_m = re.search(r"CLOSING\s+BALANCE\s+([0-9,]+\.[0-9]{2})", full_text, re.I)
+    if close_m:
+        closing_balance = float(close_m.group(1).replace(",", ""))
+
+    lines = [l.strip() for l in full_text.splitlines() if l.strip()]
+    parsed_transactions: list[ParsedTransaction] = []
+    last_date = stmt_date
+    for line in lines:
+        m = re.match(r"^(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})\s+(.+?)\s+([0-9,]+\.[0-9]{2})(\s*CR)?$", line)
+        if m:
+            d_str, desc, amt_str, cr = m.groups()
+            if any(k in desc.upper() for k in ("PREVIOUS BALANCE", "SUB-TOTAL", "CLOSING BALANCE", "TOTAL")):
+                continue
+            try:
+                tx_date = datetime.strptime(d_str, "%d %b %Y").date()
+            except ValueError:
+                continue
+            last_date = tx_date
+            amt = float(amt_str.replace(",", ""))
+            if not cr:
+                amt = -amt
+            parsed_transactions.append(
+                ParsedTransaction(
+                    transaction_date=tx_date,
+                    amount=amt,
+                    merchant=clean_merchant_name(desc),
+                    raw_description=desc.strip(),
+                    category=auto_categorize(desc),
+                    currency=currency,
+                )
+            )
+            continue
+
+        m_undated = re.match(r"^([0-9]{3}[A-Z].+?)\s+([0-9,]+\.[0-9]{2})$", line)
+        if m_undated:
+            desc, amt_str = m_undated.groups()
+            amt = -float(amt_str.replace(",", ""))
+            tx_date = last_date or stmt_date or date.today()
+            parsed_transactions.append(
+                ParsedTransaction(
+                    transaction_date=tx_date,
+                    amount=amt,
+                    merchant=clean_merchant_name(desc),
+                    raw_description=desc.strip(),
+                    category=auto_categorize(desc),
+                    currency=currency,
+                )
+            )
+
+    start_date = min((t.transaction_date for t in parsed_transactions), default=stmt_date)
+    end_date = stmt_date or max((t.transaction_date for t in parsed_transactions), default=None)
+
+    return StatementParseResult(
+        institution=detected_inst,
+        account_number_masked=account_number_masked,
+        account_name=account_name,
+        start_date=start_date,
+        end_date=end_date,
+        opening_balance=opening_balance,
+        closing_balance=closing_balance,
+        transaction_count=len(parsed_transactions),
+        transactions=parsed_transactions,
+        currency=currency,
+    )
+
+
+def _parse_dbs_card(full_text: str, detected_inst: str = "DBS Bank") -> StatementParseResult:
+    currency = "SGD"
+    account_name = "DBS Credit Card"
+    card_name_match = re.search(r"([A-Z0-9 ]+CARD)\s+NO\.?:", full_text, re.I)
+    if card_name_match:
+        account_name = card_name_match.group(1).strip().title()
+
+    account_number_masked = None
+    card_num_match = re.search(r"CARD\s+NO\.?:?\s*([0-9Xx]{4}[\s-][0-9Xx]{4}[\s-][0-9Xx]{4}[\s-][0-9Xx]{4})", full_text, re.I)
+    if card_num_match:
+        account_number_masked = card_num_match.group(1).strip()
+    else:
+        m_num = re.search(r"\b([0-9]{4}[\s-][0-9]{4}[\s-][0-9]{4}[\s-][0-9]{4})\b", full_text)
+        if m_num:
+            account_number_masked = m_num.group(1).strip()
+
+    stmt_date = None
+    date_m = re.search(r"STATEMENT\s+DATE\s+CREDIT\s+LIMIT.*?(\d{1,2}\s+[A-Za-z]{3,9}\s+(\d{4}))", full_text, re.I | re.S)
+    if not date_m:
+        date_m = re.search(r"STATEMENT\s+DATE.*?(\d{1,2}\s+[A-Za-z]{3,9}\s+(\d{4}))", full_text, re.I)
+    if not date_m:
+        date_m = re.search(r"STATEMENT\s+PRINTED\s+ON\s+(\d{1,2}\s+[A-Za-z]{3,9}\s+(\d{4}))", full_text, re.I)
+
+    year = datetime.now().year
+    if date_m:
+        try:
+            stmt_date = datetime.strptime(date_m.group(1).strip(), "%d %b %Y").date()
+            year = stmt_date.year
+        except ValueError:
+            pass
+
+    opening_balance = None
+    prev_bal_m = re.search(r"PREVIOUS\s+BALANCE\s+([0-9,]+\.[0-9]{2})", full_text, re.I)
+    if prev_bal_m:
+        opening_balance = float(prev_bal_m.group(1).replace(",", ""))
+
+    closing_balance = None
+    close_m = re.search(r"TOTAL:\s*([0-9,]+\.[0-9]{2})", full_text, re.I)
+    if not close_m:
+        close_m = re.search(r"GRAND\s+TOTAL\s+FOR\s+ALL\s+CARD\s+ACCOUNTS:\s*([0-9,]+\.[0-9]{2})", full_text, re.I)
+    if not close_m:
+        close_m = re.search(r"TOTAL\s+OUTSTANDING\s+BALANCE\s*\n?\s*\$?\s*([0-9,]+\.[0-9]{2})", full_text, re.I)
+    if close_m:
+        closing_balance = float(close_m.group(1).replace(",", ""))
+
+    tx_pattern = re.compile(r"^(\d{1,2}\s+[A-Za-z]{3})\s+(.+?)\s+([0-9,]+\.[0-9]{2})(\s*CR)?$", re.M)
+    tx_multiline_pattern = re.compile(r"^(\d{1,2}\s+[A-Za-z]{3})\s+(.+)$", re.M)
+
+    lines = [l.strip() for l in full_text.splitlines() if l.strip()]
+    parsed_transactions: list[ParsedTransaction] = []
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m = tx_pattern.match(line)
+        if m:
+            d_str, desc, amt_str, cr = m.groups()
+            if not any(k in desc.upper() for k in ("PREVIOUS BALANCE", "SUB-TOTAL", "TOTAL", "INSTALMENT PLANS", "MINIMUM PAYMENT")):
+                day, mon = d_str.split()
+                tx_mon = MONTH_NAMES.get(mon.lower()[:3], 1)
+                tx_year = year
+                if stmt_date and tx_mon > stmt_date.month:
+                    tx_year = year - 1
+                tx_date = date(tx_year, tx_mon, int(day))
+                amt = float(amt_str.replace(",", ""))
+                if not cr:
+                    amt = -amt
+                parsed_transactions.append(
+                    ParsedTransaction(
+                        transaction_date=tx_date,
+                        amount=amt,
+                        merchant=clean_merchant_name(desc),
+                        raw_description=desc.strip(),
+                        category=auto_categorize(desc),
+                        currency=currency,
+                    )
+                )
+            i += 1
+            continue
+
+        m2 = tx_multiline_pattern.match(line)
+        if m2 and not any(k in line.upper() for k in ("STATEMENT DATE", "PAYMENT DUE DATE", "CARD NO", "TAX INVOICE", "HOTLINE")):
+            d_str = m2.group(1)
+            parts = d_str.split()
+            if len(parts) == 2:
+                day, mon = parts
+                if mon.lower()[:3] in MONTH_NAMES and day.isdigit():
+                    desc_parts = [m2.group(2)]
+                    i += 1
+                    amt_found = False
+                    while i < len(lines):
+                        cur = lines[i]
+                        amt_m = re.match(r"^([0-9,]+\.[0-9]{2})(\s*CR)?$", cur)
+                        if amt_m:
+                            amt_str, cr = amt_m.groups()
+                            tx_mon = MONTH_NAMES.get(mon.lower()[:3], 1)
+                            tx_year = year
+                            if stmt_date and tx_mon > stmt_date.month:
+                                tx_year = year - 1
+                            tx_date = date(tx_year, tx_mon, int(day))
+                            amt = float(amt_str.replace(",", ""))
+                            if not cr:
+                                amt = -amt
+                            full_desc = " ".join(desc_parts).strip()
+                            if not any(k in full_desc.upper() for k in ("PREVIOUS BALANCE", "SUB-TOTAL", "TOTAL")):
+                                parsed_transactions.append(
+                                    ParsedTransaction(
+                                        transaction_date=tx_date,
+                                        amount=amt,
+                                        merchant=clean_merchant_name(full_desc),
+                                        raw_description=full_desc.strip(),
+                                        category=auto_categorize(full_desc),
+                                        currency=currency,
+                                    )
+                               )
+                            amt_found = True
+                            i += 1
+                            break
+                        elif tx_multiline_pattern.match(cur) or any(k in cur.upper() for k in ("NEW TRANSACTIONS", "SUB-TOTAL", "TOTAL", "INSTALMENT")):
+                            break
+                        else:
+                            desc_parts.append(cur)
+                            i += 1
+                    if amt_found:
+                        continue
+        i += 1
+
+    start_date = min((t.transaction_date for t in parsed_transactions), default=stmt_date)
+    end_date = stmt_date or max((t.transaction_date for t in parsed_transactions), default=None)
+
+    return StatementParseResult(
+        institution=detected_inst,
+        account_number_masked=account_number_masked,
+        account_name=account_name,
+        start_date=start_date,
+        end_date=end_date,
+        opening_balance=opening_balance,
+        closing_balance=closing_balance,
+        transaction_count=len(parsed_transactions),
+        transactions=parsed_transactions,
+        currency=currency,
+    )
+
+
+def _parse_dbs_consolidated(full_text: str, detected_inst: str = "DBS Bank") -> StatementParseResult:
+    currency = "SGD"
+    account_name = "DBS Savings / Multiplier"
+    account_number_masked = None
+
+    acc_nums = re.findall(r"DBS\s+(?:Savings|Multiplier|Current)\s+Account\s+([0-9-]+)", full_text)
+    if acc_nums:
+        account_number_masked = " / ".join(acc_nums)
+    else:
+        m_acc = re.search(r"\b([0-9]{3}-[0-9]-[0-9]{6}|[0-9]{3}-[0-9]{6}-[0-9])\b", full_text)
+        if m_acc:
+            account_number_masked = m_acc.group(1).strip()
+
+    stmt_date = None
+    date_m = re.search(r"Account\s+Summary\s+as\s+(?:at|of)\s+(\d{1,2}\s+[A-Za-z]{3,9}\s+(\d{4}))", full_text, re.I)
+    if not date_m:
+        date_m = re.search(r"Transaction\s+Details\s+as\s+(?:at|of)\s+(\d{1,2}\s+[A-Za-z]{3,9}\s+(\d{4}))", full_text, re.I)
+    if date_m:
+        try:
+            stmt_date = datetime.strptime(date_m.group(1).strip(), "%d %b %Y").date()
+        except ValueError:
+            pass
+
+    closing_balance = None
+    close_m = re.search(r"Current\s+and\s+Savings\s+Account\s+Total:\s*SGD\s+Equivalent\s+([0-9,]+\.[0-9]{2})", full_text, re.I)
+    if not close_m:
+        close_m = re.search(r"Total\s+Balance\s+Carried\s+Forward\s+in\s+SGD:\s*[0-9,.]+\s+[0-9,.]+\s+([0-9,]+\.[0-9]{2})", full_text, re.I)
+    if close_m:
+        closing_balance = float(close_m.group(1).replace(",", ""))
+
+    opening_balance = None
+    open_m = re.search(r"Balance\s+Brought\s+Forward\s*(?:SGD)?\s*([0-9,]+\.[0-9]{2})", full_text, re.I)
+    if open_m:
+        opening_balance = float(open_m.group(1).replace(",", ""))
+
+    lines = [l.strip() for l in full_text.splitlines() if l.strip()]
+    parsed_transactions: list[ParsedTransaction] = []
+
+    current_subacc = ""
+    current_balance = 0.0
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        subacc_m = re.search(r"(DBS\s+(?:Savings|Multiplier|Current)\s+Account)\s+Account\s+No\.\s+([0-9-]+)", line)
+        if subacc_m:
+            current_subacc = f"{subacc_m.group(1)} ({subacc_m.group(2)})"
+            i += 1
+            continue
+
+        bbf_m = re.match(r"Balance\s+Brought\s+Forward\s*(?:SGD)?\s*([0-9,]+\.[0-9]{2})", line, re.I)
+        if bbf_m:
+            current_balance = float(bbf_m.group(1).replace(",", ""))
+            i += 1
+            continue
+
+        single_line_m = re.match(r"^(\d{2}/\d{2}/\d{4})\s+(.+?)\s+([0-9,]+\.[0-9]{2})\s+([0-9,]+\.[0-9]{2})$", line)
+        if single_line_m:
+            d_str, desc, val1_str, val2_str = single_line_m.groups()
+            try:
+                tx_date = datetime.strptime(d_str, "%d/%m/%Y").date()
+            except ValueError:
+                i += 1
+                continue
+            val1 = float(val1_str.replace(",", ""))
+            val2 = float(val2_str.replace(",", ""))
+            delta = round(val2 - current_balance, 2)
+            if abs(round(abs(delta) - val1, 2)) < 0.05:
+                amt = delta
+            elif val2 > current_balance:
+                amt = val1
+            else:
+                amt = -val1
+            current_balance = val2
+            raw_desc = f"{desc} [{current_subacc}]" if current_subacc else desc
+            parsed_transactions.append(
+                ParsedTransaction(
+                    transaction_date=tx_date,
+                    amount=amt,
+                    merchant=clean_merchant_name(desc),
+                    raw_description=raw_desc.strip(),
+                    category=auto_categorize(desc),
+                    currency=currency,
+                )
+            )
+            i += 1
+            continue
+
+        date_m = re.match(r"^(\d{2}/\d{2}/\d{4})\s*(.*)$", line)
+        if date_m:
+            d_str = date_m.group(1)
+            try:
+                tx_date = datetime.strptime(d_str, "%d/%m/%Y").date()
+            except ValueError:
+                i += 1
+                continue
+            desc_parts = [date_m.group(2)] if date_m.group(2) else []
+            i += 1
+
+            amt_line_found = False
+            while i < len(lines):
+                cur = lines[i]
+                amt_m = re.match(r"^([0-9,]+\.[0-9]{2})\s+([0-9,]+\.[0-9]{2})$", cur)
+                if amt_m:
+                    val1 = float(amt_m.group(1).replace(",", ""))
+                    val2 = float(amt_m.group(2).replace(",", ""))
+                    delta = round(val2 - current_balance, 2)
+                    if abs(round(abs(delta) - val1, 2)) < 0.05:
+                        amt = delta
+                    elif val2 > current_balance:
+                        amt = val1
+                    else:
+                        amt = -val1
+                    current_balance = val2
+
+                    desc = " ".join(filter(None, desc_parts)).strip()
+                    raw_desc = f"{desc} [{current_subacc}]" if current_subacc else desc
+                    parsed_transactions.append(
+                        ParsedTransaction(
+                            transaction_date=tx_date,
+                            amount=amt,
+                            merchant=clean_merchant_name(desc),
+                            raw_description=raw_desc.strip(),
+                            category=auto_categorize(desc),
+                            currency=currency,
+                        )
+                    )
+                    amt_line_found = True
+                    i += 1
+                    break
+                elif re.match(r"^\d{2}/\d{2}/\d{4}", cur) or any(k in cur for k in ("Total Balance", "Page ", "Transaction Details", "DBS Multiplier", "DBS Savings")):
+                    break
+                else:
+                    desc_parts.append(cur)
+                    i += 1
+            if amt_line_found:
+                continue
+        i += 1
+
+    start_date = min((t.transaction_date for t in parsed_transactions), default=stmt_date)
+    end_date = stmt_date or max((t.transaction_date for t in parsed_transactions), default=None)
+
+    return StatementParseResult(
+        institution=detected_inst,
+        account_number_masked=account_number_masked,
+        account_name=account_name,
+        start_date=start_date,
+        end_date=end_date,
+        opening_balance=opening_balance,
+        closing_balance=closing_balance,
+        transaction_count=len(parsed_transactions),
+        transactions=parsed_transactions,
+        currency=currency,
+    )
+
+
+def parse_dbs_statement(full_text: str, detected_inst: str = "DBS Bank") -> StatementParseResult:
+    """Dedicated DBS Bank statement parser for all 3 account types:
+    1. Consolidated Statement (Savings / Multiplier)
+    2. Cashline Account
+    3. Credit Card Statement
+    """
+    is_cashline = bool(re.search(r"CASHLINE\s+ACCOUNT\s+NO|\bCASHLINE\b", full_text, re.I))
+    is_card = bool(
+        re.search(
+            r"CARD\s+NO\.?:|CREDIT\s+CARD|TOTAL\s+OUTSTANDING\s+BALANCE|GRAND\s+TOTAL\s+FOR\s+ALL\s+CARD|LIVE\s+FRESH",
+            full_text,
+            re.I,
+        )
+    ) and not is_cashline
+
+    if is_cashline:
+        return _parse_dbs_cashline(full_text, detected_inst)
+    elif is_card:
+        return _parse_dbs_card(full_text, detected_inst)
+    else:
+        return _parse_dbs_consolidated(full_text, detected_inst)
+
+
 def parse_pdf_statement(file_bytes: bytes, institution: str = "auto") -> StatementParseResult:
     """Parse text and tables from an official bank statement PDF."""
+    pdfplumber = None
     try:
         import pdfplumber
     except ImportError:
-        # Fallback if pdfplumber is not installed
+        pass
+
+    pypdf = None
+    try:
+        import pypdf
+    except ImportError:
+        pass
+
+    if pdfplumber is None and pypdf is None:
         return StatementParseResult(
             institution=institution,
             transaction_count=0,
@@ -310,43 +736,63 @@ def parse_pdf_statement(file_bytes: bytes, institution: str = "auto") -> Stateme
     start_date: Optional[date] = None
     end_date: Optional[date] = None
 
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        for page in pdf.pages:
-            page_text = page.extract_text() or ""
-            full_text += "\n" + page_text
+    if pdfplumber is not None:
+        try:
+            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+                for page in pdf.pages:
+                    page_text = page.extract_text() or ""
+                    full_text += "\n" + page_text
 
-            # 1. Attempt structured table extraction if bordered tables exist
-            tables = page.extract_tables()
-            for table in tables:
-                for row in table:
-                    if not row or len(row) < 3:
-                        continue
-                    col0 = (row[0] or "").strip()
-                    for fmt in ("%d %b %Y", "%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d"):
-                        try:
-                            parsed_dt = datetime.strptime(col0, fmt).date()
-                            desc = (row[1] or "").strip()
-                            amt_col = (row[2] or "").replace("$", "").replace(",", "").strip()
-                            amt = float(amt_col)
-                            merchant = clean_merchant_name(desc)
-                            parsed_transactions.append(
-                                ParsedTransaction(
-                                    transaction_date=parsed_dt,
-                                    amount=amt,
-                                    merchant=merchant,
-                                    raw_description=desc,
-                                    category=auto_categorize(desc),
-                                )
-                            )
-                            break
-                        except (ValueError, TypeError):
-                            continue
+                    # 1. Attempt structured table extraction if bordered tables exist
+                    try:
+                        tables = page.extract_tables()
+                    except Exception:
+                        tables = []
+                    for table in tables:
+                        for row in table:
+                            if not row or len(row) < 3:
+                                continue
+                            col0 = (row[0] or "").strip()
+                            for fmt in ("%d %b %Y", "%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d"):
+                                try:
+                                    parsed_dt = datetime.strptime(col0, fmt).date()
+                                    desc = (row[1] or "").strip()
+                                    amt_col = (row[2] or "").replace("$", "").replace(",", "").strip()
+                                    amt = float(amt_col)
+                                    merchant = clean_merchant_name(desc)
+                                    parsed_transactions.append(
+                                        ParsedTransaction(
+                                            transaction_date=parsed_dt,
+                                            amount=amt,
+                                            merchant=merchant,
+                                            raw_description=desc,
+                                            category=auto_categorize(desc),
+                                        )
+                                    )
+                                    break
+                                except (ValueError, TypeError):
+                                    continue
+        except Exception:
+            pass
+
+    if not full_text.strip() and pypdf is not None:
+        try:
+            reader = pypdf.PdfReader(io.BytesIO(file_bytes))
+            for page in reader.pages:
+                page_text = page.extract_text() or ""
+                full_text += "\n" + page_text
+        except Exception:
+            pass
 
     # Institution detection from full document text
     detected_inst = institution
     if not detected_inst or detected_inst.lower() in ("auto", "unknown"):
         found = detect_institution(full_text)
         detected_inst = found if found else "Unknown"
+
+    # Specialized institution parsing for DBS
+    if detected_inst == "DBS Bank" or re.search(r"\b(?:DBS|POSB)\b|dbs\.com|posb\.com", full_text, re.I):
+        return parse_dbs_statement(full_text, detected_inst="DBS Bank")
 
     # 2. Extract account metadata
     acc_num_match = re.search(r"\b([0-9]{2}-[0-9]{4}-[0-9]{7}-[0-9]{2,3})\b", full_text)
