@@ -213,6 +213,47 @@ class TestBudgetsRouter(unittest.TestCase):
         self.assertEqual(auto_categorize("TRANSFERWISE NZD"), "Transfers")
         self.assertEqual(auto_categorize("SHARESIES WALLET"), "Transfers")
 
+    def test_last_month_and_account_id_filter(self):
+        today = date.today()
+        first_this_month = date(today.year, today.month, 1)
+        last_day_prev_month = first_this_month - timedelta(days=1)
+        prev_month_mid = date(last_day_prev_month.year, last_day_prev_month.month, 15)
+
+        # Transaction in last month
+        tx_prev = Transaction(
+            transaction_date=prev_month_mid,
+            account_id=self.acc.id,
+            amount=-80.0,
+            merchant="Countdown",
+            category="Groceries",
+            raw_hash="hash_prev_month_1",
+        )
+        # Transaction in this month
+        tx_curr = Transaction(
+            transaction_date=today,
+            account_id=self.acc.id,
+            amount=-50.0,
+            merchant="Pak n Save",
+            category="Groceries",
+            raw_hash="hash_curr_month_1",
+        )
+        self.db.add_all([tx_prev, tx_curr])
+        self.db.commit()
+
+        # Query transactions for last_month
+        res = self.client.get(f"/transactions?period=last_month&account_id={self.acc.id}")
+        self.assertEqual(res.status_code, 200)
+        items = res.json()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["merchant"], "Countdown")
+
+        # Query spending breakdown for last_month
+        b_res = self.client.get("/budgets/breakdown?period=last_month")
+        self.assertEqual(b_res.status_code, 200)
+        b_data = b_res.json()
+        self.assertEqual(b_data["period"], "last_month")
+        self.assertEqual(b_data["total_spend"], 80.0)
+
 
 if __name__ == "__main__":
     unittest.main()

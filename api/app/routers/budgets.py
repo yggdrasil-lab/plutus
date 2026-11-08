@@ -126,7 +126,7 @@ def initialize_default_budgets(
 
 @router.get("/breakdown", response_model=SpendingBreakdownResponse)
 def get_spending_breakdown(
-    period: str = Query(default="month", description="'week', 'month', or 'all'"),
+    period: str = Query(default="month", description="'week', 'month', 'last_month', or 'all'"),
     db: Session = Depends(get_db),
 ):
     """Retrieve detailed category spending breakdown, budget utilization, and overspending warnings."""
@@ -142,11 +142,16 @@ def get_spending_breakdown(
         # 1st day of current month
         start_date = date(today.year, today.month, 1)
         end_date = today
+    elif period == "last_month":
+        # Full calendar month prior to current month
+        first_this_month = date(today.year, today.month, 1)
+        end_date = first_this_month - timedelta(days=1)
+        start_date = date(end_date.year, end_date.month, 1)
     elif period == "all":
         start_date = None
         end_date = None
     else:
-        raise HTTPException(status_code=400, detail="Invalid period. Choose 'week', 'month', or 'all'.")
+        raise HTTPException(status_code=400, detail="Invalid period. Choose 'week', 'month', 'last_month', or 'all'.")
 
     # Fetch active budget rules
     budget_rules = {r.category.lower(): r for r in db.scalars(select(BudgetRule).where(BudgetRule.is_active == True)).all()}

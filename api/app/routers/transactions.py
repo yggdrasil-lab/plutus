@@ -22,11 +22,12 @@ def list_transactions(
     start_date: Optional[date] = Query(default=None),
     end_date: Optional[date] = Query(default=None),
     category: Optional[str] = Query(default=None),
-    period: Optional[str] = Query(default=None, description="'week', 'month', or 'all'"),
+    period: Optional[str] = Query(default=None, description="'week', 'month', 'last_month', or 'all'"),
+    account_id: Optional[int] = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
     db: Session = Depends(get_db),
 ):
-    """List transactions with optional date range, period, and category filters."""
+    """List transactions with optional date range, period, account_id, and category filters."""
     if period:
         today = date.today()
         if period == "week":
@@ -35,16 +36,22 @@ def list_transactions(
         elif period == "month":
             start_date = date(today.year, today.month, 1)
             end_date = today
+        elif period == "last_month":
+            first_this_month = date(today.year, today.month, 1)
+            end_date = first_this_month - timedelta(days=1)
+            start_date = date(end_date.year, end_date.month, 1)
         elif period == "all":
             start_date = None
             end_date = None
         else:
-            raise HTTPException(status_code=400, detail="Invalid period. Choose 'week', 'month', or 'all'.")
+            raise HTTPException(status_code=400, detail="Invalid period. Choose 'week', 'month', 'last_month', or 'all'.")
 
     stmt = select(Transaction).options(
         joinedload(Transaction.account),
         joinedload(Transaction.receipt),
     )
+    if account_id is not None:
+        stmt = stmt.where(Transaction.account_id == account_id)
     if start_date:
         stmt = stmt.where(Transaction.transaction_date >= start_date)
     if end_date:
