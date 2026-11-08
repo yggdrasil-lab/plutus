@@ -26,6 +26,7 @@ DEFAULT_INSTITUTIONS: list[InstitutionInfo] = [
     InstitutionInfo(name="InvestNow", default_tier="growth", default_type="brokerage"),
     InstitutionInfo(name="Interactive Brokers", default_tier="growth", default_type="brokerage"),
     InstitutionInfo(name="Simplicity", default_tier="locked", default_type="kiwisaver"),
+    InstitutionInfo(name="DBS Bank", default_tier="cash", default_type="savings"),
 ]
 
 

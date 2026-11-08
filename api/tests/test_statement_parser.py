@@ -2,6 +2,8 @@
 
 import sys
 import unittest
+import unittest.mock
+from unittest.mock import patch, MagicMock
 from datetime import date
 from pathlib import Path
 
@@ -14,6 +16,7 @@ from app.services.statement_parser import (
     generate_transaction_hash,
     parse_csv_statement,
     parse_pdf_statement,
+    parse_dbs_statement,
 )
 
 
@@ -151,6 +154,117 @@ ANZ Bank New Zealand Limited
         self.assertEqual(result.transactions[2].amount, -400.00)
         self.assertEqual(result.transactions[3].amount, -20.00)
         self.assertEqual(result.transactions[0].merchant, "TRANSFERWISE RAYMUND TIEN 2051669430TW")
+
+    @unittest.mock.patch("pdfplumber.open")
+    def test_parse_dbs_consolidated_statement(self, mock_pdf_open):
+        """Verify DBS Consolidated (Savings/Multiplier) statement parses accounts, balances, and transactions."""
+        page_text = """DBS Bank Ltd
+Account Summary as at 31 Oct 2026
+Consolidated Statement
+DBS Savings Account 019-9-085673 SGD
+DBS Multiplier Account 120-210091-2 SGD
+Current and Savings Account Total: SGD Equivalent 300.00
+DBS Savings Account Account No. 019-9-085673
+Balance Brought Forward 0.00
+30/09/2026 Funds Transfer 85.00 85.00
+30/09/2026 Funds Transfer 85.00 0.00
+DBS Multiplier Account Account No. 120-210091-2
+Balance Brought Forward 0.00
+19/10/2026 IB:ZABLAN ARNIE RAMOS 305.00 305.00
+31/10/2026 Service Charge 5.00 300.00
+Total Balance Carried Forward in SGD: 300.00
+"""
+        mock_page = unittest.mock.MagicMock()
+        mock_page.extract_text.return_value = page_text
+        mock_page.extract_tables.return_value = []
+        mock_pdf = unittest.mock.MagicMock()
+        mock_pdf.pages = [mock_page]
+        mock_pdf_open.return_value.__enter__.return_value = mock_pdf
+
+        result = parse_pdf_statement(b"%PDF-1.4 mock dbs", institution="auto")
+        self.assertEqual(result.institution, "DBS Bank")
+        self.assertEqual(result.account_name, "DBS Savings / Multiplier")
+        self.assertEqual(result.account_number_masked, "019-9-085673 / 120-210091-2")
+        self.assertEqual(result.currency, "SGD")
+        self.assertEqual(result.closing_balance, 300.00)
+        self.assertEqual(result.transaction_count, 4)
+        self.assertEqual(result.transactions[0].amount, 85.00)
+        self.assertEqual(result.transactions[1].amount, -85.00)
+        self.assertEqual(result.transactions[2].amount, 305.00)
+        self.assertEqual(result.transactions[3].amount, -5.00)
+
+    @unittest.mock.patch("pdfplumber.open")
+    def test_parse_dbs_cashline_statement(self, mock_pdf_open):
+        """Verify DBS Cashline statement parses credit line, transactions, and balances."""
+        page_text = """DBS Bank Ltd
+CASHLINE ACCOUNT NO: 082-502918-8
+STATEMENT PRINTED ON 20 Oct 2026
+PREVIOUS BALANCE 228.42
+Total Outstanding Balance S$117.78
+DATE TRANSACTION ACTIVITY AMOUNT
+28 Sep 2026 PAYMENT - DBS INTERNET/WIRELESS 228.42 CR
+20 Oct 2026 CASHCARE PROTECTOR 0.68
+002IL (24M) 5.88%PA+2%PF (20/24MTH) 107.10
+20 Oct 2026 INTEREST CHARGED THIS STATEMENT 10.00
+CLOSING BALANCE 117.78
+"""
+        mock_page = unittest.mock.MagicMock()
+        mock_page.extract_text.return_value = page_text
+        mock_page.extract_tables.return_value = []
+        mock_pdf = unittest.mock.MagicMock()
+        mock_pdf.pages = [mock_page]
+        mock_pdf_open.return_value.__enter__.return_value = mock_pdf
+
+        result = parse_pdf_statement(b"%PDF-1.4 mock cashline", institution="auto")
+        self.assertEqual(result.institution, "DBS Bank")
+        self.assertEqual(result.account_name, "DBS Cashline")
+        self.assertEqual(result.account_number_masked, "082-502918-8")
+        self.assertEqual(result.currency, "SGD")
+        self.assertEqual(result.opening_balance, 228.42)
+        self.assertEqual(result.closing_balance, 117.78)
+        self.assertEqual(result.transaction_count, 4)
+        self.assertEqual(result.transactions[0].amount, 228.42)
+        self.assertEqual(result.transactions[1].amount, -0.68)
+        self.assertEqual(result.transactions[2].amount, -107.10)
+        self.assertEqual(result.transactions[3].amount, -10.00)
+
+    @unittest.mock.patch("pdfplumber.open")
+    def test_parse_dbs_credit_card_statement(self, mock_pdf_open):
+        """Verify DBS Credit Card statement parses card details, multi-line transactions, and balances."""
+        page_text = """DBS Bank Ltd
+LIVE FRESH DBS VISA PAYWAVE PLATINUM CARD NO: 4119 1101 0425 2926
+STATEMENT DATE 12 Oct 2026
+PREVIOUS BALANCE 347.28
+TOTAL: 377.26
+DATE DESCRIPTION AMOUNT
+28 SEP BILL PAYMENT - DBS INTERNET/WIRELESS
+REF NO 12345
+347.15 CR
+18 SEP BASE REWARDS 0.13 CR
+18 SEP ALL OTHER SPEND 0.65 CR
+10 OCT SPOTIFY 17.99
+11 OCT NETFLIX 23.98
+"""
+        mock_page = unittest.mock.MagicMock()
+        mock_page.extract_text.return_value = page_text
+        mock_page.extract_tables.return_value = []
+        mock_pdf = unittest.mock.MagicMock()
+        mock_pdf.pages = [mock_page]
+        mock_pdf_open.return_value.__enter__.return_value = mock_pdf
+
+        result = parse_pdf_statement(b"%PDF-1.4 mock card", institution="auto")
+        self.assertEqual(result.institution, "DBS Bank")
+        self.assertEqual(result.account_name, "Live Fresh Dbs Visa Paywave Platinum Card")
+        self.assertEqual(result.account_number_masked, "4119 1101 0425 2926")
+        self.assertEqual(result.currency, "SGD")
+        self.assertEqual(result.opening_balance, 347.28)
+        self.assertEqual(result.closing_balance, 377.26)
+        self.assertEqual(result.transaction_count, 5)
+        self.assertEqual(result.transactions[0].amount, 347.15)
+        self.assertEqual(result.transactions[1].amount, 0.13)
+        self.assertEqual(result.transactions[2].amount, 0.65)
+        self.assertEqual(result.transactions[3].amount, -17.99)
+        self.assertEqual(result.transactions[4].amount, -23.98)
 
 
 if __name__ == "__main__":
