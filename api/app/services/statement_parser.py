@@ -119,6 +119,15 @@ INSTITUTION_DETECTION_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\bBitcoin\b|\bBTC\b|\bBinance\b|\bEasyCrypto\b|\bCoinbase\b|\bKraken\b", re.I), "Crypto"),
 ]
 
+INSTITUTION_DEFAULT_CURRENCIES: dict[str, str] = {
+    "DBS Bank": "SGD",
+    "BDO Unibank": "PHP",
+    "BPI": "PHP",
+    "UnionBank": "PHP",
+    "Metrobank": "PHP",
+    "Interactive Brokers": "USD",
+}
+
 
 def detect_institution(text: str) -> Optional[str]:
     """Scan statement text for known banking and investment institution keywords."""
@@ -276,6 +285,13 @@ def parse_csv_statement(csv_content: str, institution: str = "auto") -> Statemen
     stmt_currency = "NZD"
     if parsed_list and parsed_list[0].currency:
         stmt_currency = parsed_list[0].currency
+    elif detected_inst in INSTITUTION_DEFAULT_CURRENCIES:
+        stmt_currency = INSTITUTION_DEFAULT_CURRENCIES[detected_inst]
+    else:
+        # Detect currency symbol or standard 3-letter currency code from header/content
+        cur_header_match = re.search(r"\b(SGD|USD|AUD|NZD|PHP|EUR|GBP|CAD|JPY|HKD)\b", csv_content[:1500], re.I)
+        if cur_header_match:
+            stmt_currency = cur_header_match.group(1).upper()
 
     return StatementParseResult(
         institution=detected_inst,
@@ -529,6 +545,13 @@ def _parse_dbs_card(full_text: str, detected_inst: str = "DBS Bank") -> Statemen
 
 def _parse_dbs_consolidated(full_text: str, detected_inst: str = "DBS Bank") -> StatementParseResult:
     currency = "SGD"
+    cur_match = re.search(r"Total\s+Balance\s+Carried\s+Forward\s+in\s+([A-Z]{3}):", full_text, re.I)
+    if not cur_match:
+        cur_match = re.search(r"Current\s+and\s+Savings\s+Account\s+Total:\s*([A-Z]{3})\s+Equivalent", full_text, re.I)
+    if not cur_match:
+        cur_match = re.search(r"DBS\s+(?:Savings|Multiplier|Current)\s+Account\s+[0-9-]+\s+([A-Z]{3})\b", full_text, re.I)
+    if cur_match:
+        currency = cur_match.group(1).upper()
     account_name = "DBS Savings / Multiplier"
     account_number_masked = None
 
@@ -978,6 +1001,14 @@ def parse_pdf_statement(file_bytes: bytes, institution: str = "auto") -> Stateme
         if not end_date:
             end_date = max(t.transaction_date for t in parsed_transactions)
 
+    stmt_currency = "NZD"
+    if detected_inst in INSTITUTION_DEFAULT_CURRENCIES:
+        stmt_currency = INSTITUTION_DEFAULT_CURRENCIES[detected_inst]
+    else:
+        cur_header_match = re.search(r"\b(SGD|USD|AUD|NZD|PHP|EUR|GBP|CAD|JPY|HKD)\b", full_text[:2000], re.I)
+        if cur_header_match:
+            stmt_currency = cur_header_match.group(1).upper()
+
     return StatementParseResult(
         institution=detected_inst,
         account_number_masked=account_number_masked,
@@ -988,4 +1019,5 @@ def parse_pdf_statement(file_bytes: bytes, institution: str = "auto") -> Stateme
         closing_balance=closing_balance,
         transaction_count=len(parsed_transactions),
         transactions=parsed_transactions,
+        currency=stmt_currency,
     )
