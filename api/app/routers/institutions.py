@@ -24,9 +24,12 @@ DEFAULT_INSTITUTIONS: list[InstitutionInfo] = [
     InstitutionInfo(name="Kernel", default_tier="growth", default_type="brokerage"),
     InstitutionInfo(name="Milford", default_tier="growth", default_type="brokerage"),
     InstitutionInfo(name="InvestNow", default_tier="growth", default_type="brokerage"),
-    InstitutionInfo(name="Interactive Brokers", default_tier="growth", default_type="brokerage"),
-    InstitutionInfo(name="Simplicity", default_tier="locked", default_type="kiwisaver"),
-    InstitutionInfo(name="DBS Bank", default_tier="cash", default_type="savings"),
+    InstitutionInfo(name="Interactive Brokers", default_tier="growth", default_type="brokerage", currency="USD"),
+    InstitutionInfo(name="Simplicity", default_tier="locked", default_type="kiwisaver", currency="NZD"),
+    InstitutionInfo(name="DBS Bank", default_tier="cash", default_type="savings", currency="SGD"),
+    InstitutionInfo(name="BDO Unibank", default_tier="cash", default_type="checking", currency="PHP"),
+    InstitutionInfo(name="BPI", default_tier="cash", default_type="checking", currency="PHP"),
+    InstitutionInfo(name="Wise", default_tier="cash", default_type="checking", currency="NZD"),
 ]
 
 

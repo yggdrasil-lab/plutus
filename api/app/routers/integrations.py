@@ -189,6 +189,7 @@ async def upload_statement(
     tier: Optional[str] = Query(default=None, description="Asset tier: cash, growth, or locked"),
     account_type: Optional[str] = Query(default=None, description="Account type: checking, savings, brokerage, kiwisaver"),
     account_name: Optional[str] = Query(default=None, description="Custom account name"),
+    currency: Optional[str] = Query(default=None, description="Custom currency override (e.g. SGD, USD, NZD)"),
     db: Session = Depends(get_db),
     _authorized: bool = Depends(verify_integration_token),
 ):
@@ -211,6 +212,9 @@ async def upload_statement(
         parse_result.closing_balance = closing_balance
         if parse_result.end_date is None:
             parse_result.end_date = date.today()
+
+    if currency and currency.strip():
+        parse_result.currency = currency.strip().upper()
 
     if commit:
         # Effective institution: use caller override if specific, else use auto-detected from statement

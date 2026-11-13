@@ -38,6 +38,10 @@ class TestInstitutionsRouter(unittest.TestCase):
         self.assertIn("Sharesies", names)
         self.assertIn("Simplicity", names)
         self.assertIn("Milford", names)
+        self.assertIn("DBS Bank", names)
+
+        dbs_info = next(i for i in insts if i.name == "DBS Bank")
+        self.assertEqual(dbs_info.currency, "SGD")
 
     def test_list_institutions_merges_custom_account(self):
         """Custom institutions from active accounts should automatically appear in directory."""

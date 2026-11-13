@@ -109,6 +109,15 @@ ANZ Bank New Zealand
 """
         result_anz = parse_csv_statement(csv_anz, institution="auto")
         self.assertEqual(result_anz.institution, "ANZ")
+        self.assertEqual(result_anz.currency, "NZD")
+
+        csv_dbs = """Date,Transaction Details,Amount,Balance
+DBS Bank Singapore
+2026-11-01,Salary,5000.00,10000.00
+"""
+        result_dbs = parse_csv_statement(csv_dbs, institution="auto")
+        self.assertEqual(result_dbs.institution, "DBS Bank")
+        self.assertEqual(result_dbs.currency, "SGD")
 
     def test_clean_merchant_name(self):
         """Banking transaction prefixes like AP, BP, DC, DD, VT should be stripped."""
