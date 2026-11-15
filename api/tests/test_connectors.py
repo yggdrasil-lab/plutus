@@ -303,3 +303,46 @@ class TestExternalConnectors(unittest.TestCase):
         )
         res = sync_akahu(self.db, days=14, gateway=FakeFeedGateway(feeds))
         self.assertEqual(res.transactions_created, 1)
+
+    def test_existing_unlinked_account_is_auto_linked_not_duplicated(self):
+        existing_anz = Account(
+            name="ANZ Freedom",
+            account_type="checking",
+            tier="cash",
+            institution="ANZ",
+            currency="NZD",
+            is_active=True,
+        )
+        self.db.add(existing_anz)
+        self.db.commit()
+        self.db.refresh(existing_anz)
+
+        feeds = normalize_akahu_feeds(
+            raw_accounts=[
+                {
+                    "_id": "acc_anz_live",
+                    "name": "ANZ Go",
+                    "type": "CHECKING",
+                    "connection": {"name": "ANZ"},
+                    "balance": {"current": 3200.00, "currency": "NZD"},
+                }
+            ],
+            raw_transactions=[
+                {
+                    "_id": "tx_anz_1",
+                    "_account": "acc_anz_live",
+                    "date": "2026-11-16T08:00:00Z",
+                    "amount": -12.00,
+                    "description": "CAFE",
+                }
+            ],
+        )
+        res = sync_akahu(self.db, days=14, gateway=FakeFeedGateway(feeds))
+        self.assertEqual(res.accounts_synced, 1)
+        self.assertEqual(res.accounts[0].account_id, existing_anz.id)
+        self.assertEqual(res.accounts[0].account_name, "ANZ Freedom")
+
+        all_accounts = self.db.scalars(select(Account)).all()
+        self.assertEqual(len(all_accounts), 1)
+        self.assertEqual(all_accounts[0].external_provider, "akahu")
+        self.assertEqual(all_accounts[0].external_account_id, "acc_anz_live")
