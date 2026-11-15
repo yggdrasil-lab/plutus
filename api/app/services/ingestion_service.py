@@ -3,8 +3,10 @@
 # ============================================================================
 # 1. IMPORTS & CONSTANTS
 # ============================================================================
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from decimal import Decimal
 from typing import Optional, Protocol
 
 from sqlalchemy import select
@@ -129,6 +131,11 @@ def _resolve_category_and_merchant(
     return merchant_name, resolved
 
 
+def _cross_source_key(tx_date: date, amount: float | Decimal) -> tuple[date, Decimal]:
+    """Build a normalized (date, 8dp amount) key for cross-source deduplication."""
+    return (tx_date, Decimal(str(amount)).quantize(Decimal("0.00000001")))
+
+
 def ingest_normalized_transactions(
     db: Session,
     account: Account,
@@ -144,6 +151,20 @@ def ingest_normalized_transactions(
         .order_by(CategorizationRule.priority.asc(), CategorizationRule.id.asc())
     ).all()
 
+    # Preload existing (date, amount) counts for this account so cross-source
+    # statement uploads do not duplicate API/email-synced rows with different merchant text.
+    tx_dates = {item.transaction_date for item in items}
+    existing_rows = db.execute(
+        select(Transaction.transaction_date, Transaction.amount).where(
+            Transaction.account_id == account.id,
+            Transaction.transaction_date.in_(tx_dates),
+        )
+    ).all()
+    existing_counts: Counter[tuple[date, Decimal]] = Counter(
+        _cross_source_key(row.transaction_date, row.amount) for row in existing_rows
+    )
+    batch_seen_counts: Counter[tuple[date, Decimal]] = Counter()
+
     created: list[Transaction] = []
     skipped = 0
 
@@ -155,6 +176,12 @@ def ingest_normalized_transactions(
             account_id=account.id,
         )
         if db.scalar(select(Transaction).where(Transaction.raw_hash == raw_hash)):
+            skipped += 1
+            continue
+
+        cs_key = _cross_source_key(item.transaction_date, item.amount)
+        batch_seen_counts[cs_key] += 1
+        if batch_seen_counts[cs_key] <= existing_counts[cs_key]:
             skipped += 1
             continue
 
