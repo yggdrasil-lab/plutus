@@ -21,6 +21,7 @@ from app.services.ingestion_service import (
 )
 
 WISE_BASE_URL = "https://api.wise.com/v1"
+WISE_V4_BASE_URL = "https://api.wise.com/v4"
 
 
 # ============================================================================
@@ -52,7 +53,7 @@ class HttpWiseGateway:
                 profile_id = profile["id"]
                 balances = self._get_json(
                     client,
-                    f"{WISE_BASE_URL}/profiles/{profile_id}/balances",
+                    f"{WISE_V4_BASE_URL}/profiles/{profile_id}/balances",
                     "Wise /balances",
                     params={"types": "STANDARD,SAVINGS"},
                 )

@@ -279,3 +279,27 @@ class TestExternalConnectors(unittest.TestCase):
         created, skipped, _ = ingest_normalized_transactions(self.db, account, statement_items)
         self.assertEqual(created, 1)
         self.assertEqual(skipped, 3)
+
+    def test_zero_amount_transaction_does_not_crash_transfer_reconcile(self):
+        feeds = normalize_akahu_feeds(
+            raw_accounts=[
+                {
+                    "_id": "acc_zero",
+                    "name": "ASB Card",
+                    "type": "CREDITCARD",
+                    "connection": {"name": "ASB"},
+                    "balance": {"current": 0.0, "currency": "NZD"},
+                }
+            ],
+            raw_transactions=[
+                {
+                    "_id": "tx_zero",
+                    "_account": "acc_zero",
+                    "date": "2026-11-15T10:00:00Z",
+                    "amount": 0.00,
+                    "description": "CARD AUTH CHECK",
+                }
+            ],
+        )
+        res = sync_akahu(self.db, days=14, gateway=FakeFeedGateway(feeds))
+        self.assertEqual(res.transactions_created, 1)
