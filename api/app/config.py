@@ -18,6 +18,18 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_model: str = "app-synthesize"
     jev_model: str = "jev-decision"
+    akahu_app_token: str = Field(
+        default="",
+        validation_alias=AliasChoices("PLUTUS_AKAHU_APP_TOKEN", "AKAHU_APP_TOKEN"),
+    )
+    akahu_user_token: str = Field(
+        default="",
+        validation_alias=AliasChoices("PLUTUS_AKAHU_USER_TOKEN", "AKAHU_USER_TOKEN"),
+    )
+    wise_api_token: str = Field(
+        default="",
+        validation_alias=AliasChoices("PLUTUS_WISE_API_TOKEN", "WISE_API_TOKEN"),
+    )
     discord_bot_token: str | None = Field(
         default=None,
         validation_alias=AliasChoices("PLUTUS_DISCORD_BOT_TOKEN", "DISCORD_BOT_TOKEN"),

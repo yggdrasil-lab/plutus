@@ -24,6 +24,9 @@ class AccountCreate(AccountBase):
 
 class AccountRead(AccountBase):
     id: int
+    external_provider: Optional[str] = None
+    external_account_id: Optional[str] = None
+    last_synced_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
 
@@ -426,6 +429,40 @@ class RunwayAiSynthesisRead(BaseModel):
     simulated_runway_years: Optional[float] = None
     is_perpetual: bool = False
     delta_weeks_compared_to_baseline: Optional[float] = None
+
+
+# --- External Connector & Ingestion Schemas ---
+class SyncAccountSummary(BaseModel):
+    account_id: int
+    account_name: str
+    institution: str
+    currency: str
+    balance: Optional[float] = None
+    transactions_created: int = 0
+    transactions_skipped: int = 0
+
+
+class SyncResult(BaseModel):
+    provider: str
+    accounts_synced: int = 0
+    transactions_created: int = 0
+    transactions_skipped: int = 0
+    snapshots_updated: int = 0
+    accounts: list[SyncAccountSummary] = Field(default_factory=list)
+
+
+class DbsAlertPayload(BaseModel):
+    """Inbound email alert payload forwarded from Cloudflare Email Worker."""
+    subject: str = Field(..., max_length=300)
+    text: str = Field(..., min_length=1)
+    from_address: Optional[str] = Field(default=None, max_length=200)
+    account_name: Optional[str] = Field(default=None, max_length=100)
+
+
+class DbsAlertResult(BaseModel):
+    status: str
+    transaction: Optional[TransactionRead] = None
+    duplicate: bool = False
 
 
 from app.services.statement_parser import ParsedTransaction, StatementParseResult
