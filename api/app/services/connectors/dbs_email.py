@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from app.models import Account
 from app.schemas import DbsAlertPayload, DbsAlertResult
 from app.services.ingestion_service import (
+    ExternalAccountSpec,
     NormalizedTx,
     get_or_create_external_account,
     ingest_normalized_transactions,
@@ -106,13 +107,15 @@ def ingest_dbs_alert(db: Session, payload: DbsAlertPayload) -> DbsAlertResult:
     if not account:
         account = get_or_create_external_account(
             db,
-            provider="dbs_email",
-            external_id=f"dbs-{normalized.currency.lower()}",
-            name=payload.account_name or f"DBS Singapore ({normalized.currency})",
-            institution="DBS",
-            account_type="checking",
-            tier="cash",
-            currency=normalized.currency,
+            ExternalAccountSpec(
+                provider="dbs_email",
+                external_id=f"dbs-{normalized.currency.lower()}",
+                name=payload.account_name or f"DBS Singapore ({normalized.currency})",
+                institution="DBS",
+                account_type="checking",
+                tier="cash",
+                currency=normalized.currency,
+            ),
         )
 
     created_count, skipped_count, created_txs = ingest_normalized_transactions(

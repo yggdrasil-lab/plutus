@@ -1,7 +1,7 @@
 """Machine-to-machine integrations router for Shortcuts, Siri, and document ingestion."""
 
 from datetime import date, timedelta
-from typing import Optional
+from typing import Callable, Optional
 
 from fastapi import (
     APIRouter,
@@ -32,6 +32,11 @@ from app.services.connectors import ConnectorConfigError, ConnectorUpstreamError
 from app.services.connectors.akahu import sync_akahu
 from app.services.connectors.dbs_email import ingest_dbs_alert
 from app.services.connectors.wise import sync_wise
+from app.services.ingestion_service import (
+    NormalizedTx,
+    ingest_normalized_transactions,
+    upsert_account_snapshot,
+)
 from app.services.jev_client import classify_transaction_jev
 from app.services.receipt_service import reconcile_unlinked_receipts
 from app.services.transfer_service import reconcile_transfers
@@ -282,88 +287,40 @@ async def upload_statement(
             db.commit()
             db.refresh(account)
 
-        target_account_id = account.id
-
-        # 1. Commit transactions with deduplication
-        # 1. Query active user categorization rules to evaluate before heuristics or Jev
-        active_rules = db.scalars(
-            select(CategorizationRule)
-            .where(CategorizationRule.is_active == True)
-            .order_by(CategorizationRule.priority.asc(), CategorizationRule.id.asc())
-        ).all()
-
-        for ptx in parse_result.transactions:
-            raw_hash = generate_transaction_hash(
-                tx_date=ptx.transaction_date,
+        normalized_items = [
+            NormalizedTx(
+                transaction_date=ptx.transaction_date,
                 amount=ptx.amount,
+                currency=ptx.currency or parse_result.currency,
                 merchant=ptx.merchant,
-                account_id=target_account_id,
+                category=ptx.category,
+                raw_description=ptx.raw_description,
+                exchange_rate=ptx.exchange_rate,
+                fee_amount=ptx.fee_amount,
             )
-            existing = db.scalar(select(Transaction).where(Transaction.raw_hash == raw_hash))
-            if not existing:
-                desc = ptx.raw_description or ptx.merchant
-                rule_cat, rename, rule_id = evaluate_rules(desc, ptx.amount, active_rules)
-                merchant_name = rename if rename else ptx.merchant
+            for ptx in parse_result.transactions
+        ]
+        ingest_normalized_transactions(db, account, normalized_items)
 
-                if rule_cat:
-                    tx_cat = rule_cat
-                    if rule_id:
-                        matched_rule = next((r for r in active_rules if r.id == rule_id), None)
-                        if matched_rule:
-                            matched_rule.match_count += 1
-                else:
-                    tx_cat = ptx.category
-                    if not tx_cat or tx_cat == "General":
-                        jev_cat, _ = classify_transaction_jev(merchant_name, ptx.amount)
-                        tx_cat = jev_cat if jev_cat and jev_cat != "General" else auto_categorize(merchant_name)
-
-                tx = Transaction(
-                    transaction_date=ptx.transaction_date,
-                    account_id=target_account_id,
-                    amount=ptx.amount,
-                    currency=ptx.currency or parse_result.currency,
-                    merchant=merchant_name,
-                    category=tx_cat,
-                    raw_description=ptx.raw_description,
-                    raw_hash=raw_hash,
-                    exchange_rate=ptx.exchange_rate,
-                    fee_amount=ptx.fee_amount,
-                )
-                db.add(tx)
-
-        # 2. If closing balance is detected, commit an asset snapshot anchor
         if parse_result.closing_balance is not None and parse_result.end_date is not None:
-            bal_nzd = parse_result.closing_balance
-            existing_snap = db.scalar(
-                select(AssetSnapshot).where(
-                    AssetSnapshot.account_id == target_account_id,
-                    AssetSnapshot.snapshot_date == parse_result.end_date,
-                )
+            snap_source = "statement_pdf" if filename.endswith(".pdf") else "statement_csv"
+            upsert_account_snapshot(
+                db,
+                account=account,
+                snapshot_date=parse_result.end_date,
+                balance=parse_result.closing_balance,
+                currency=parse_result.currency,
+                source=snap_source,
+                notes=f"Auto-anchored from {filename}",
             )
-            if existing_snap:
-                existing_snap.balance = parse_result.closing_balance
-                existing_snap.balance_nzd = bal_nzd
-                existing_snap.source = "statement_pdf" if filename.endswith(".pdf") else "statement_csv"
-            else:
-                snap = AssetSnapshot(
-                    account_id=target_account_id,
-                    snapshot_date=parse_result.end_date,
-                    balance=parse_result.closing_balance,
-                    currency=parse_result.currency,
-                    exchange_rate=1.0,
-                    balance_nzd=bal_nzd,
-                    source="statement_pdf" if filename.endswith(".pdf") else "statement_csv",
-                    notes=f"Auto-anchored from {filename}",
-                )
-                db.add(snap)
-
-        db.commit()
-
-        # 3. Auto-reconcile with any unlinked receipts and internal transfers
-        reconcile_unlinked_receipts(db)
-        reconcile_transfers(db)
 
     return parse_result
+
+
+SYNC_HANDLERS: dict[str, Callable[[Session, int], SyncResult]] = {
+    "akahu": lambda db, days: sync_akahu(db, days=days),
+    "wise": lambda db, days: sync_wise(db, days=days),
+}
 
 
 @router.post("/sync/{provider}", response_model=SyncResult)
@@ -375,22 +332,15 @@ def sync_external_provider(
 ):
     """Trigger live sync for Akahu or Wise accounts and transactions."""
     normalized = provider.strip().lower()
+    if normalized != "all" and normalized not in SYNC_HANDLERS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported sync provider '{provider}'. Use 'akahu', 'wise', or 'all'.",
+        )
+
+    targets = list(SYNC_HANDLERS.values()) if normalized == "all" else [SYNC_HANDLERS[normalized]]
     try:
-        if normalized == "akahu":
-            return sync_akahu(db, days=days)
-        if normalized == "wise":
-            return sync_wise(db, days=days)
-        if normalized == "all":
-            akahu_res = sync_akahu(db, days=days)
-            wise_res = sync_wise(db, days=days)
-            return SyncResult(
-                provider="all",
-                accounts_synced=akahu_res.accounts_synced + wise_res.accounts_synced,
-                transactions_created=akahu_res.transactions_created + wise_res.transactions_created,
-                transactions_skipped=akahu_res.transactions_skipped + wise_res.transactions_skipped,
-                snapshots_updated=akahu_res.snapshots_updated + wise_res.snapshots_updated,
-                accounts=[*akahu_res.accounts, *wise_res.accounts],
-            )
+        results = [handler(db, days) for handler in targets]
     except ConnectorConfigError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -402,9 +352,16 @@ def sync_external_provider(
             detail=str(exc),
         ) from exc
 
-    raise HTTPException(
-        status_code=status.HTTP_400_BAD_REQUEST,
-        detail=f"Unsupported sync provider '{provider}'. Use 'akahu', 'wise', or 'all'.",
+    if len(results) == 1:
+        return results[0]
+
+    return SyncResult(
+        provider="all",
+        accounts_synced=sum(r.accounts_synced for r in results),
+        transactions_created=sum(r.transactions_created for r in results),
+        transactions_skipped=sum(r.transactions_skipped for r in results),
+        snapshots_updated=sum(r.snapshots_updated for r in results),
+        accounts=[acc for r in results for acc in r.accounts],
     )
 
 

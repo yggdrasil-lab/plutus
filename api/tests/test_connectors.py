@@ -1,11 +1,9 @@
-"""Unit tests for Akahu, Wise, and DBS email alert connectors."""
+"""Unit tests for Akahu, Wise, and DBS email alert connectors (SOLID / FakeGateway)."""
 
-import json
 from pathlib import Path
 import sys
 import unittest
 
-import httpx
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
@@ -16,9 +14,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.config import settings
 from app.db import Base, get_db
 from app.main import app
-from app.models import Account, AssetSnapshot, Transaction
-from app.services.connectors.akahu import sync_akahu
-from app.services.connectors.wise import sync_wise
+from app.models import AssetSnapshot, Transaction
+from app.services.connectors.akahu import normalize_akahu_feeds, sync_akahu
+from app.services.connectors.wise import normalize_wise_feed, sync_wise
+from app.services.ingestion_service import ProviderAccountFeed
 
 TEST_DB_URL = "sqlite:///:memory:"
 engine = create_engine(
@@ -27,6 +26,16 @@ engine = create_engine(
     poolclass=StaticPool,
 )
 TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+class FakeFeedGateway:
+    """In-memory BankFeedGateway stub for zero-network unit testing."""
+
+    def __init__(self, feeds: list[ProviderAccountFeed]) -> None:
+        self._feeds = feeds
+
+    def fetch_feeds(self, *, days: int) -> list[ProviderAccountFeed]:
+        return self._feeds
 
 
 class TestExternalConnectors(unittest.TestCase):
@@ -56,82 +65,53 @@ class TestExternalConnectors(unittest.TestCase):
         Base.metadata.drop_all(bind=engine)
         app.dependency_overrides.clear()
 
-    def test_sync_akahu_fail_loud_without_credentials(self):
+    def test_sync_fail_loud_without_credentials(self):
         settings.akahu_app_token = ""
         settings.akahu_user_token = ""
-        resp = self.client.post("/integrations/sync/akahu")
-        self.assertEqual(resp.status_code, 503)
-
-    def test_sync_wise_fail_loud_without_credentials(self):
         settings.wise_api_token = ""
-        resp = self.client.post("/integrations/sync/wise")
-        self.assertEqual(resp.status_code, 503)
+        self.assertEqual(self.client.post("/integrations/sync/akahu").status_code, 503)
+        self.assertEqual(self.client.post("/integrations/sync/wise").status_code, 503)
+        self.assertEqual(self.client.post("/integrations/sync/unknown").status_code, 400)
 
-    def test_akahu_sync_paginated_and_idempotent(self):
-        settings.akahu_app_token = "app_tok_test"
-        settings.akahu_user_token = "user_tok_test"
+    def test_akahu_normalizer_and_idempotent_sync(self):
+        feeds = normalize_akahu_feeds(
+            raw_accounts=[
+                {
+                    "_id": "acc_asb_1",
+                    "name": "ASB Streamline",
+                    "type": "CHECKING",
+                    "connection": {"name": "ASB"},
+                    "balance": {"current": 4500.25, "currency": "NZD"},
+                }
+            ],
+            raw_transactions=[
+                {
+                    "_id": "tx_1",
+                    "_account": "acc_asb_1",
+                    "date": "2026-11-15T10:00:00Z",
+                    "amount": -42.50,
+                    "description": "PAK N SAVE ALBANY",
+                    "merchant": {"name": "Pak n Save"},
+                    "category": {"name": "Groceries"},
+                },
+                {
+                    "_id": "tx_2",
+                    "_account": "acc_asb_1",
+                    "date": "2026-11-14T09:00:00Z",
+                    "amount": 2500.00,
+                    "description": "SALARY",
+                    "category": {"name": "Income"},
+                },
+            ],
+        )
+        gateway = FakeFeedGateway(feeds)
 
-        def handler(request: httpx.Request) -> httpx.Response:
-            if request.url.path == "/v1/accounts":
-                return httpx.Response(
-                    200,
-                    json={
-                        "items": [
-                            {
-                                "_id": "acc_asb_1",
-                                "name": "ASB Streamline",
-                                "type": "CHECKING",
-                                "connection": {"name": "ASB"},
-                                "balance": {"current": 4500.25, "currency": "NZD"},
-                            }
-                        ]
-                    },
-                )
-            if request.url.path == "/v1/transactions":
-                cursor = request.url.params.get("cursor")
-                if not cursor:
-                    return httpx.Response(
-                        200,
-                        json={
-                            "items": [
-                                {
-                                    "_id": "tx_1",
-                                    "_account": "acc_asb_1",
-                                    "date": "2026-11-15T10:00:00Z",
-                                    "amount": -42.50,
-                                    "description": "PAK N SAVE ALBANY",
-                                    "merchant": {"name": "Pak n Save"},
-                                    "category": {"name": "Groceries"},
-                                }
-                            ],
-                            "cursor": {"next": "page_2"},
-                        },
-                    )
-                return httpx.Response(
-                    200,
-                    json={
-                        "items": [
-                            {
-                                "_id": "tx_2",
-                                "_account": "acc_asb_1",
-                                "date": "2026-11-14T09:00:00Z",
-                                "amount": 2500.00,
-                                "description": "SALARY",
-                                "category": {"name": "Income"},
-                            }
-                        ],
-                        "cursor": {"next": None},
-                    },
-                )
-            return httpx.Response(404)
-
-        mock_client = httpx.Client(transport=httpx.MockTransport(handler))
-        res1 = sync_akahu(self.db, days=14, client=mock_client)
+        res1 = sync_akahu(self.db, days=14, gateway=gateway)
         self.assertEqual(res1.accounts_synced, 1)
         self.assertEqual(res1.transactions_created, 2)
         self.assertEqual(res1.snapshots_updated, 1)
 
-        res2 = sync_akahu(self.db, days=14, client=mock_client)
+        res2 = sync_akahu(self.db, days=14, gateway=gateway)
         self.assertEqual(res2.transactions_created, 0)
         self.assertEqual(res2.transactions_skipped, 2)
 
@@ -139,47 +119,32 @@ class TestExternalConnectors(unittest.TestCase):
         self.assertEqual(len(snaps), 1)
         self.assertEqual(float(snaps[0].balance), 4500.25)
 
-    def test_wise_sync_and_idempotency(self):
-        settings.wise_api_token = "wise_tok_test"
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            if request.url.path == "/v1/profiles":
-                return httpx.Response(200, json=[{"id": 999, "type": "PERSONAL"}])
-            if request.url.path == "/v1/profiles/999/balances":
-                return httpx.Response(
-                    200,
-                    json=[
-                        {
-                            "id": 101,
-                            "currency": "SGD",
-                            "type": "STANDARD",
-                            "amount": {"value": 1200.50, "currency": "SGD"},
-                        }
-                    ],
-                )
-            if request.url.path == "/v1/profiles/999/balance-statements/101/statement.json":
-                return httpx.Response(
-                    200,
-                    json={
-                        "transactions": [
-                            {
-                                "referenceNumber": "TRANSFER-1",
-                                "date": "2026-11-15T12:00:00Z",
-                                "amount": {"value": -500.00, "currency": "SGD"},
-                                "totalFees": {"value": 3.25, "currency": "SGD"},
-                                "exchangeDetails": {"rate": 1.245},
-                                "details": {
-                                    "description": "Sent to NZD",
-                                    "recipient": {"name": "Raymund NZD"},
-                                },
-                            }
-                        ]
+    def test_wise_normalizer_and_idempotent_sync(self):
+        feed = normalize_wise_feed(
+            profile={"id": 999, "type": "PERSONAL"},
+            balance={
+                "id": 101,
+                "currency": "SGD",
+                "type": "STANDARD",
+                "amount": {"value": 1200.50, "currency": "SGD"},
+            },
+            raw_transactions=[
+                {
+                    "referenceNumber": "TRANSFER-1",
+                    "date": "2026-11-15T12:00:00Z",
+                    "amount": {"value": -500.00, "currency": "SGD"},
+                    "totalFees": {"value": 3.25, "currency": "SGD"},
+                    "exchangeDetails": {"rate": 1.245},
+                    "details": {
+                        "description": "Sent to NZD",
+                        "recipient": {"name": "Raymund NZD"},
                     },
-                )
-            return httpx.Response(404)
+                }
+            ],
+        )
+        gateway = FakeFeedGateway([feed])
 
-        mock_client = httpx.Client(transport=httpx.MockTransport(handler))
-        res1 = sync_wise(self.db, days=14, client=mock_client)
+        res1 = sync_wise(self.db, days=14, gateway=gateway)
         self.assertEqual(res1.accounts_synced, 1)
         self.assertEqual(res1.transactions_created, 1)
         self.assertEqual(res1.snapshots_updated, 1)
@@ -189,7 +154,7 @@ class TestExternalConnectors(unittest.TestCase):
         self.assertEqual(tx.currency, "SGD")
         self.assertEqual(float(tx.fee_amount), 3.25)
 
-        res2 = sync_wise(self.db, days=14, client=mock_client)
+        res2 = sync_wise(self.db, days=14, gateway=gateway)
         self.assertEqual(res2.transactions_created, 0)
         self.assertEqual(res2.transactions_skipped, 1)
 
@@ -209,7 +174,6 @@ class TestExternalConnectors(unittest.TestCase):
         self.assertEqual(data["transaction"]["currency"], "SGD")
         self.assertEqual(data["transaction"]["merchant"], "FAIRPRICE FINEST")
 
-        # Duplicate alert should not create a second transaction
         dup_resp = self.client.post(
             "/integrations/dbs-alert",
             json={
@@ -220,7 +184,6 @@ class TestExternalConnectors(unittest.TestCase):
         self.assertEqual(dup_resp.status_code, 200)
         self.assertTrue(dup_resp.json()["duplicate"])
 
-        # Incoming credit alert
         credit_resp = self.client.post(
             "/integrations/dbs-alert",
             json={
@@ -231,7 +194,6 @@ class TestExternalConnectors(unittest.TestCase):
         self.assertEqual(credit_resp.status_code, 200)
         self.assertEqual(float(credit_resp.json()["transaction"]["amount"]), 250.00)
 
-        # Unparseable payload fails loud with 422
         bad_resp = self.client.post(
             "/integrations/dbs-alert",
             json={"subject": "DBS Security Notice", "text": "Your OTP is 123456."},
