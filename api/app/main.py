@@ -1,15 +1,36 @@
 """FastAPI entrypoint for Plutus wealth and runway engine."""
 
+import asyncio
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.routers import accounts, admin, budgets, health, institutions, integrations, mcp, products, receipts, rules, runway, transactions
+from app.services.sync_scheduler import periodic_sync_loop
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Manage background periodic sync task in production."""
+    stop_event = asyncio.Event()
+    task = None
+    if settings.environment == "production" and settings.sync_interval_hours > 0:
+        task = asyncio.create_task(periodic_sync_loop(stop_event, settings.sync_interval_hours))
+    try:
+        yield
+    finally:
+        stop_event.set()
+        if task:
+            await task
+
 
 app = FastAPI(
     title="Plutus API",
     description="Central wealth, ledger, asset valuation, and runway engine for Yggdrasil.",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 # CORS configuration allowing Midas PWA and local development
