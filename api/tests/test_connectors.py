@@ -1,5 +1,6 @@
 """Unit tests for Akahu, Wise, and DBS email alert connectors (SOLID / FakeGateway)."""
 
+from datetime import date
 from pathlib import Path
 import sys
 import unittest
@@ -14,10 +15,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.config import settings
 from app.db import Base, get_db
 from app.main import app
-from app.models import AssetSnapshot, Transaction
+from app.models import Account, AssetSnapshot, Transaction
 from app.services.connectors.akahu import normalize_akahu_feeds, sync_akahu
 from app.services.connectors.wise import normalize_wise_feed, sync_wise
-from app.services.ingestion_service import ProviderAccountFeed
+from app.services.ingestion_service import (
+    NormalizedTx,
+    ProviderAccountFeed,
+    ingest_normalized_transactions,
+)
 
 TEST_DB_URL = "sqlite:///:memory:"
 engine = create_engine(
@@ -199,3 +204,78 @@ class TestExternalConnectors(unittest.TestCase):
             json={"subject": "DBS Security Notice", "text": "Your OTP is 123456."},
         )
         self.assertEqual(bad_resp.status_code, 422)
+
+    def test_cross_source_statement_upload_deduplicates_with_different_merchant(self):
+        # 1. Akahu syncs Pak n Save + two legitimate $5.50 coffees on the same day
+        feeds = normalize_akahu_feeds(
+            raw_accounts=[
+                {
+                    "_id": "acc_asb_2",
+                    "name": "ASB Everyday",
+                    "type": "CHECKING",
+                    "connection": {"name": "ASB"},
+                    "balance": {"current": 1000.00, "currency": "NZD"},
+                }
+            ],
+            raw_transactions=[
+                {
+                    "_id": "tx_pns",
+                    "_account": "acc_asb_2",
+                    "date": "2026-11-15T10:00:00Z",
+                    "amount": -42.50,
+                    "description": "PAK N SAVE",
+                    "merchant": {"name": "Pak n Save"},
+                },
+                {
+                    "_id": "tx_coffee_1",
+                    "_account": "acc_asb_2",
+                    "date": "2026-11-15T08:00:00Z",
+                    "amount": -5.50,
+                    "description": "COFFEE 1",
+                    "merchant": {"name": "Cafe A"},
+                },
+                {
+                    "_id": "tx_coffee_2",
+                    "_account": "acc_asb_2",
+                    "date": "2026-11-15T14:00:00Z",
+                    "amount": -5.50,
+                    "description": "COFFEE 2",
+                    "merchant": {"name": "Cafe B"},
+                },
+            ],
+        )
+        res = sync_akahu(self.db, days=14, gateway=FakeFeedGateway(feeds))
+        self.assertEqual(res.transactions_created, 3)
+
+        # 2. Later, a CSV/PDF statement is uploaded for the same account with
+        #    different merchant formatting, plus 1 genuinely new transaction
+        account = self.db.scalar(select(Account).where(Account.external_account_id == "acc_asb_2"))
+        statement_items = [
+            NormalizedTx(
+                transaction_date=date(2026, 11, 15),
+                amount=-42.50,
+                currency="NZD",
+                merchant="PAK N SAVE ALBANY 0421",
+            ),
+            NormalizedTx(
+                transaction_date=date(2026, 11, 15),
+                amount=-5.50,
+                currency="NZD",
+                merchant="CAFE AUCKLAND POS 1",
+            ),
+            NormalizedTx(
+                transaction_date=date(2026, 11, 15),
+                amount=-5.50,
+                currency="NZD",
+                merchant="CAFE B POS 2",
+            ),
+            NormalizedTx(
+                transaction_date=date(2026, 11, 15),
+                amount=-19.00,
+                currency="NZD",
+                merchant="NEW PHARMACY TX",
+            ),
+        ]
+        created, skipped, _ = ingest_normalized_transactions(self.db, account, statement_items)
+        self.assertEqual(created, 1)
+        self.assertEqual(skipped, 3)
