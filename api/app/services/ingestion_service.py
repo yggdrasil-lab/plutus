@@ -90,6 +90,26 @@ def get_or_create_external_account(
     if account:
         return account
 
+    # Link to an existing unlinked manual account when institution and currency match
+    unlinked_candidates = db.scalars(
+        select(Account).where(
+            Account.external_provider.is_(None),
+            Account.is_active == True,
+            Account.currency == spec.currency[:3].upper(),
+            Account.institution.ilike(f"%{spec.institution}%"),
+        )
+    ).all()
+    matched = next(
+        (c for c in unlinked_candidates if c.account_type == spec.account_type),
+        unlinked_candidates[0] if len(unlinked_candidates) == 1 else None,
+    )
+    if matched:
+        matched.external_provider = spec.provider
+        matched.external_account_id = spec.external_id
+        db.commit()
+        db.refresh(matched)
+        return matched
+
     account = Account(
         name=spec.name[:100],
         account_type=spec.account_type,
