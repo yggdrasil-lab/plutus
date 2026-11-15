@@ -31,8 +31,12 @@ def match_transfer_pair(tx: Transaction, db: Session) -> Optional[Transaction]:
     if tx.linked_transaction_id is not None:
         return None
 
+    tx_cat = (tx.category or "").strip().lower()
+    if tx_cat not in ("general", "transfers", "transfer"):
+        return None
+
     is_transfer = (
-        tx.category.lower() in ("transfers", "transfer")
+        tx_cat in ("transfers", "transfer")
         or TRANSFER_KEYWORDS.search(tx.merchant) is not None
         or (tx.raw_description and TRANSFER_KEYWORDS.search(tx.raw_description) is not None)
     )
@@ -64,40 +68,58 @@ def match_transfer_pair(tx: Transaction, db: Session) -> Optional[Transaction]:
             .where(Transaction.transaction_date <= date_max)
         )
 
-    candidates = db.scalars(stmt).all()
+    candidates = [
+        cand
+        for cand in db.scalars(stmt).all()
+        if (cand.category or "").strip().lower() in ("general", "transfers", "transfer")
+    ]
     if not candidates or float(tx.amount) == 0.0:
         return None
+
+    candidates.sort(key=lambda c: abs((c.transaction_date - tx.transaction_date).days))
 
     outflow_tx = tx if tx.amount < 0 else None
     inflow_tx = tx if tx.amount > 0 else None
 
     best_match: Optional[Transaction] = None
 
+    # Pass 1: Same-Currency Exact Match (always preferred over cross-currency)
     for cand in candidates:
         cand_outflow = cand if cand.amount < 0 else outflow_tx
         cand_inflow = cand if cand.amount > 0 else inflow_tx
         if not cand_outflow or not cand_inflow:
             continue
 
+        if cand_outflow.currency != cand_inflow.currency:
+            continue
+
         out_amt = abs(float(cand_outflow.amount))
         in_amt = float(cand_inflow.amount)
+        fee = float(cand_outflow.fee_amount or 0.0)
+        net_out = out_amt - fee
+        if abs(net_out - in_amt) <= 0.05 or abs(out_amt - in_amt) <= 0.05:
+            best_match = cand
+            cand_outflow.exchange_rate = 1.0
+            cand_inflow.exchange_rate = 1.0
+            if abs(out_amt - in_amt) > 0.05 and not cand_outflow.fee_amount:
+                diff = round(out_amt - in_amt, 2)
+                if 0 < diff <= 50.0:
+                    cand_outflow.fee_amount = diff
+            break
 
-        # 1. Same-Currency Match
-        if cand_outflow.currency == cand_inflow.currency:
-            fee = float(cand_outflow.fee_amount or 0.0)
-            net_out = out_amt - fee
-            if abs(net_out - in_amt) <= 0.05 or abs(out_amt - in_amt) <= 0.05:
-                best_match = cand
-                cand_outflow.exchange_rate = 1.0
-                cand_inflow.exchange_rate = 1.0
-                if abs(out_amt - in_amt) > 0.05 and not cand_outflow.fee_amount:
-                    diff = round(out_amt - in_amt, 2)
-                    if 0 < diff <= 50.0:
-                        cand_outflow.fee_amount = diff
-                break
+    # Pass 2: Multi-Currency (FX / Remittance / Crypto) Match
+    if not best_match:
+        for cand in candidates:
+            cand_outflow = cand if cand.amount < 0 else outflow_tx
+            cand_inflow = cand if cand.amount > 0 else inflow_tx
+            if not cand_outflow or not cand_inflow:
+                continue
 
-        # 2. Multi-Currency (FX / Remittance / Crypto) Match
-        else:
+            if cand_outflow.currency == cand_inflow.currency:
+                continue
+
+            out_amt = abs(float(cand_outflow.amount))
+            in_amt = float(cand_inflow.amount)
             desc_text = f"{cand_outflow.merchant} {cand_outflow.raw_description or ''} {cand_inflow.merchant} {cand_inflow.raw_description or ''}".lower()
             has_transfer_signal = (
                 cand_outflow.category.lower() in ("transfers", "transfer")
