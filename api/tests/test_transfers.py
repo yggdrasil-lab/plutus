@@ -413,6 +413,109 @@ TRANSFER-98765433,05-11-2026,500.00,NZD,Client Payment Invoice 101,Freelance,500
         self.assertEqual(tx2.category, "Income")
         self.assertEqual(tx2.currency, "NZD")
 
+    def test_same_currency_preferred_over_foreign_currency_candidate(self):
+        """Verify NZD-to-NZD transfer pairs with exact NZD leg instead of a nearby USD candidate."""
+        d = date(2026, 11, 10)
+
+        # Unrelated foreign-currency inflow on Wise USD within 4-day window
+        wise_tx = Transaction(
+            transaction_date=d,
+            account_id=self.acc_wise.id,
+            amount=120.00,
+            currency="USD",
+            merchant="Wise USD Credit",
+            category="General",
+            raw_hash="wise_usd_distractor_1",
+        )
+        # Same-currency ANZ/ASB outflow & inflow
+        nzd_out = Transaction(
+            transaction_date=d,
+            account_id=self.acc_asb.id,
+            amount=-200.00,
+            currency="NZD",
+            merchant="Transfer to Savings",
+            category="Transfers",
+            raw_hash="nzd_out_same_curr_1",
+        )
+        nzd_in = Transaction(
+            transaction_date=d,
+            account_id=self.acc_sharesies.id,
+            amount=200.00,
+            currency="NZD",
+            merchant="Transfer from Checking",
+            category="General",
+            raw_hash="nzd_in_same_curr_1",
+        )
+        self.db.add_all([wise_tx, nzd_out, nzd_in])
+        self.db.commit()
+        self.db.refresh(wise_tx)
+        self.db.refresh(nzd_out)
+        self.db.refresh(nzd_in)
+
+        matched = match_transfer_pair(nzd_out, self.db)
+        self.assertIsNotNone(matched)
+        self.assertEqual(matched.id, nzd_in.id)
+        self.db.refresh(nzd_out)
+        self.db.refresh(nzd_in)
+        self.assertEqual(float(nzd_out.exchange_rate), 1.0)
+        self.assertEqual(float(nzd_in.exchange_rate), 1.0)
+
+    def test_recategorize_transfer_to_expense_clears_link_and_fx_rate(self):
+        """Verify changing a linked transfer to an expense category (e.g. Gym) clears FX rate and unlinks both legs."""
+        d = date(2026, 11, 12)
+        out_tx = Transaction(
+            transaction_date=d,
+            account_id=self.acc_asb.id,
+            amount=-35.00,
+            currency="NZD",
+            merchant="Transfer Badminton Club",
+            category="Transfers",
+            raw_hash="badminton_out_1",
+            exchange_rate=0.612,
+            fee_amount=1.50,
+        )
+        in_tx = Transaction(
+            transaction_date=d,
+            account_id=self.acc_wise.id,
+            amount=21.42,
+            currency="USD",
+            merchant="Wise Receipt",
+            category="Transfers",
+            raw_hash="badminton_in_1",
+            exchange_rate=0.612,
+        )
+        self.db.add_all([out_tx, in_tx])
+        self.db.commit()
+        self.db.refresh(out_tx)
+        self.db.refresh(in_tx)
+
+        out_tx.linked_transaction_id = in_tx.id
+        in_tx.linked_transaction_id = out_tx.id
+        self.db.commit()
+
+        res = self.client.patch(
+            f"/transactions/{out_tx.id}",
+            json={"category": "Gym"},
+        )
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(data["category"], "Gym")
+        self.assertIsNone(data["linked_transaction_id"])
+        self.assertIsNone(data["exchange_rate"])
+        self.assertIsNone(data["fee_amount"])
+
+        self.db.expire_all()
+        self.db.refresh(in_tx)
+        self.assertIsNone(in_tx.linked_transaction_id)
+        self.assertIsNone(in_tx.exchange_rate)
+        self.assertIsNone(in_tx.fee_amount)
+
+        # Subsequent reconciliation must not re-link the Gym transaction
+        reconcile_transfers(self.db)
+        self.db.refresh(out_tx)
+        self.assertIsNone(out_tx.linked_transaction_id)
+        self.assertIsNone(out_tx.exchange_rate)
+
 
 if __name__ == "__main__":
     unittest.main()

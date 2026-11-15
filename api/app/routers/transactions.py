@@ -86,6 +86,16 @@ def update_transaction(
         if not cat:
             raise HTTPException(status_code=400, detail="Category name cannot be empty")
         tx.category = cat
+        if cat.lower() not in ("transfers", "transfer"):
+            if tx.linked_transaction_id is not None:
+                partner = db.get(Transaction, tx.linked_transaction_id)
+                if partner is not None:
+                    partner.linked_transaction_id = None
+                    partner.exchange_rate = None
+                    partner.fee_amount = None
+            tx.linked_transaction_id = None
+            tx.exchange_rate = None
+            tx.fee_amount = None
 
     if payload.merchant is not None:
         m = payload.merchant.strip()
