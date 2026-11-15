@@ -20,7 +20,18 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.db import get_db
 from app.models import Account, AssetSnapshot, CategorizationRule, Transaction
-from app.schemas import QuickLogRequest, StatementParseResult, TransactionRead
+from app.schemas import (
+    DbsAlertPayload,
+    DbsAlertResult,
+    QuickLogRequest,
+    StatementParseResult,
+    SyncResult,
+    TransactionRead,
+)
+from app.services.connectors import ConnectorConfigError, ConnectorUpstreamError
+from app.services.connectors.akahu import sync_akahu
+from app.services.connectors.dbs_email import ingest_dbs_alert
+from app.services.connectors.wise import sync_wise
 from app.services.jev_client import classify_transaction_jev
 from app.services.receipt_service import reconcile_unlinked_receipts
 from app.services.transfer_service import reconcile_transfers
@@ -353,3 +364,61 @@ async def upload_statement(
         reconcile_transfers(db)
 
     return parse_result
+
+
+@router.post("/sync/{provider}", response_model=SyncResult)
+def sync_external_provider(
+    provider: str,
+    days: int = Query(default=14, ge=1, le=90, description="Lookback window in days"),
+    db: Session = Depends(get_db),
+    _authorized: bool = Depends(verify_integration_token),
+):
+    """Trigger live sync for Akahu or Wise accounts and transactions."""
+    normalized = provider.strip().lower()
+    try:
+        if normalized == "akahu":
+            return sync_akahu(db, days=days)
+        if normalized == "wise":
+            return sync_wise(db, days=days)
+        if normalized == "all":
+            akahu_res = sync_akahu(db, days=days)
+            wise_res = sync_wise(db, days=days)
+            return SyncResult(
+                provider="all",
+                accounts_synced=akahu_res.accounts_synced + wise_res.accounts_synced,
+                transactions_created=akahu_res.transactions_created + wise_res.transactions_created,
+                transactions_skipped=akahu_res.transactions_skipped + wise_res.transactions_skipped,
+                snapshots_updated=akahu_res.snapshots_updated + wise_res.snapshots_updated,
+                accounts=[*akahu_res.accounts, *wise_res.accounts],
+            )
+    except ConnectorConfigError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
+    except ConnectorUpstreamError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=str(exc),
+        ) from exc
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=f"Unsupported sync provider '{provider}'. Use 'akahu', 'wise', or 'all'.",
+    )
+
+
+@router.post("/dbs-alert", response_model=DbsAlertResult)
+def receive_dbs_alert(
+    payload: DbsAlertPayload,
+    db: Session = Depends(get_db),
+    _authorized: bool = Depends(verify_integration_token),
+):
+    """Ingest a forwarded DBS transaction alert email from Cloudflare Email Worker."""
+    try:
+        return ingest_dbs_alert(db, payload)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc

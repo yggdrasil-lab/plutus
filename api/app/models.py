@@ -38,6 +38,9 @@ class Account(Base):
     currency: Mapped[str] = mapped_column(String(3), nullable=False, default="NZD")
     expected_annual_return: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    external_provider: Mapped[Optional[str]] = mapped_column(String(30), nullable=True, index=True)
+    external_account_id: Mapped[Optional[str]] = mapped_column(String(150), nullable=True, index=True)
+    last_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
