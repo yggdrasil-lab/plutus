@@ -65,7 +65,7 @@ def match_transfer_pair(tx: Transaction, db: Session) -> Optional[Transaction]:
         )
 
     candidates = db.scalars(stmt).all()
-    if not candidates:
+    if not candidates or float(tx.amount) == 0.0:
         return None
 
     outflow_tx = tx if tx.amount < 0 else None
@@ -76,6 +76,8 @@ def match_transfer_pair(tx: Transaction, db: Session) -> Optional[Transaction]:
     for cand in candidates:
         cand_outflow = cand if cand.amount < 0 else outflow_tx
         cand_inflow = cand if cand.amount > 0 else inflow_tx
+        if not cand_outflow or not cand_inflow:
+            continue
 
         out_amt = abs(float(cand_outflow.amount))
         in_amt = float(cand_inflow.amount)
