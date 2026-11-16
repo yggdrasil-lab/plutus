@@ -44,7 +44,7 @@ TRANSACTION_GATES_SCHEMA = {
         },
         "tags": {
             "type": "list",
-            "instructions": "1 to 3 short lowercase kebab-case tags for granular spend tracking (e.g. ['gym', 'fitness'], ['badminton', 'sports'], ['coffee'], ['skincare', 'supplements']).",
+            "instructions": "1 to 3 short atomic composable lowercase tags for cross-category querying (split compound concepts: e.g. ['gym', 'subscription'], ['mobile', 'subscription'], ['cloud', 'subscription'], ['badminton', 'sports'], ['coffee'], ['skincare']).",
         },
     }
 }
