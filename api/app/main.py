@@ -2,7 +2,11 @@
 
 import asyncio
 from contextlib import asynccontextmanager
+import logging
+from pathlib import Path
 
+from alembic import command as alembic_command
+from alembic.config import Config as AlembicConfig
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -11,13 +15,29 @@ from app.routers import accounts, admin, budgets, health, institutions, integrat
 from app.services.sync_scheduler import periodic_sync_loop
 
 
+logger = logging.getLogger(__name__)
+
+
+def _ensure_migrations_current() -> None:
+    """Apply any pending Alembic migrations before serving traffic in production."""
+    alembic_ini = Path(__file__).resolve().parent.parent / "alembic.ini"
+    if not alembic_ini.exists():
+        raise RuntimeError(f"Alembic configuration not found at {alembic_ini}")
+    cfg = AlembicConfig(str(alembic_ini))
+    cfg.set_main_option("script_location", str(alembic_ini.parent / "alembic"))
+    alembic_command.upgrade(cfg, "head")
+    logger.info("Verified Alembic database migrations are at head.")
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """Manage background periodic sync task in production."""
+    """Manage startup migrations and background periodic sync task in production."""
     stop_event = asyncio.Event()
     task = None
-    if settings.environment == "production" and settings.sync_interval_hours > 0:
-        task = asyncio.create_task(periodic_sync_loop(stop_event, settings.sync_interval_hours))
+    if settings.environment == "production":
+        _ensure_migrations_current()
+        if settings.sync_interval_hours > 0:
+            task = asyncio.create_task(periodic_sync_loop(stop_event, settings.sync_interval_hours))
     try:
         yield
     finally:
