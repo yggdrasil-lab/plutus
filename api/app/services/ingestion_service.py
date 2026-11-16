@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from app.models import Account, AssetSnapshot, CategorizationRule, Transaction
 from app.schemas import SyncAccountSummary, SyncResult
 from app.services.fx_service import get_exchange_rate
-from app.services.jev_client import classify_transaction_jev
+from app.services.jev_client import classify_transaction_jev_with_tags
 from app.services.receipt_service import reconcile_unlinked_receipts
 from app.services.rules_engine import evaluate_rules, normalize_tags, parse_rule_tags
 from app.services.statement_parser import auto_categorize, generate_transaction_hash
@@ -135,26 +135,31 @@ def _resolve_category_and_merchant(
     item: NormalizedTx,
     active_rules: list[CategorizationRule],
 ) -> tuple[str, str, list[str]]:
-    """Resolve final (merchant, category, rule_tags) using rules, Jev, or heuristic fallback."""
+    """Resolve final (merchant, category, extra_tags) using rules, upstream category, and Jev."""
     desc = item.raw_description or item.merchant
     rule_cat, rename, rule_id = evaluate_rules(desc, item.amount, active_rules)
     merchant_name = (rename if rename else item.merchant)[:150]
 
+    extra_tags: list[str] = []
     if rule_cat:
-        rule_tags: list[str] = []
         if rule_id:
             matched = next((r for r in active_rules if r.id == rule_id), None)
             if matched:
                 matched.match_count += 1
-                rule_tags = parse_rule_tags(matched.target_tags)
-        return merchant_name, rule_cat, rule_tags
+                extra_tags = parse_rule_tags(matched.target_tags)
+        resolved_cat = rule_cat
+    elif item.category and item.category != "General":
+        resolved_cat = item.category
+    else:
+        jev_cat, _, jev_tags = classify_transaction_jev_with_tags(merchant_name, item.amount, item.notes)
+        resolved_cat = jev_cat if jev_cat and jev_cat != "General" else auto_categorize(merchant_name)
+        return merchant_name, resolved_cat, jev_tags
 
-    if item.category and item.category != "General":
-        return merchant_name, item.category, []
+    if not item.tags and not extra_tags and resolved_cat != "Transfers":
+        _, _, jev_tags = classify_transaction_jev_with_tags(merchant_name, item.amount, item.notes)
+        extra_tags = jev_tags
 
-    jev_cat, _ = classify_transaction_jev(merchant_name, item.amount, item.notes)
-    resolved = jev_cat if jev_cat and jev_cat != "General" else auto_categorize(merchant_name)
-    return merchant_name, resolved, []
+    return merchant_name, resolved_cat, extra_tags
 
 
 def _cross_source_key(tx_date: date, amount: float | Decimal) -> tuple[date, Decimal]:
