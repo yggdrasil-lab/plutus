@@ -96,4 +96,4 @@ def test_jev_tags_applied_when_untagged_even_with_category():
             )
         assert created == 1
         assert txs[0].category == "Insurance"
-        assert json.loads(txs[0].tags) == ["car", "insurance"]
+        assert json.loads(txs[0].tags) == ["car"]

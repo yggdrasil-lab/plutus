@@ -44,7 +44,7 @@ TRANSACTION_GATES_SCHEMA = {
         },
         "tags": {
             "type": "list",
-            "instructions": "1 to 3 short atomic composable lowercase tags for cross-category querying (split compound concepts: e.g. ['gym', 'subscription'], ['mobile', 'subscription'], ['cloud', 'subscription'], ['badminton', 'sports'], ['coffee'], ['skincare']).",
+            "instructions": "1 to 3 short atomic composable lowercase tags for cross-category querying (e.g. ['gym', 'subscription'], ['mobile', 'subscription'], ['car'], ['badminton', 'sports']). Never repeat the category name itself as a tag (e.g. never return 'insurance' for Insurance or 'food' for Food).",
         },
     }
 }
