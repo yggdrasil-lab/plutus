@@ -153,13 +153,16 @@ def _resolve_category_and_merchant(
     else:
         jev_cat, _, jev_tags = classify_transaction_jev_with_tags(merchant_name, item.amount, item.notes)
         resolved_cat = jev_cat if jev_cat and jev_cat != "General" else auto_categorize(merchant_name)
-        return merchant_name, resolved_cat, jev_tags
+        cat_lower = resolved_cat.strip().lower()
+        return merchant_name, resolved_cat, [t for t in jev_tags if t.strip().lower() != cat_lower]
 
     if not item.tags and not extra_tags:
         _, _, jev_tags = classify_transaction_jev_with_tags(merchant_name, item.amount, item.notes)
-        extra_tags = jev_tags or [resolved_cat.lower()]
+        extra_tags = jev_tags
 
-    return merchant_name, resolved_cat, extra_tags
+    cat_lower = resolved_cat.strip().lower()
+    filtered_extra = [t for t in extra_tags if t.strip().lower() != cat_lower]
+    return merchant_name, resolved_cat, filtered_extra
 
 
 def _cross_source_key(tx_date: date, amount: float | Decimal) -> tuple[date, Decimal]:

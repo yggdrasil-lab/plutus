@@ -84,7 +84,7 @@ AKAHU_TAG_HINTS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
     (("parking",), ("parking",)),
     (("uber", "taxi", "rideshare"), ("rideshare",)),
     (("transit", "transport"), ("transit",)),
-    (("electric", "power"), ("electricity", "utilities")),
+    (("electric", "power"), ("electricity",)),
     (("internet", "broadband"), ("internet", "subscription")),
     (("mobile", "phone", "telco"), ("mobile", "subscription")),
     (("gaming",), ("gaming",)),
