@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import Transaction
+from app.services.fx_service import get_exchange_rate
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,18 @@ TRANSFER_KEYWORDS = re.compile(
 )
 
 
+def _is_transfer_like(tx: Transaction) -> bool:
+    """Return True if a transaction is categorized as a transfer or contains transfer keywords."""
+    tx_cat = (tx.category or "").strip().lower()
+    if tx_cat not in ("general", "transfers", "transfer"):
+        return False
+    return bool(
+        tx_cat in ("transfers", "transfer")
+        or TRANSFER_KEYWORDS.search(tx.merchant or "") is not None
+        or (tx.raw_description and TRANSFER_KEYWORDS.search(tx.raw_description) is not None)
+    )
+
+
 def match_transfer_pair(tx: Transaction, db: Session) -> Optional[Transaction]:
     """Finds matching counter-leg for an account transfer.
 
@@ -31,16 +44,7 @@ def match_transfer_pair(tx: Transaction, db: Session) -> Optional[Transaction]:
     if tx.linked_transaction_id is not None:
         return None
 
-    tx_cat = (tx.category or "").strip().lower()
-    if tx_cat not in ("general", "transfers", "transfer"):
-        return None
-
-    is_transfer = (
-        tx_cat in ("transfers", "transfer")
-        or TRANSFER_KEYWORDS.search(tx.merchant) is not None
-        or (tx.raw_description and TRANSFER_KEYWORDS.search(tx.raw_description) is not None)
-    )
-    if not is_transfer:
+    if not _is_transfer_like(tx):
         return None
 
     # Multi-day window for international wire settlement, remittances, or crypto block confirmations
@@ -117,6 +121,8 @@ def match_transfer_pair(tx: Transaction, db: Session) -> Optional[Transaction]:
 
             if cand_outflow.currency == cand_inflow.currency:
                 continue
+            if not _is_transfer_like(cand):
+                continue
 
             out_amt = abs(float(cand_outflow.amount))
             in_amt = float(cand_inflow.amount)
@@ -141,8 +147,16 @@ def match_transfer_pair(tx: Transaction, db: Session) -> Optional[Transaction]:
 
             if net_out > 0:
                 implied_rate = in_amt / net_out
-                # Handle arbitrary currency pairs (fiat ratios and high/low crypto fractional rates)
                 if has_transfer_signal and implied_rate > 0:
+                    market = get_exchange_rate(
+                        db,
+                        rate_date=tx.transaction_date,
+                        from_currency=cand_outflow.currency,
+                        to_currency=cand_inflow.currency,
+                    )
+                    if market is not None and market[0] > 0:
+                        if abs(implied_rate - market[0]) / market[0] > 0.12:
+                            continue
                     best_match = cand
                     precision = 8 if implied_rate < 0.01 else 6 if implied_rate < 1.0 else 4
                     cand_outflow.exchange_rate = round(implied_rate, precision)
