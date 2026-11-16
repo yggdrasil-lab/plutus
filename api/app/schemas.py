@@ -440,6 +440,8 @@ class RunwayTierBreakdown(BaseModel):
     growth_balance: float
     locked_balance: float
     total_liquid_balance: float
+    total_liabilities: float = 0.0
+    net_worth: float = 0.0
     emergency_weeks: float
     growth_weeks: Optional[float] = None
     locked_weeks: Optional[float] = None
@@ -465,6 +467,7 @@ class RunwayScenarioRequest(BaseModel):
     weekly_burn_adjustment: float = Field(default=0.0, description="Adjustment in $/week (e.g. -150 to reduce burn)")
     custom_annual_return: Optional[float] = Field(default=None, ge=0.0, le=0.5, description="Custom real return rate")
     lump_sum_adjustment: float = Field(default=0.0, description="One-time asset injection or withdrawal")
+    pay_off_loans: bool = Field(default=False, description="Simulate paying off active loans from liquid assets")
 
 
 class RunwayScenarioResponse(BaseModel):
@@ -472,6 +475,10 @@ class RunwayScenarioResponse(BaseModel):
     simulated_runway_years: Optional[float]
     is_perpetual: bool
     delta_weeks_compared_to_baseline: Optional[float]
+    loan_free_date: Optional[date] = None
+    loan_weekly_relief: float = 0.0
+    total_liabilities: float = 0.0
+    simulated_net_worth: float = 0.0
 
 
 class RunwaySynthesizeRequest(BaseModel):
@@ -526,6 +533,60 @@ class DbsAlertResult(BaseModel):
     status: str
     transaction: Optional[TransactionRead] = None
     duplicate: bool = False
+
+
+class LoanBase(BaseModel):
+    name: str = Field(..., max_length=120)
+    lender: str = Field(..., max_length=120)
+    principal_amount: float = Field(..., gt=0.0)
+    annual_interest_rate: float = Field(..., ge=0.0, le=1.0)
+    term_months: int = Field(..., ge=1, le=600)
+    monthly_payment: float = Field(..., gt=0.0)
+    start_date: date
+    asset_value: Optional[float] = Field(default=None, ge=0.0)
+    currency: str = Field(default="NZD", max_length=3)
+    notes: Optional[str] = None
+    is_active: bool = True
+
+
+class LoanCreate(LoanBase):
+    pass
+
+
+class LoanUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, max_length=120)
+    lender: Optional[str] = Field(default=None, max_length=120)
+    principal_amount: Optional[float] = Field(default=None, gt=0.0)
+    annual_interest_rate: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    term_months: Optional[int] = Field(default=None, ge=1, le=600)
+    monthly_payment: Optional[float] = Field(default=None, gt=0.0)
+    start_date: Optional[date] = None
+    asset_value: Optional[float] = Field(default=None, ge=0.0)
+    notes: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class LoanRead(LoanBase):
+    id: int
+    payments_made: int
+    payments_remaining: int
+    payoff_date: date
+    next_payment_date: Optional[date] = None
+    remaining_principal: float
+    principal_paid: float
+    remaining_interest: float
+    weekly_payment_equivalent: float
+    net_worth_impact: float
+
+
+class LoansSummaryResponse(BaseModel):
+    loans: list[LoanRead] = Field(default_factory=list)
+    total_liabilities: float
+    total_asset_value: float
+    net_loan_impact: float
+    total_monthly_payment: float
+    total_weekly_payment: float
+    latest_payoff_date: Optional[date] = None
 
 
 from app.services.statement_parser import ParsedTransaction, StatementParseResult

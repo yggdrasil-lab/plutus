@@ -9,7 +9,8 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.db import get_db
-from app.models import Account, AssetSnapshot, BudgetRule, Transaction
+from app.models import Account, AssetSnapshot, BudgetRule, Loan, Transaction
+from app.services.loan_service import summarize_loans
 from app.schemas import (
     RunwayAiSynthesisRead,
     RunwayResponse,
@@ -165,11 +166,18 @@ def get_current_runway(
         "locked": locked_label,
     }
 
+    loans = db.scalars(select(Loan).where(Loan.is_active == True)).all()
+    loan_summary = summarize_loans(loans, today)
+    total_liabilities = float(loan_summary["total_liabilities"])
+    net_worth = round(total_liquid + locked_bal - total_liabilities, 2)
+
     breakdown = RunwayTierBreakdown(
         cash_balance=cash_bal,
         growth_balance=growth_bal,
         locked_balance=locked_bal,
         total_liquid_balance=total_liquid,
+        total_liabilities=total_liabilities,
+        net_worth=net_worth,
         emergency_weeks=emergency_weeks,
         growth_weeks=growth_weeks,
         locked_weeks=locked_weeks,
@@ -217,6 +225,11 @@ def simulate_runway_scenario(
 
     # Baseline calculation
     baseline_liquid = balances["cash"] + balances["growth"]
+    locked_bal = balances["locked"]
+    loans = db.scalars(select(Loan).where(Loan.is_active == True)).all()
+    loan_summary = summarize_loans(loans, today)
+    total_liabilities = float(loan_summary["total_liabilities"])
+    loan_weekly_relief = float(loan_summary["total_weekly_payment"])
     baseline_return = 0.05
     baseline_weeks, baseline_perpetual = calculate_compounding_runway(
         accessible_assets=baseline_liquid,
@@ -225,8 +238,10 @@ def simulate_runway_scenario(
     )
 
     # Simulated calculation
-    simulated_burn = max(1.0, weekly_burn + payload.weekly_burn_adjustment)
-    simulated_liquid = max(0.0, baseline_liquid + payload.lump_sum_adjustment)
+    burn_delta = payload.weekly_burn_adjustment - (loan_weekly_relief if payload.pay_off_loans else 0.0)
+    liquid_delta = payload.lump_sum_adjustment - (total_liabilities if payload.pay_off_loans else 0.0)
+    simulated_burn = max(1.0, weekly_burn + burn_delta)
+    simulated_liquid = max(0.0, baseline_liquid + liquid_delta)
     simulated_return = payload.custom_annual_return if payload.custom_annual_return is not None else baseline_return
 
     sim_weeks, is_perpetual = calculate_compounding_runway(
@@ -242,11 +257,18 @@ def simulate_runway_scenario(
     if not is_perpetual and not baseline_perpetual and sim_weeks is not None and baseline_weeks is not None:
         delta_weeks = round(sim_weeks - baseline_weeks, 2)
 
+    remaining_liabilities = 0.0 if payload.pay_off_loans else total_liabilities
+    simulated_net_worth = round(simulated_liquid + locked_bal - remaining_liabilities, 2)
+
     return RunwayScenarioResponse(
         simulated_runway_weeks=sim_weeks,
         simulated_runway_years=sim_years,
         is_perpetual=is_perpetual,
         delta_weeks_compared_to_baseline=delta_weeks,
+        loan_free_date=loan_summary["latest_payoff_date"],
+        loan_weekly_relief=loan_weekly_relief,
+        total_liabilities=remaining_liabilities,
+        simulated_net_worth=simulated_net_worth,
     )
 
 

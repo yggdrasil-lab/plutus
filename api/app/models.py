@@ -254,3 +254,24 @@ class ExchangeRate(Base):
     rate: Mapped[float] = mapped_column(Numeric(18, 8), nullable=False)
     source: Mapped[str] = mapped_column(String(30), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class Loan(Base):
+    """Financed liability (e.g. vehicle loan, mortgage) with amortization countdown."""
+
+    __tablename__ = "loans"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    lender: Mapped[str] = mapped_column(String(120), nullable=False)
+    principal_amount: Mapped[float] = mapped_column(Numeric(14, 2), nullable=False)
+    annual_interest_rate: Mapped[float] = mapped_column(Numeric(6, 4), nullable=False)
+    term_months: Mapped[int] = mapped_column(Integer, nullable=False)
+    monthly_payment: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    start_date: Mapped[date] = mapped_column(Date, nullable=False)
+    asset_value: Mapped[Optional[float]] = mapped_column(Numeric(14, 2), nullable=True)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False, default="NZD")
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)

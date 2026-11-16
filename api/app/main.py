@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.db import SessionLocal
-from app.routers import accounts, admin, budgets, health, institutions, integrations, mcp, products, receipts, rules, runway, transactions
+from app.routers import accounts, admin, budgets, health, institutions, integrations, loans, mcp, products, receipts, rules, runway, transactions
 from app.services.connectors.akahu import normalize_existing_legacy_categories
 from app.services.sync_scheduler import periodic_sync_loop
 
@@ -74,6 +74,7 @@ app.include_router(accounts.router)
 app.include_router(institutions.router)
 app.include_router(transactions.router)
 app.include_router(budgets.router)
+app.include_router(loans.router)
 app.include_router(rules.router)
 app.include_router(receipts.router)
 app.include_router(products.router)
