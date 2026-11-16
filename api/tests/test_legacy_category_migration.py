@@ -114,3 +114,56 @@ def test_normalize_legacy_categories_migration():
             sa.text("SELECT category FROM budget_rules WHERE id = 1")
         ).scalar()
         assert budget_cat == "Health"
+
+
+def test_normalize_existing_legacy_categories_startup_cleanup():
+    from app.services.connectors.akahu import normalize_existing_legacy_categories
+
+    engine = sa.create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        acc = Account(
+            name="ANZ",
+            institution="ANZ",
+            account_type="checking",
+            tier="cash",
+            currency="NZD",
+        )
+        session.add(acc)
+        session.flush()
+
+        samples = [
+            ("CityFitness", "Gyms, fitness, aquatic facilities, yoga, pilates", "h1"),
+            ("Chemist Warehouse", "Pharmacies", "h2"),
+            ("McDonalds", "Fast food stores", "h3"),
+            ("BP", "Fuel stations", "h4"),
+            ("Woolworths", "Supermarkets and grocery stores", "h5"),
+        ]
+        for merchant, cat, rhash in samples:
+            session.add(
+                Transaction(
+                    account_id=acc.id,
+                    transaction_date=date(2026, 11, 10),
+                    amount=-10.0,
+                    currency="NZD",
+                    merchant=merchant,
+                    category=cat,
+                    raw_hash=rhash,
+                    tags="[]",
+                )
+            )
+        session.commit()
+
+        updated = normalize_existing_legacy_categories(session)
+        assert updated == 5
+
+        txs = session.query(Transaction).order_by(Transaction.id).all()
+        assert [(t.category, json.loads(t.tags)) for t in txs] == [
+            ("Health", ["gyms-fitness-aquatic-facilities-yoga-pil"]),
+            ("Health", ["pharmacies"]),
+            ("Food", ["fast-food-stores"]),
+            ("Transport", ["fuel-stations"]),
+            ("Groceries", ["supermarkets-and-grocery-stores"]),
+        ]
+        assert normalize_existing_legacy_categories(session) == 0

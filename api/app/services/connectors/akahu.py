@@ -33,8 +33,25 @@ AKAHU_TYPE_MAP: dict[str, tuple[str, str]] = {
     "SAVINGS": ("savings", "cash"),
 }
 
+CANONICAL_CATEGORIES: frozenset[str] = frozenset(
+    {
+        "Groceries",
+        "Food",
+        "Transport",
+        "Utilities",
+        "Health",
+        "Leisure",
+        "Insurance",
+        "Travel",
+        "Housing",
+        "Transfers",
+        "Income",
+        "General",
+    }
+)
+
 AKAHU_CATEGORY_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
-    (("gym", "fitness", "health", "medical", "pharmacy", "dental", "doctor", "physio", "optom"), "Health"),
+    (("gym", "fitness", "health", "medical", "pharmac", "chemist", "dent", "doctor", "physio", "optom", "clinic", "hospital"), "Health"),
     (("supermarket", "grocer"), "Groceries"),
     (("cafe", "restaurant", "dining", "takeaway", "fast food", "bakery", "bar", "pub", "food"), "Food"),
     (("transport", "fuel", "petrol", "parking", "taxi", "rideshare", "uber", "transit", "toll", "vehicle"), "Transport"),
@@ -74,6 +91,39 @@ def normalize_akahu_category(
             tags.append(slug[:40])
 
     return canonical, tuple(tags)
+
+
+def normalize_existing_legacy_categories(db: Session) -> int:
+    """Normalize any non-canonical transaction categories in-place with tags."""
+    import json
+    from app.models import Transaction
+
+    rows = (
+        db.query(Transaction)
+        .filter(Transaction.category.notin_(CANONICAL_CATEGORIES))
+        .all()
+    )
+    if not rows:
+        return 0
+
+    for tx in rows:
+        canonical, new_tags = normalize_akahu_category(
+            tx.category, tx.merchant or "", tx.raw_description or ""
+        )
+        try:
+            existing_tags = json.loads(tx.tags) if tx.tags else []
+            if not isinstance(existing_tags, list):
+                existing_tags = []
+        except (ValueError, TypeError):
+            existing_tags = []
+        for tag in new_tags:
+            if tag not in existing_tags:
+                existing_tags.append(tag)
+        tx.category = canonical
+        tx.tags = json.dumps(existing_tags)
+
+    db.commit()
+    return len(rows)
 
 
 # ============================================================================
