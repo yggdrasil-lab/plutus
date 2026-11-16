@@ -1,6 +1,7 @@
 """Machine-to-machine integrations router for Shortcuts, Siri, and document ingestion."""
 
 from datetime import date, timedelta
+import logging
 from typing import Callable, Optional
 
 from fastapi import (
@@ -49,6 +50,7 @@ from app.services.statement_parser import (
 )
 
 router = APIRouter(prefix="/integrations", tags=["Integrations"])
+logger = logging.getLogger(__name__)
 
 
 def verify_integration_token(
@@ -350,6 +352,12 @@ def sync_external_provider(
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=str(exc),
+        ) from exc
+    except Exception as exc:
+        logger.exception("External sync failed for provider '%s'", normalized)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Sync failed ({type(exc).__name__}): {exc}",
         ) from exc
 
     if len(results) == 1:
