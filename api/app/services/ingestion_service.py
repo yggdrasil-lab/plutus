@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.models import Account, AssetSnapshot, CategorizationRule, Transaction
 from app.schemas import SyncAccountSummary, SyncResult
+from app.services.fx_service import get_exchange_rate
 from app.services.jev_client import classify_transaction_jev
 from app.services.receipt_service import reconcile_unlinked_receipts
 from app.services.rules_engine import evaluate_rules
@@ -208,16 +209,28 @@ def ingest_normalized_transactions(
             continue
 
         merchant_name, tx_cat = _resolve_category_and_merchant(item, active_rules)
+        tx_currency = (item.currency or account.currency or "NZD")[:10].upper()
+        tx_fx_rate = item.exchange_rate
+        if tx_fx_rate is None and tx_currency != "NZD":
+            resolved = get_exchange_rate(
+                db,
+                rate_date=item.transaction_date,
+                from_currency=tx_currency,
+                to_currency="NZD",
+            )
+            if resolved is not None:
+                tx_fx_rate = resolved[0]
+
         tx = Transaction(
             transaction_date=item.transaction_date,
             account_id=account.id,
             amount=item.amount,
-            currency=(item.currency or account.currency or "NZD")[:3].upper(),
+            currency=tx_currency[:3],
             merchant=merchant_name,
             category=tx_cat[:50],
             raw_description=item.raw_description,
             raw_hash=raw_hash,
-            exchange_rate=item.exchange_rate,
+            exchange_rate=tx_fx_rate,
             fee_amount=item.fee_amount,
             tags=json.dumps(list(dict.fromkeys(t.strip().lower().lstrip("#") for t in item.tags if t.strip()))),
             notes=item.notes,
@@ -248,6 +261,19 @@ def upsert_account_snapshot(
     notes: Optional[str] = None,
 ) -> AssetSnapshot:
     """Insert or update the balance snapshot for an account on a given date."""
+    normalized_currency = (currency or account.currency or "NZD")[:10].upper()
+    fx_rate = 1.0
+    if normalized_currency != "NZD":
+        resolved = get_exchange_rate(
+            db,
+            rate_date=snapshot_date,
+            from_currency=normalized_currency,
+            to_currency="NZD",
+        )
+        if resolved is not None:
+            fx_rate = resolved[0]
+    balance_nzd = round(float(balance) * fx_rate, 2)
+
     existing = db.scalar(
         select(AssetSnapshot).where(
             AssetSnapshot.account_id == account.id,
@@ -256,8 +282,9 @@ def upsert_account_snapshot(
     )
     if existing:
         existing.balance = balance
-        existing.balance_nzd = balance
-        existing.currency = currency[:3].upper()
+        existing.exchange_rate = fx_rate
+        existing.balance_nzd = balance_nzd
+        existing.currency = normalized_currency[:3]
         existing.source = source[:30]
         if notes:
             existing.notes = notes
@@ -269,9 +296,9 @@ def upsert_account_snapshot(
         account_id=account.id,
         snapshot_date=snapshot_date,
         balance=balance,
-        currency=currency[:3].upper(),
-        exchange_rate=1.0,
-        balance_nzd=balance,
+        currency=normalized_currency[:3],
+        exchange_rate=fx_rate,
+        balance_nzd=balance_nzd,
         source=source[:30],
         notes=notes,
     )
