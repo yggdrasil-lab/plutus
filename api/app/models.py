@@ -234,3 +234,20 @@ class ReceiptItem(Base):
 
     receipt: Mapped["Receipt"] = relationship("Receipt", back_populates="items")
     product: Mapped[Optional["Product"]] = relationship("Product", back_populates="receipt_items")
+
+
+class ExchangeRate(Base):
+    """Cached historical and spot FX rates for fiat and crypto conversions."""
+
+    __tablename__ = "exchange_rates"
+    __table_args__ = (
+        UniqueConstraint("rate_date", "from_currency", "to_currency", name="uq_exchange_rate_date_pair"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    rate_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    from_currency: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    to_currency: Mapped[str] = mapped_column(String(10), nullable=False, default="NZD")
+    rate: Mapped[float] = mapped_column(Numeric(18, 8), nullable=False)
+    source: Mapped[str] = mapped_column(String(30), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
