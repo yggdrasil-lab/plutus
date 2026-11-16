@@ -155,9 +155,9 @@ def _resolve_category_and_merchant(
         resolved_cat = jev_cat if jev_cat and jev_cat != "General" else auto_categorize(merchant_name)
         return merchant_name, resolved_cat, jev_tags
 
-    if not item.tags and not extra_tags and resolved_cat != "Transfers":
+    if not item.tags and not extra_tags:
         _, _, jev_tags = classify_transaction_jev_with_tags(merchant_name, item.amount, item.notes)
-        extra_tags = jev_tags
+        extra_tags = jev_tags or [resolved_cat.lower()]
 
     return merchant_name, resolved_cat, extra_tags
 
