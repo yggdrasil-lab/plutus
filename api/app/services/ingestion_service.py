@@ -7,6 +7,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
+import hashlib
 import json
 from typing import Optional, Protocol
 
@@ -189,26 +190,62 @@ def ingest_normalized_transactions(
         _cross_source_key(row.transaction_date, row.amount) for row in existing_rows
     )
     batch_seen_counts: Counter[tuple[date, Decimal]] = Counter()
+    seen_hashes: set[str] = set()
+    seen_external_notes: set[str] = set()
+    existing_external_notes = set(
+        n
+        for n in db.scalars(
+            select(Transaction.notes).where(
+                Transaction.account_id == account.id,
+                Transaction.notes.isnot(None),
+            )
+        ).all()
+        if n and n.startswith(("akahu:", "wise:"))
+    )
 
     created: list[Transaction] = []
     skipped = 0
 
     for item in items:
-        raw_hash = generate_transaction_hash(
+        ext_note = item.notes if (item.notes and item.notes.startswith(("akahu:", "wise:"))) else None
+        if ext_note and (ext_note in existing_external_notes or ext_note in seen_external_notes):
+            skipped += 1
+            continue
+
+        base_hash = generate_transaction_hash(
             tx_date=item.transaction_date,
             amount=item.amount,
             merchant=item.merchant,
             account_id=account.id,
         )
-        if db.scalar(select(Transaction).where(Transaction.raw_hash == raw_hash)):
-            skipped += 1
-            continue
+        hash_exists = (
+            base_hash in seen_hashes
+            or db.scalar(select(Transaction.id).where(Transaction.raw_hash == base_hash)) is not None
+        )
 
-        cs_key = _cross_source_key(item.transaction_date, item.amount)
-        batch_seen_counts[cs_key] += 1
-        if batch_seen_counts[cs_key] <= existing_counts[cs_key]:
-            skipped += 1
-            continue
+        if hash_exists:
+            if not ext_note:
+                skipped += 1
+                continue
+            raw_hash = hashlib.sha256(f"{base_hash}:{ext_note}".encode("utf-8")).hexdigest()
+            salted_exists = (
+                raw_hash in seen_hashes
+                or db.scalar(select(Transaction.id).where(Transaction.raw_hash == raw_hash)) is not None
+            )
+            if salted_exists:
+                skipped += 1
+                continue
+        else:
+            raw_hash = base_hash
+            cs_key = _cross_source_key(item.transaction_date, item.amount)
+            batch_seen_counts[cs_key] += 1
+            if batch_seen_counts[cs_key] <= existing_counts[cs_key]:
+                skipped += 1
+                continue
+
+        seen_hashes.add(raw_hash)
+        if ext_note:
+            seen_external_notes.add(ext_note)
 
         merchant_name, tx_cat, rule_tags = _resolve_category_and_merchant(item, active_rules)
         tx_currency = (item.currency or account.currency or "NZD")[:10].upper()
