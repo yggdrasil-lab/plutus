@@ -237,7 +237,7 @@ class TestExternalConnectors(unittest.TestCase):
                 {
                     "_id": "tx_coffee_2",
                     "_account": "acc_asb_2",
-                    "date": "2026-11-15T14:00:00Z",
+                    "date": "2026-11-15T09:00:00Z",
                     "amount": -5.50,
                     "description": "COFFEE 2",
                     "merchant": {"name": "Cafe B"},
