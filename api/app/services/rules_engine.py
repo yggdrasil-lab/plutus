@@ -1,10 +1,35 @@
 """Outlook-style transaction categorization rules engine."""
 
-from typing import Optional, Tuple
+import json
+import re
+from typing import Iterable, Optional, Tuple
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models import CategorizationRule, Transaction
+
+
+def normalize_tags(tags: Iterable[str]) -> list[str]:
+    """Normalize tags to deduplicated lowercase kebab-case tokens."""
+    seen: list[str] = []
+    for raw in tags:
+        cleaned = re.sub(r"\s+", "-", str(raw).strip().lower().lstrip("#"))
+        if cleaned and cleaned not in seen:
+            seen.append(cleaned)
+    return seen
+
+
+def parse_rule_tags(raw_tags: Optional[str]) -> list[str]:
+    """Parse JSON-encoded tag list from a CategorizationRule or Transaction."""
+    if not raw_tags:
+        return []
+    try:
+        parsed = json.loads(raw_tags)
+        if isinstance(parsed, list):
+            return normalize_tags(str(t) for t in parsed)
+    except (ValueError, TypeError):
+        pass
+    return []
 
 
 def matches_rule(rule: CategorizationRule, raw_description: str, amount: float) -> bool:
@@ -73,6 +98,7 @@ def apply_rules_to_existing_transactions(
     transactions = db.scalars(select(Transaction)).all()
     updated_count = 0
     rule_match_counts: dict[int, int] = {r.id: 0 for r in rules}
+    rules_by_id: dict[int, CategorizationRule] = {r.id: r for r in rules}
 
     for tx in transactions:
         desc = tx.raw_description or tx.merchant
@@ -87,6 +113,14 @@ def apply_rules_to_existing_transactions(
             if rename and tx.merchant != rename:
                 tx.merchant = rename
                 changed = True
+            matched_rule = rules_by_id.get(rule_id)
+            rule_tags = parse_rule_tags(matched_rule.target_tags if matched_rule else None)
+            if rule_tags:
+                existing_tags = parse_rule_tags(tx.tags)
+                merged_tags = normalize_tags([*existing_tags, *rule_tags])
+                if merged_tags != existing_tags:
+                    tx.tags = json.dumps(merged_tags)
+                    changed = True
             if changed:
                 updated_count += 1
 

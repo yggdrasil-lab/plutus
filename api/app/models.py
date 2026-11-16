@@ -147,6 +147,7 @@ class CategorizationRule(Base):
     match_type: Mapped[str] = mapped_column(String(20), nullable=False, default="contains")
     amount_equals: Mapped[Optional[float]] = mapped_column(Numeric(12, 2), nullable=True)
     target_category: Mapped[str] = mapped_column(String(50), nullable=False)
+    target_tags: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     rename_merchant: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
