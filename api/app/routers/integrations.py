@@ -1,6 +1,7 @@
 """Machine-to-machine integrations router for Shortcuts, Siri, and document ingestion."""
 
 from datetime import date, timedelta
+import json
 from typing import Callable, Optional
 
 from fastapi import (
@@ -37,7 +38,7 @@ from app.services.ingestion_service import (
     ingest_normalized_transactions,
     upsert_account_snapshot,
 )
-from app.services.jev_client import classify_transaction_jev
+from app.services.jev_client import classify_transaction_jev_with_tags
 from app.services.receipt_service import reconcile_unlinked_receipts
 from app.services.transfer_service import reconcile_transfers
 from app.services.rules_engine import evaluate_rules
@@ -139,8 +140,11 @@ def quick_log_expense(
     # Category resolution via Jev System One or rule-based fallback
     category = payload.category
     notes = payload.notes
+    jev_tags: list[str] = []
     if not category or category == "General":
-        jev_cat, is_anomaly = classify_transaction_jev(payload.merchant, payload.amount, payload.notes)
+        jev_cat, is_anomaly, jev_tags = classify_transaction_jev_with_tags(
+            payload.merchant, payload.amount, payload.notes
+        )
         if jev_cat and jev_cat != "General":
             category = jev_cat
         else:
@@ -158,6 +162,7 @@ def quick_log_expense(
         category=category,
         raw_description=f"QuickLog: {payload.merchant}",
         raw_hash=raw_hash,
+        tags=json.dumps(jev_tags),
         notes=notes,
     )
     db.add(tx)

@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from app.models import Account, AssetSnapshot, CategorizationRule, Transaction
 from app.schemas import SyncAccountSummary, SyncResult
 from app.services.fx_service import get_exchange_rate
-from app.services.jev_client import classify_transaction_jev
+from app.services.jev_client import classify_transaction_jev_with_tags
 from app.services.receipt_service import reconcile_unlinked_receipts
 from app.services.rules_engine import evaluate_rules, normalize_tags, parse_rule_tags
 from app.services.statement_parser import auto_categorize, generate_transaction_hash
@@ -151,9 +151,9 @@ def _resolve_category_and_merchant(
     if item.category and item.category != "General":
         return merchant_name, item.category, []
 
-    jev_cat, _ = classify_transaction_jev(merchant_name, item.amount, item.notes)
+    jev_cat, _, jev_tags = classify_transaction_jev_with_tags(merchant_name, item.amount, item.notes)
     resolved = jev_cat if jev_cat and jev_cat != "General" else auto_categorize(merchant_name)
-    return merchant_name, resolved, []
+    return merchant_name, resolved, jev_tags
 
 
 def _cross_source_key(tx_date: date, amount: float | Decimal) -> tuple[date, Decimal]:
