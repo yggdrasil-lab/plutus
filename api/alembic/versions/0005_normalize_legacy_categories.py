@@ -98,14 +98,14 @@ def upgrade() -> None:
         )
 
     rule_rows = bind.execute(
-        sa.text("SELECT id, category FROM categorization_rules")
+        sa.text("SELECT id, target_category FROM categorization_rules")
     ).fetchall()
     for rule_id, raw_category in rule_rows:
         if raw_category in CANONICAL_CATEGORIES:
             continue
         canonical, _ = _map_legacy_category(raw_category)
         bind.execute(
-            sa.text("UPDATE categorization_rules SET category = :cat WHERE id = :id"),
+            sa.text("UPDATE categorization_rules SET target_category = :cat WHERE id = :id"),
             {"cat": canonical, "id": rule_id},
         )
 
