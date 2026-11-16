@@ -62,7 +62,7 @@ class TestTransactionTagsAndAkahuCategories(unittest.TestCase):
             "Gyms, fitness, aquatic facilities, yoga, pilates", "Les Mills", "LES MILLS NZ"
         )
         self.assertEqual(cat, "Health")
-        self.assertEqual(tags, ("gym-membership",))
+        self.assertEqual(tags, ("gym", "subscription"))
 
         feeds = normalize_akahu_feeds(
             [
@@ -87,7 +87,7 @@ class TestTransactionTagsAndAkahuCategories(unittest.TestCase):
             ],
         )
         self.assertEqual(feeds[0].transactions[0].category, "Health")
-        self.assertEqual(feeds[0].transactions[0].tags, ("gym-membership",))
+        self.assertEqual(feeds[0].transactions[0].tags, ("gym", "subscription"))
 
     def test_create_update_and_filter_transaction_tags(self):
         res_create = self.client.post(

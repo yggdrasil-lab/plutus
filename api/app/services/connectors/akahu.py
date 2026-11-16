@@ -65,49 +65,49 @@ AKAHU_CATEGORY_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
 )
 
 
-AKAHU_TAG_HINTS: tuple[tuple[tuple[str, ...], str], ...] = (
-    (("gym", "fitness"), "gym-membership"),
-    (("aquatic", "pool", "swim"), "swimming"),
-    (("pharmac", "chemist"), "pharmacy"),
-    (("dent",), "dental"),
-    (("physio",), "physio"),
-    (("optom",), "optometry"),
-    (("doctor", "medical", "clinic", "hospital"), "medical"),
-    (("supermarket", "grocer"), "supermarket"),
-    (("cafe", "coffee"), "cafe"),
-    (("fast food", "takeaway"), "fast-food"),
-    (("bakery",), "bakery"),
-    (("restaurant", "dining"), "dining"),
-    (("bar", "pub"), "drinks"),
-    (("fuel", "petrol"), "fuel"),
-    (("parking",), "parking"),
-    (("uber", "taxi", "rideshare"), "rideshare"),
-    (("transit", "transport"), "public-transit"),
-    (("electric", "power"), "electricity"),
-    (("internet", "broadband"), "internet"),
-    (("mobile", "phone", "telco"), "mobile"),
-    (("gaming",), "gaming"),
-    (("streaming",), "streaming"),
-    (("cinema", "movie"), "movies"),
-    (("sport",), "sports"),
-    (("airline", "flight"), "flights"),
-    (("hotel", "accommodation"), "accommodation"),
+AKAHU_TAG_HINTS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    (("gym", "fitness"), ("gym", "subscription")),
+    (("aquatic", "pool", "swim"), ("swimming",)),
+    (("pharmac", "chemist"), ("pharmacy",)),
+    (("dent",), ("dental",)),
+    (("physio",), ("physio",)),
+    (("optom",), ("optometry",)),
+    (("doctor", "medical", "clinic", "hospital"), ("medical",)),
+    (("supermarket", "grocer"), ("supermarket",)),
+    (("cafe", "coffee"), ("cafe",)),
+    (("fast food", "takeaway"), ("fast-food", "takeaway")),
+    (("bakery",), ("bakery",)),
+    (("restaurant", "dining"), ("dining",)),
+    (("bar", "pub"), ("drinks",)),
+    (("fuel", "petrol"), ("fuel",)),
+    (("parking",), ("parking",)),
+    (("uber", "taxi", "rideshare"), ("rideshare",)),
+    (("transit", "transport"), ("transit",)),
+    (("electric", "power"), ("electricity", "utilities")),
+    (("internet", "broadband"), ("internet", "subscription")),
+    (("mobile", "phone", "telco"), ("mobile", "subscription")),
+    (("gaming",), ("gaming",)),
+    (("streaming",), ("streaming", "subscription")),
+    (("cinema", "movie"), ("movies",)),
+    (("sport",), ("sports",)),
+    (("airline", "flight"), ("flights",)),
+    (("hotel", "accommodation"), ("accommodation",)),
 )
 
 
-def _concise_akahu_tag(lower_category: str, canonical: str) -> Optional[str]:
-    """Derive a concise single-concept tag from Akahu's verbose category string."""
+def _concise_akahu_tags(lower_category: str, canonical: str) -> tuple[str, ...]:
+    """Derive concise, composable atomic tags from Akahu's verbose category string."""
     if not lower_category or lower_category in ("unknown", "other", "general", canonical.lower()):
-        return None
-    for keywords, tag in AKAHU_TAG_HINTS:
+        return ()
+    for keywords, tags in AKAHU_TAG_HINTS:
         if any(kw in lower_category for kw in keywords):
-            return tag
+            return tags
     # Fallback to first clause before comma/slash, capped at 24 chars
     head = re.split(r"[,/&]", lower_category, maxsplit=1)[0].strip()
     slug = re.sub(r"[^a-z0-9]+", "-", head).strip("-")[:24]
     if slug and slug != canonical.lower():
-        return slug
-    return None
+        return (slug,)
+    return ()
 
 
 def normalize_akahu_category(
@@ -115,7 +115,7 @@ def normalize_akahu_category(
     merchant: str,
     raw_description: str,
 ) -> tuple[str, tuple[str, ...]]:
-    """Map Akahu's raw category name into Plutus canonical categories plus a concise tag."""
+    """Map Akahu's raw category name into Plutus canonical categories plus concise tags."""
     cleaned = (raw_category or "").strip()
     lower = cleaned.lower()
 
@@ -129,8 +129,7 @@ def normalize_akahu_category(
     if not canonical:
         canonical = auto_categorize(f"{merchant} {raw_description}".strip())
 
-    tag = _concise_akahu_tag(lower, canonical)
-    return canonical, ((tag,) if tag else ())
+    return canonical, _concise_akahu_tags(lower, canonical)
 
 
 def normalize_existing_legacy_categories(db: Session) -> int:
