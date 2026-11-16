@@ -516,6 +516,54 @@ TRANSFER-98765433,05-11-2026,500.00,NZD,Client Payment Invoice 101,Freelance,500
         self.assertIsNone(out_tx.linked_transaction_id)
         self.assertIsNone(out_tx.exchange_rate)
 
+    def test_does_not_link_transfer_to_unrelated_general_purchase(self):
+        wise_sgd = Account(
+            name="Wise SGD",
+            institution="Wise",
+            account_type="checking",
+            tier="cash",
+            currency="SGD",
+        )
+        wise_nzd = Account(
+            name="Wise Checking",
+            institution="Wise",
+            account_type="checking",
+            tier="cash",
+            currency="NZD",
+        )
+        self.db.add_all([wise_sgd, wise_nzd])
+        self.db.commit()
+        self.db.refresh(wise_sgd)
+        self.db.refresh(wise_nzd)
+
+        deposit = Transaction(
+            transaction_date=date(2026, 11, 6),
+            account_id=wise_sgd.id,
+            amount=2000.0,
+            currency="SGD",
+            merchant="TIENZO RAYMUND MAGLALANG",
+            category="Transfers",
+            raw_hash="sgd-deposit-2000",
+        )
+        amazon = Transaction(
+            transaction_date=date(2026, 11, 2),
+            account_id=wise_nzd.id,
+            amount=-86.14,
+            currency="NZD",
+            merchant="Amazon Marketplace Au",
+            category="General",
+            raw_hash="nzd-amazon-86",
+        )
+        self.db.add_all([deposit, amazon])
+        self.db.commit()
+
+        matched = match_transfer_pair(deposit, self.db)
+        self.assertIsNone(matched)
+        self.db.refresh(deposit)
+        self.db.refresh(amazon)
+        self.assertIsNone(deposit.linked_transaction_id)
+        self.assertIsNone(amazon.linked_transaction_id)
+
 
 if __name__ == "__main__":
     unittest.main()
