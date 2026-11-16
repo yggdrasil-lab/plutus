@@ -42,6 +42,10 @@ TRANSACTION_GATES_SCHEMA = {
             "type": "noul",
             "instructions": "True if the spend amount is unusually high, erratic, or unexpected for the merchant type; False if it is standard routine spending.",
         },
+        "tags": {
+            "type": "list",
+            "instructions": "1 to 3 short lowercase kebab-case tags for granular spend tracking (e.g. ['gym', 'fitness'], ['badminton', 'sports'], ['coffee'], ['skincare', 'supplements']).",
+        },
     }
 }
 
@@ -102,20 +106,16 @@ def call_jev(
     return None, time.time() - t0
 
 
-def classify_transaction_jev(
+def classify_transaction_jev_with_tags(
     merchant: str,
     amount: float,
     notes: str | None = None,
-) -> Tuple[str, bool]:
-    """Evaluates category and anomaly status for a transaction via Jev.
-
-    Returns:
-        (category, is_anomaly)
-    """
+) -> Tuple[str, bool, list[str]]:
+    """Evaluates category, anomaly status, and granular tags for a transaction via Jev."""
     if not merchant or not merchant.strip():
-        return "General", False
+        return "General", False, []
 
-    system_prompt = f"Categorize expense and detect anomalies:\n```json\n{json.dumps(TRANSACTION_GATES_SCHEMA)}\n```"
+    system_prompt = f"Categorize expense, detect anomalies, and assign granular tags:\n```json\n{json.dumps(TRANSACTION_GATES_SCHEMA)}\n```"
     abs_amount = abs(amount)
     user_content = f"Merchant: {merchant.strip()}, Amount: ${abs_amount:.2f} NZD"
     if notes and notes.strip():
@@ -134,8 +134,29 @@ def classify_transaction_jev(
             resolved_cat = cat if cat in valid_cats else "General"
             raw_anomaly = parsed.get("is_anomaly", "false")
             is_anomaly = raw_anomaly in (True, "true", "True", 1)
-            return resolved_cat, is_anomaly
+            raw_tags = parsed.get("tags", [])
+            tags: list[str] = []
+            if isinstance(raw_tags, list):
+                for t in raw_tags[:3]:
+                    cleaned = str(t).strip().lower().lstrip("#").replace(" ", "-")
+                    if cleaned and cleaned not in tags:
+                        tags.append(cleaned[:40])
+            return resolved_cat, is_anomaly, tags
     except Exception as exc:
-        logger.warning("Error in classify_transaction_jev (%s); falling back to heuristic", exc)
+        logger.warning("Error in classify_transaction_jev_with_tags (%s); falling back to heuristic", exc)
 
-    return "General", False
+    return "General", False, []
+
+
+def classify_transaction_jev(
+    merchant: str,
+    amount: float,
+    notes: str | None = None,
+) -> Tuple[str, bool]:
+    """Evaluates category and anomaly status for a transaction via Jev.
+
+    Returns:
+        (category, is_anomaly)
+    """
+    cat, is_anomaly, _ = classify_transaction_jev_with_tags(merchant, amount, notes)
+    return cat, is_anomaly

@@ -7,6 +7,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
+import json
 from typing import Optional, Protocol
 
 from sqlalchemy import select
@@ -37,6 +38,7 @@ class NormalizedTx:
     exchange_rate: Optional[float] = None
     fee_amount: Optional[float] = None
     notes: Optional[str] = None
+    tags: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -217,6 +219,7 @@ def ingest_normalized_transactions(
             raw_hash=raw_hash,
             exchange_rate=item.exchange_rate,
             fee_amount=item.fee_amount,
+            tags=json.dumps(list(dict.fromkeys(t.strip().lower().lstrip("#") for t in item.tags if t.strip()))),
             notes=item.notes,
         )
         db.add(tx)
