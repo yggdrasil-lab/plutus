@@ -58,9 +58,11 @@ class TestTransactionTagsAndAkahuCategories(unittest.TestCase):
         Base.metadata.drop_all(bind=engine)
 
     def test_akahu_category_normalizes_to_canonical_and_preserves_tag(self):
-        cat, tags = normalize_akahu_category("Gyms and fitness", "Les Mills", "LES MILLS NZ")
+        cat, tags = normalize_akahu_category(
+            "Gyms, fitness, aquatic facilities, yoga, pilates", "Les Mills", "LES MILLS NZ"
+        )
         self.assertEqual(cat, "Health")
-        self.assertEqual(tags, ("gyms-and-fitness",))
+        self.assertEqual(tags, ("gym-membership",))
 
         feeds = normalize_akahu_feeds(
             [
@@ -85,7 +87,7 @@ class TestTransactionTagsAndAkahuCategories(unittest.TestCase):
             ],
         )
         self.assertEqual(feeds[0].transactions[0].category, "Health")
-        self.assertEqual(feeds[0].transactions[0].tags, ("gyms-and-fitness",))
+        self.assertEqual(feeds[0].transactions[0].tags, ("gym-membership",))
 
     def test_create_update_and_filter_transaction_tags(self):
         res_create = self.client.post(

@@ -160,10 +160,10 @@ def test_normalize_existing_legacy_categories_startup_cleanup():
 
         txs = session.query(Transaction).order_by(Transaction.id).all()
         assert [(t.category, json.loads(t.tags)) for t in txs] == [
-            ("Health", ["gyms-fitness-aquatic-facilities-yoga-pil"]),
-            ("Health", ["pharmacies"]),
-            ("Food", ["fast-food-stores"]),
-            ("Transport", ["fuel-stations"]),
-            ("Groceries", ["supermarkets-and-grocery-stores"]),
+            ("Health", ["gym-membership"]),
+            ("Health", ["pharmacy"]),
+            ("Food", ["fast-food"]),
+            ("Transport", ["fuel"]),
+            ("Groceries", ["supermarket"]),
         ]
         assert normalize_existing_legacy_categories(session) == 0
