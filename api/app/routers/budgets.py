@@ -15,6 +15,7 @@ from app.schemas import (
     CategorySpendingReport,
     SpendingBreakdownResponse,
 )
+from app.services.recurrence_service import get_active_recurring_commitments
 
 router = APIRouter(prefix="/budgets", tags=["Budgets & Spending Awareness"])
 
@@ -185,8 +186,10 @@ def get_spending_breakdown(
             continue
 
         if amt < 0:
+            if period == "week" and tx.recurrence is not None:
+                continue
             # Operational Expense
-            abs_spend = abs(amt)
+            abs_spend = abs(amt) * (float(tx.exchange_rate or 1.0) if period == "week" else 1.0)
             total_spend += abs_spend
             if cat not in category_spend_map:
                 category_spend_map[cat] = {"spend": 0.0, "count": 0, "is_transfer": False}
@@ -195,6 +198,15 @@ def get_spending_breakdown(
         elif amt > 0:
             # Operational Income
             total_income += amt
+
+    if period == "week":
+        for rec_tx, weekly_nzd in get_active_recurring_commitments(db, today):
+            cat = rec_tx.category or "General"
+            total_spend += weekly_nzd
+            if cat not in category_spend_map:
+                category_spend_map[cat] = {"spend": 0.0, "count": 0, "is_transfer": False}
+            category_spend_map[cat]["spend"] += weekly_nzd
+            category_spend_map[cat]["count"] += 1
 
     total_spend = round(total_spend, 2)
     total_income = round(total_income, 2)

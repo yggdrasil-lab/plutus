@@ -128,6 +128,9 @@ def update_transaction(
     if payload.tags is not None:
         tx.tags = json.dumps(_normalize_tags(payload.tags))
 
+    if "recurrence" in payload.model_fields_set:
+        tx.recurrence = payload.recurrence
+
     db.commit()
     db.refresh(tx)
     tx.account_name = tx.account.name if tx.account else None
@@ -175,6 +178,7 @@ def create_transaction(
         exchange_rate=payload.exchange_rate,
         fee_amount=payload.fee_amount,
         tags=json.dumps(_normalize_tags(payload.tags)),
+        recurrence=payload.recurrence,
         notes=payload.notes,
     )
     db.add(tx)

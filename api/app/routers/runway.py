@@ -50,8 +50,15 @@ def get_latest_account_balances(db: Session) -> dict[str, float]:
     return balances
 
 
+from app.services.recurrence_service import get_active_recurring_commitments
+
+
 def get_effective_weekly_burn(db: Session, as_of: date) -> tuple[float, float, float]:
     """Calculate effective weekly burn rate and current week spending vs budget.
+
+    Non-recurring variable expenses (`recurrence` is NULL) in the trailing 28 days
+    are averaged over 4 weeks, recurring expenses are amortized to their weekly
+    equivalent, and `one-off` capital purchases are excluded from burn.
 
     Returns:
         tuple of (effective_weekly_burn, this_week_spend, this_week_budget)
@@ -60,17 +67,24 @@ def get_effective_weekly_burn(db: Session, as_of: date) -> tuple[float, float, f
     budget_sum = db.scalar(select(func.sum(BudgetRule.weekly_limit)).where(BudgetRule.is_active == True))
     weekly_budget = float(budget_sum or 0.0)
 
-    # 2. Trailing 4-week actual burn rate (excluding internal transfers)
+    # 2. Trailing burn rate: variable (4w avg) + amortized recurring commitments
     four_weeks_ago = as_of - timedelta(days=28)
-    trailing_spend = db.scalar(
-        select(func.sum(Transaction.amount)).where(
+    variable_rows = db.execute(
+        select(Transaction.amount, Transaction.exchange_rate).where(
             Transaction.transaction_date >= four_weeks_ago,
             Transaction.transaction_date <= as_of,
-            Transaction.amount < 0,  # Negative amounts represent expenses
+            Transaction.amount < 0,
+            Transaction.recurrence.is_(None),
             func.lower(Transaction.category).not_in(("transfers", "transfer")),
         )
+    ).all()
+    variable_total_nzd = sum(abs(float(amt)) * float(fx or 1.0) for amt, fx in variable_rows)
+    variable_weekly_burn = variable_total_nzd / 4.0
+
+    recurring_weekly_burn = sum(
+        weekly_nzd for _, weekly_nzd in get_active_recurring_commitments(db, as_of)
     )
-    trailing_weekly_burn = abs(float(trailing_spend or 0.0)) / 4.0
+    trailing_weekly_burn = round(variable_weekly_burn + recurring_weekly_burn, 2)
 
     # 3. Spend in current calendar week (Monday to Sunday, excluding internal transfers)
     start_of_week = as_of - timedelta(days=as_of.weekday())

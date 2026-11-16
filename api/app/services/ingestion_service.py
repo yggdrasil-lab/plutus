@@ -134,19 +134,21 @@ def get_or_create_external_account(
 def _resolve_category_and_merchant(
     item: NormalizedTx,
     active_rules: list[CategorizationRule],
-) -> tuple[str, str, list[str]]:
-    """Resolve final (merchant, category, extra_tags) using rules, upstream category, and Jev."""
+) -> tuple[str, str, list[str], Optional[str]]:
+    """Resolve final (merchant, category, extra_tags, recurrence) using rules, upstream category, and Jev."""
     desc = item.raw_description or item.merchant
     rule_cat, rename, rule_id = evaluate_rules(desc, item.amount, active_rules)
     merchant_name = (rename if rename else item.merchant)[:150]
 
     extra_tags: list[str] = []
+    rule_recurrence: Optional[str] = None
     if rule_cat:
         if rule_id:
             matched = next((r for r in active_rules if r.id == rule_id), None)
             if matched:
                 matched.match_count += 1
                 extra_tags = parse_rule_tags(matched.target_tags)
+                rule_recurrence = matched.target_recurrence
         resolved_cat = rule_cat
     elif item.category and item.category != "General":
         resolved_cat = item.category
@@ -154,7 +156,7 @@ def _resolve_category_and_merchant(
         jev_cat, _, jev_tags = classify_transaction_jev_with_tags(merchant_name, item.amount, item.notes)
         resolved_cat = jev_cat if jev_cat and jev_cat != "General" else auto_categorize(merchant_name)
         cat_lower = resolved_cat.strip().lower()
-        return merchant_name, resolved_cat, [t for t in jev_tags if t.strip().lower() != cat_lower]
+        return merchant_name, resolved_cat, [t for t in jev_tags if t.strip().lower() != cat_lower], None
 
     if not item.tags and not extra_tags:
         _, _, jev_tags = classify_transaction_jev_with_tags(merchant_name, item.amount, item.notes)
@@ -162,7 +164,7 @@ def _resolve_category_and_merchant(
 
     cat_lower = resolved_cat.strip().lower()
     filtered_extra = [t for t in extra_tags if t.strip().lower() != cat_lower]
-    return merchant_name, resolved_cat, filtered_extra
+    return merchant_name, resolved_cat, filtered_extra, rule_recurrence
 
 
 def _cross_source_key(tx_date: date, amount: float | Decimal) -> tuple[date, Decimal]:
@@ -255,7 +257,7 @@ def ingest_normalized_transactions(
         if ext_note:
             seen_external_notes.add(ext_note)
 
-        merchant_name, tx_cat, rule_tags = _resolve_category_and_merchant(item, active_rules)
+        merchant_name, tx_cat, rule_tags, rule_recurrence = _resolve_category_and_merchant(item, active_rules)
         tx_currency = (item.currency or account.currency or "NZD")[:10].upper()
         tx_fx_rate = item.exchange_rate
         if tx_fx_rate is None and tx_currency != "NZD":
@@ -280,6 +282,7 @@ def ingest_normalized_transactions(
             exchange_rate=tx_fx_rate,
             fee_amount=item.fee_amount,
             tags=json.dumps(normalize_tags([*item.tags, *rule_tags])),
+            recurrence=rule_recurrence,
             notes=item.notes,
         )
         db.add(tx)
