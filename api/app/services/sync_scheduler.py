@@ -17,7 +17,7 @@ from app.services.connectors.wise import sync_wise
 
 logger = logging.getLogger("plutus.sync_scheduler")
 
-DEFAULT_LOOKBACK_DAYS = 14
+DEFAULT_LOOKBACK_DAYS = 30
 
 
 # ============================================================================

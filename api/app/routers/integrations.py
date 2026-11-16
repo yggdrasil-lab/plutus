@@ -328,7 +328,7 @@ SYNC_HANDLERS: dict[str, Callable[[Session, int], SyncResult]] = {
 @router.post("/sync/{provider}", response_model=SyncResult)
 def sync_external_provider(
     provider: str,
-    days: int = Query(default=14, ge=1, le=90, description="Lookback window in days"),
+    days: int = Query(default=30, ge=1, le=90, description="Lookback window in days"),
     db: Session = Depends(get_db),
     _authorized: bool = Depends(verify_integration_token),
 ):
