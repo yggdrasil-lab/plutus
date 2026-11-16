@@ -4,6 +4,7 @@
 # 1. IMPORTS & CONSTANTS
 # ============================================================================
 from datetime import date, datetime, timedelta, timezone
+import re
 from typing import Optional
 
 import httpx
@@ -19,6 +20,7 @@ from app.services.ingestion_service import (
     ProviderAccountFeed,
     sync_provider_feeds,
 )
+from app.services.statement_parser import auto_categorize
 
 AKAHU_BASE_URL = "https://api.akahu.io/v1"
 
@@ -30,6 +32,48 @@ AKAHU_TYPE_MAP: dict[str, tuple[str, str]] = {
     "CREDITCARD": ("credit_card", "cash"),
     "SAVINGS": ("savings", "cash"),
 }
+
+AKAHU_CATEGORY_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("gym", "fitness", "health", "medical", "pharmacy", "dental", "doctor", "physio", "optom"), "Health"),
+    (("supermarket", "grocer"), "Groceries"),
+    (("cafe", "restaurant", "dining", "takeaway", "fast food", "bakery", "bar", "pub", "food"), "Food"),
+    (("transport", "fuel", "petrol", "parking", "taxi", "rideshare", "uber", "transit", "toll", "vehicle"), "Transport"),
+    (("utilit", "electric", "power", "gas", "water", "internet", "broadband", "mobile", "phone", "telco"), "Utilities"),
+    (("entertainment", "leisure", "recreation", "gaming", "streaming", "sport", "hobby", "cinema", "movie"), "Leisure"),
+    (("insurance",), "Insurance"),
+    (("travel", "airline", "flight", "hotel", "accommodation"), "Travel"),
+    (("housing", "rent", "mortgage", "rates", "hardware", "home"), "Housing"),
+    (("transfer", "credit card payment"), "Transfers"),
+    (("income", "salary", "wage", "interest", "dividend", "refund"), "Income"),
+)
+
+
+def normalize_akahu_category(
+    raw_category: Optional[str],
+    merchant: str,
+    raw_description: str,
+) -> tuple[str, tuple[str, ...]]:
+    """Map Akahu's raw category name into Plutus canonical categories plus a granular tag."""
+    cleaned = (raw_category or "").strip()
+    lower = cleaned.lower()
+
+    canonical = ""
+    if lower and lower not in ("unknown", "other", "general"):
+        for keywords, target in AKAHU_CATEGORY_RULES:
+            if any(kw in lower for kw in keywords):
+                canonical = target
+                break
+
+    if not canonical:
+        canonical = auto_categorize(f"{merchant} {raw_description}".strip())
+
+    tags: list[str] = []
+    if lower and lower not in ("unknown", "other", "general", canonical.lower()):
+        slug = re.sub(r"[^a-z0-9]+", "-", lower).strip("-")
+        if slug and slug != canonical.lower():
+            tags.append(slug[:40])
+
+    return canonical, tuple(tags)
 
 
 # ============================================================================
@@ -138,14 +182,20 @@ def normalize_akahu_feeds(
         category_obj = tx.get("category") or {}
         raw_desc = tx.get("description") or ""
         merchant_name = merchant_obj.get("name") or raw_desc or "Unknown"
+        canonical_cat, akahu_tags = normalize_akahu_category(
+            category_obj.get("name"),
+            merchant_name,
+            raw_desc,
+        )
         tx_by_account[ext_acc_id].append(
             NormalizedTx(
                 transaction_date=_parse_iso_date(tx.get("date")),
                 amount=float(tx["amount"]),
                 currency=currency_by_account[ext_acc_id],
                 merchant=merchant_name,
-                category=category_obj.get("name") or "General",
+                category=canonical_cat,
                 raw_description=raw_desc or None,
+                tags=akahu_tags,
                 notes=f"akahu:{tx.get('_id', '')}" if tx.get("_id") else None,
             )
         )

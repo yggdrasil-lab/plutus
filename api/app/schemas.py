@@ -79,6 +79,21 @@ class TransactionBase(BaseModel):
     linked_transaction_id: Optional[int] = None
     exchange_rate: Optional[float] = None
     fee_amount: Optional[float] = None
+    tags: list[str] = Field(default_factory=list)
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def parse_tags_if_string(cls, v: Any) -> list[str]:
+        if isinstance(v, str):
+            try:
+                parsed = json.loads(v)
+                if isinstance(parsed, list):
+                    return [str(t) for t in parsed if str(t).strip()]
+            except Exception:
+                return [t.strip() for t in v.split(",") if t.strip()]
+        if isinstance(v, list):
+            return [str(t) for t in v if str(t).strip()]
+        return []
 
 
 class TransactionCreate(TransactionBase):
@@ -110,6 +125,7 @@ class TransactionUpdate(BaseModel):
     category: Optional[str] = Field(default=None, max_length=50)
     merchant: Optional[str] = Field(default=None, max_length=150)
     notes: Optional[str] = None
+    tags: Optional[list[str]] = None
 
 
 # --- Budget Rule Schemas ---

@@ -87,6 +87,7 @@ class Transaction(Base):
     linked_transaction_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("transactions.id", ondelete="SET NULL"), nullable=True, index=True)
     exchange_rate: Mapped[Optional[float]] = mapped_column(Numeric(18, 8), nullable=True)
     fee_amount: Mapped[Optional[float]] = mapped_column(Numeric(12, 2), nullable=True)
+    tags: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 

@@ -1,6 +1,7 @@
 """Transactions and spending router."""
 
 from datetime import date, timedelta
+import json
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -17,11 +18,23 @@ from app.services.transfer_service import reconcile_transfers
 router = APIRouter(prefix="/transactions", tags=["Transactions"])
 
 
+def _normalize_tags(raw_tags: Optional[list[str]]) -> list[str]:
+    if not raw_tags:
+        return []
+    seen: list[str] = []
+    for item in raw_tags:
+        cleaned = str(item).strip().lower().lstrip("#").replace(" ", "-")
+        if cleaned and cleaned not in seen:
+            seen.append(cleaned[:40])
+    return seen
+
+
 @router.get("", response_model=list[TransactionRead])
 def list_transactions(
     start_date: Optional[date] = Query(default=None),
     end_date: Optional[date] = Query(default=None),
     category: Optional[str] = Query(default=None),
+    tag: Optional[str] = Query(default=None),
     period: Optional[str] = Query(default=None, description="'week', 'month', 'last_month', or 'all'"),
     account_id: Optional[int] = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
@@ -60,6 +73,13 @@ def list_transactions(
         stmt = stmt.where(func.lower(Transaction.category) == category.strip().lower())
 
     txs = db.scalars(stmt.order_by(desc(Transaction.transaction_date), desc(Transaction.id)).limit(limit)).all()
+    if tag:
+        target_tag = tag.strip().lower().lstrip("#").replace(" ", "-")
+        txs = [
+            tx
+            for tx in txs
+            if target_tag in json.loads(tx.tags or "[]")
+        ]
     for tx in txs:
         tx.account_name = tx.account.name if tx.account else None
         tx.has_receipt = bool(tx.receipt)
@@ -104,6 +124,9 @@ def update_transaction(
 
     if payload.notes is not None:
         tx.notes = payload.notes
+
+    if payload.tags is not None:
+        tx.tags = json.dumps(_normalize_tags(payload.tags))
 
     db.commit()
     db.refresh(tx)
@@ -151,6 +174,7 @@ def create_transaction(
         linked_transaction_id=payload.linked_transaction_id,
         exchange_rate=payload.exchange_rate,
         fee_amount=payload.fee_amount,
+        tags=json.dumps(_normalize_tags(payload.tags)),
         notes=payload.notes,
     )
     db.add(tx)
