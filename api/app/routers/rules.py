@@ -48,6 +48,7 @@ def create_rule(
         amount_equals=amt,
         target_category=payload.target_category.strip(),
         target_tags=json.dumps(normalize_tags(payload.target_tags)),
+        target_recurrence=payload.target_recurrence,
         rename_merchant=payload.rename_merchant.strip() if payload.rename_merchant else None,
         priority=payload.priority,
         is_active=payload.is_active,
@@ -102,6 +103,8 @@ def update_rule(
         rule.target_category = payload.target_category.strip()
     if "target_tags" in payload.model_fields_set and payload.target_tags is not None:
         rule.target_tags = json.dumps(normalize_tags(payload.target_tags))
+    if "target_recurrence" in payload.model_fields_set:
+        rule.target_recurrence = payload.target_recurrence
     if "rename_merchant" in payload.model_fields_set:
         rule.rename_merchant = payload.rename_merchant.strip() if payload.rename_merchant else None
     if "priority" in payload.model_fields_set and payload.priority is not None:

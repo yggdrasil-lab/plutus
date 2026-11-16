@@ -66,6 +66,22 @@ class AssetSnapshotRead(AssetSnapshotBase):
         from_attributes = True
 
 
+RECURRENCE_CHOICES = {"weekly", "fortnightly", "monthly", "quarterly", "annual", "one-off"}
+
+
+def normalize_recurrence(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = str(value).strip().lower().replace("_", "-")
+    if not cleaned or cleaned in ("none", "variable"):
+        return None
+    if cleaned not in RECURRENCE_CHOICES:
+        raise ValueError(
+            f"Unsupported recurrence '{value}'. Use one of: {', '.join(sorted(RECURRENCE_CHOICES))}."
+        )
+    return cleaned
+
+
 # --- Transaction Schemas ---
 class TransactionBase(BaseModel):
     transaction_date: date
@@ -80,6 +96,12 @@ class TransactionBase(BaseModel):
     exchange_rate: Optional[float] = None
     fee_amount: Optional[float] = None
     tags: list[str] = Field(default_factory=list)
+    recurrence: Optional[str] = Field(default=None, max_length=20)
+
+    @field_validator("recurrence", mode="before")
+    @classmethod
+    def validate_recurrence(cls, v: Any) -> Optional[str]:
+        return normalize_recurrence(v)
 
     @field_validator("tags", mode="before")
     @classmethod
@@ -126,6 +148,12 @@ class TransactionUpdate(BaseModel):
     merchant: Optional[str] = Field(default=None, max_length=150)
     notes: Optional[str] = None
     tags: Optional[list[str]] = None
+    recurrence: Optional[str] = Field(default=None, max_length=20)
+
+    @field_validator("recurrence", mode="before")
+    @classmethod
+    def validate_recurrence_update(cls, v: Any) -> Optional[str]:
+        return normalize_recurrence(v)
 
 
 # --- Budget Rule Schemas ---
@@ -182,6 +210,7 @@ class CategorizationRuleBase(BaseModel):
     amount_equals: Optional[float] = Field(default=None, ge=0.0)
     target_category: str = Field(..., max_length=50)
     target_tags: list[str] = Field(default_factory=list)
+    target_recurrence: Optional[str] = Field(default=None, max_length=20)
     rename_merchant: Optional[str] = Field(default=None, max_length=150)
     priority: int = Field(default=10, ge=1)
     is_active: bool = True
@@ -190,6 +219,11 @@ class CategorizationRuleBase(BaseModel):
     @classmethod
     def parse_target_tags_if_string(cls, v: Any) -> list[str]:
         return TransactionBase.parse_tags_if_string(v)
+
+    @field_validator("target_recurrence", mode="before")
+    @classmethod
+    def validate_target_recurrence(cls, v: Any) -> Optional[str]:
+        return normalize_recurrence(v)
 
 
 class CategorizationRuleCreate(CategorizationRuleBase):
@@ -203,10 +237,16 @@ class CategorizationRuleUpdate(BaseModel):
     amount_equals: Optional[float] = None
     target_category: Optional[str] = Field(default=None, max_length=50)
     target_tags: Optional[list[str]] = None
+    target_recurrence: Optional[str] = Field(default=None, max_length=20)
     rename_merchant: Optional[str] = Field(default=None, max_length=150)
     priority: Optional[int] = None
     is_active: Optional[bool] = None
     apply_retroactively: bool = False
+
+    @field_validator("target_recurrence", mode="before")
+    @classmethod
+    def validate_target_recurrence_update(cls, v: Any) -> Optional[str]:
+        return normalize_recurrence(v)
 
 
 class CategorizationRuleRead(CategorizationRuleBase):

@@ -121,6 +121,9 @@ def apply_rules_to_existing_transactions(
                 if merged_tags != existing_tags:
                     tx.tags = json.dumps(merged_tags)
                     changed = True
+            if matched_rule and matched_rule.target_recurrence and tx.recurrence != matched_rule.target_recurrence:
+                tx.recurrence = matched_rule.target_recurrence
+                changed = True
             if changed:
                 updated_count += 1
 

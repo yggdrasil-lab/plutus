@@ -88,6 +88,7 @@ class Transaction(Base):
     exchange_rate: Mapped[Optional[float]] = mapped_column(Numeric(18, 8), nullable=True)
     fee_amount: Mapped[Optional[float]] = mapped_column(Numeric(12, 2), nullable=True)
     tags: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    recurrence: Mapped[Optional[str]] = mapped_column(String(20), nullable=True, index=True)
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
@@ -148,6 +149,7 @@ class CategorizationRule(Base):
     amount_equals: Mapped[Optional[float]] = mapped_column(Numeric(12, 2), nullable=True)
     target_category: Mapped[str] = mapped_column(String(50), nullable=False)
     target_tags: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    target_recurrence: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     rename_merchant: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
