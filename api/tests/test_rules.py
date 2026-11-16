@@ -175,6 +175,60 @@ class TestCategorizationRules(unittest.TestCase):
         res_check = self.client.get("/rules")
         self.assertEqual(len(res_check.json()), 0)
 
+    def test_rule_target_tags_retroactive_and_ingestion(self):
+        from datetime import date
+        from app.services.ingestion_service import NormalizedTx, ingest_normalized_transactions
+
+        self.db.add(
+            Transaction(
+                transaction_date=date(2026, 11, 10),
+                account_id=self.acc.id,
+                amount=-28.81,
+                currency="NZD",
+                merchant="CityFitness",
+                category="Health",
+                raw_description="Cityfitness Group Cityfitnessg",
+                raw_hash="rule-tag-hist-1",
+                tags="[]",
+            )
+        )
+        self.db.commit()
+
+        res = self.client.post(
+            "/rules",
+            json={
+                "name": "CityFitness Gym",
+                "description_pattern": "Cityfitness",
+                "match_type": "contains",
+                "target_category": "Health",
+                "target_tags": ["gym-membership"],
+                "apply_retroactively": True,
+            },
+        )
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(res.json()["target_tags"], ["gym-membership"])
+
+        txs = self.client.get("/transactions").json()
+        self.assertEqual(txs[0]["tags"], ["gym-membership"])
+
+        created, _, _ = ingest_normalized_transactions(
+            self.db,
+            self.acc,
+            [
+                NormalizedTx(
+                    transaction_date=date(2026, 11, 16),
+                    amount=-28.81,
+                    currency="NZD",
+                    merchant="CityFitness",
+                    raw_description="Cityfitness Group 0Q100E",
+                    category="Health",
+                )
+            ],
+        )
+        self.assertEqual(created, 1)
+        txs_after = self.client.get("/transactions").json()
+        self.assertEqual(txs_after[0]["tags"], ["gym-membership"])
+
 
 if __name__ == "__main__":
     unittest.main()

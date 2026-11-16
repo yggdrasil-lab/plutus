@@ -181,9 +181,15 @@ class CategorizationRuleBase(BaseModel):
     match_type: str = Field(default="contains", description="'contains', 'exact', or 'starts_with'")
     amount_equals: Optional[float] = Field(default=None, ge=0.0)
     target_category: str = Field(..., max_length=50)
+    target_tags: list[str] = Field(default_factory=list)
     rename_merchant: Optional[str] = Field(default=None, max_length=150)
     priority: int = Field(default=10, ge=1)
     is_active: bool = True
+
+    @field_validator("target_tags", mode="before")
+    @classmethod
+    def parse_target_tags_if_string(cls, v: Any) -> list[str]:
+        return TransactionBase.parse_tags_if_string(v)
 
 
 class CategorizationRuleCreate(CategorizationRuleBase):
@@ -196,6 +202,7 @@ class CategorizationRuleUpdate(BaseModel):
     match_type: Optional[str] = None
     amount_equals: Optional[float] = None
     target_category: Optional[str] = Field(default=None, max_length=50)
+    target_tags: Optional[list[str]] = None
     rename_merchant: Optional[str] = Field(default=None, max_length=150)
     priority: Optional[int] = None
     is_active: Optional[bool] = None

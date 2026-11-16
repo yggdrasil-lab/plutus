@@ -18,7 +18,7 @@ from app.schemas import SyncAccountSummary, SyncResult
 from app.services.fx_service import get_exchange_rate
 from app.services.jev_client import classify_transaction_jev
 from app.services.receipt_service import reconcile_unlinked_receipts
-from app.services.rules_engine import evaluate_rules
+from app.services.rules_engine import evaluate_rules, normalize_tags, parse_rule_tags
 from app.services.statement_parser import auto_categorize, generate_transaction_hash
 from app.services.transfer_service import reconcile_transfers
 
@@ -133,25 +133,27 @@ def get_or_create_external_account(
 def _resolve_category_and_merchant(
     item: NormalizedTx,
     active_rules: list[CategorizationRule],
-) -> tuple[str, str]:
-    """Resolve final (merchant, category) using rules, Jev, or heuristic fallback."""
+) -> tuple[str, str, list[str]]:
+    """Resolve final (merchant, category, rule_tags) using rules, Jev, or heuristic fallback."""
     desc = item.raw_description or item.merchant
     rule_cat, rename, rule_id = evaluate_rules(desc, item.amount, active_rules)
     merchant_name = (rename if rename else item.merchant)[:150]
 
     if rule_cat:
+        rule_tags: list[str] = []
         if rule_id:
             matched = next((r for r in active_rules if r.id == rule_id), None)
             if matched:
                 matched.match_count += 1
-        return merchant_name, rule_cat
+                rule_tags = parse_rule_tags(matched.target_tags)
+        return merchant_name, rule_cat, rule_tags
 
     if item.category and item.category != "General":
-        return merchant_name, item.category
+        return merchant_name, item.category, []
 
     jev_cat, _ = classify_transaction_jev(merchant_name, item.amount, item.notes)
     resolved = jev_cat if jev_cat and jev_cat != "General" else auto_categorize(merchant_name)
-    return merchant_name, resolved
+    return merchant_name, resolved, []
 
 
 def _cross_source_key(tx_date: date, amount: float | Decimal) -> tuple[date, Decimal]:
@@ -208,7 +210,7 @@ def ingest_normalized_transactions(
             skipped += 1
             continue
 
-        merchant_name, tx_cat = _resolve_category_and_merchant(item, active_rules)
+        merchant_name, tx_cat, rule_tags = _resolve_category_and_merchant(item, active_rules)
         tx_currency = (item.currency or account.currency or "NZD")[:10].upper()
         tx_fx_rate = item.exchange_rate
         if tx_fx_rate is None and tx_currency != "NZD":
@@ -232,7 +234,7 @@ def ingest_normalized_transactions(
             raw_hash=raw_hash,
             exchange_rate=tx_fx_rate,
             fee_amount=item.fee_amount,
-            tags=json.dumps(list(dict.fromkeys(t.strip().lower().lstrip("#") for t in item.tags if t.strip()))),
+            tags=json.dumps(normalize_tags([*item.tags, *rule_tags])),
             notes=item.notes,
         )
         db.add(tx)

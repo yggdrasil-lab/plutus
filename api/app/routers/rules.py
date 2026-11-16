@@ -1,5 +1,6 @@
 """Outlook-style transaction categorization rules router."""
 
+import json
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
@@ -12,7 +13,7 @@ from app.schemas import (
     CategorizationRuleRead,
     CategorizationRuleUpdate,
 )
-from app.services.rules_engine import apply_rules_to_existing_transactions
+from app.services.rules_engine import apply_rules_to_existing_transactions, normalize_tags
 
 router = APIRouter(prefix="/rules", tags=["Categorization Rules"])
 
@@ -46,6 +47,7 @@ def create_rule(
         match_type=payload.match_type.strip(),
         amount_equals=amt,
         target_category=payload.target_category.strip(),
+        target_tags=json.dumps(normalize_tags(payload.target_tags)),
         rename_merchant=payload.rename_merchant.strip() if payload.rename_merchant else None,
         priority=payload.priority,
         is_active=payload.is_active,
@@ -98,6 +100,8 @@ def update_rule(
         )
     if "target_category" in payload.model_fields_set and payload.target_category is not None:
         rule.target_category = payload.target_category.strip()
+    if "target_tags" in payload.model_fields_set and payload.target_tags is not None:
+        rule.target_tags = json.dumps(normalize_tags(payload.target_tags))
     if "rename_merchant" in payload.model_fields_set:
         rule.rename_merchant = payload.rename_merchant.strip() if payload.rename_merchant else None
     if "priority" in payload.model_fields_set and payload.priority is not None:
