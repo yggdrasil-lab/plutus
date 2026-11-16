@@ -198,6 +198,56 @@ def trigger_transfer_reconciliation(db: Session = Depends(get_db)):
     return {"status": "ok", "matched_transfers": matched}
 
 
+@router.post("/auto-tag")
+def auto_tag_transactions_with_jev(
+    limit: int = Query(default=200, ge=1, le=500),
+    overwrite: bool = Query(default=False),
+    db: Session = Depends(get_db),
+):
+    """Retrospectively tag transactions via Jev System One."""
+    from concurrent.futures import ThreadPoolExecutor
+    from app.services.jev_client import classify_transaction_jev_with_tags
+
+    stmt = select(Transaction).order_by(Transaction.transaction_date.desc(), Transaction.id.desc())
+    if not overwrite:
+        stmt = stmt.where((Transaction.tags == "[]") | (Transaction.tags == "") | (Transaction.tags.is_(None)))
+    candidates = db.scalars(stmt.limit(limit)).all()
+    if not candidates:
+        return {"evaluated": 0, "updated": 0, "samples": []}
+
+    inputs = [(tx.id, tx.merchant or "", float(tx.amount), tx.notes) for tx in candidates]
+
+    def _classify(entry: tuple[int, str, float, Optional[str]]) -> tuple[int, list[str]]:
+        tx_id, merchant, amt, notes = entry
+        _, _, tags = classify_transaction_jev_with_tags(merchant, amt, notes)
+        return tx_id, _normalize_tags(tags)
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = dict(pool.map(_classify, inputs))
+
+    updated = 0
+    samples: list[dict[str, object]] = []
+    for tx in candidates:
+        new_tags = results.get(tx.id, [])
+        if not new_tags:
+            continue
+        tx.tags = json.dumps(new_tags)
+        updated += 1
+        samples.append(
+            {
+                "id": tx.id,
+                "merchant": tx.merchant,
+                "category": tx.category,
+                "tags": new_tags,
+            }
+        )
+
+    if updated:
+        db.commit()
+
+    return {"evaluated": len(candidates), "updated": updated, "samples": samples}
+
+
 @router.get("/summary/categories")
 def get_category_summary(
     start_date: date = Query(...),
