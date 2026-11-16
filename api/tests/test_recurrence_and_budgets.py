@@ -128,5 +128,27 @@ def test_amortized_recurrence_for_weekly_budget_and_runway():
         )
         assert rule_res.status_code == 201
         assert rule_res.json()["target_recurrence"] == "monthly"
+
+        # Test inheriting recurrence from an earlier transaction for the same merchant
+        from app.services.ingestion_service import NormalizedTx, ingest_normalized_transactions
+
+        with TestingSessionLocal() as db:
+            acc = db.query(Account).first()
+            created, _, new_txs = ingest_normalized_transactions(
+                db,
+                acc,
+                [
+                    NormalizedTx(
+                        transaction_date=today,
+                        amount=-520.0,
+                        currency="NZD",
+                        merchant="Aioi Insurance",
+                        category="Insurance",
+                        notes="akahu:trans_aioi_next_year",
+                    )
+                ],
+            )
+            assert created == 1
+            assert new_txs[0].recurrence == "annual"
     finally:
         app.dependency_overrides.clear()

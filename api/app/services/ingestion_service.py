@@ -212,6 +212,15 @@ def ingest_normalized_transactions(
         ).all()
         if n and n.startswith(("akahu:", "wise:"))
     )
+    merchant_recurrence_map: dict[str, str] = {}
+    for rec_merchant, rec_val in db.execute(
+        select(Transaction.merchant, Transaction.recurrence)
+        .where(Transaction.recurrence.isnot(None))
+        .order_by(Transaction.transaction_date.desc(), Transaction.id.desc())
+    ).all():
+        key = (rec_merchant or "").strip().lower()
+        if key and key not in merchant_recurrence_map and rec_val:
+            merchant_recurrence_map[key] = rec_val
 
     created: list[Transaction] = []
     skipped = 0
@@ -258,6 +267,7 @@ def ingest_normalized_transactions(
             seen_external_notes.add(ext_note)
 
         merchant_name, tx_cat, rule_tags, rule_recurrence = _resolve_category_and_merchant(item, active_rules)
+        effective_recurrence = rule_recurrence or merchant_recurrence_map.get(merchant_name.strip().lower())
         tx_currency = (item.currency or account.currency or "NZD")[:10].upper()
         tx_fx_rate = item.exchange_rate
         if tx_fx_rate is None and tx_currency != "NZD":
@@ -282,7 +292,7 @@ def ingest_normalized_transactions(
             exchange_rate=tx_fx_rate,
             fee_amount=item.fee_amount,
             tags=json.dumps(normalize_tags([*item.tags, *rule_tags])),
-            recurrence=rule_recurrence,
+            recurrence=effective_recurrence,
             notes=item.notes,
         )
         db.add(tx)
