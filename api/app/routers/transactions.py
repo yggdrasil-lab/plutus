@@ -68,9 +68,24 @@ def list_transactions(
             for tx in txs
             if target_tag in json.loads(tx.tags or "[]")
         ]
+    linked_ids = {tx.linked_transaction_id for tx in txs if tx.linked_transaction_id is not None}
+    linked_map: dict[int, Transaction] = {}
+    if linked_ids:
+        linked_rows = db.scalars(
+            select(Transaction)
+            .options(joinedload(Transaction.account))
+            .where(Transaction.id.in_(linked_ids))
+        ).all()
+        linked_map = {row.id: row for row in linked_rows}
+
     for tx in txs:
         tx.account_name = tx.account.name if tx.account else None
         tx.has_receipt = bool(tx.receipt)
+        partner = linked_map.get(tx.linked_transaction_id) if tx.linked_transaction_id else None
+        if partner is not None:
+            tx.linked_account_name = partner.account.name if partner.account else None
+            tx.linked_amount = float(partner.amount)
+            tx.linked_currency = partner.currency
     return txs
 
 

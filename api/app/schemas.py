@@ -135,6 +135,9 @@ class QuickLogRequest(BaseModel):
 class TransactionRead(TransactionBase):
     id: int
     account_name: Optional[str] = None
+    linked_account_name: Optional[str] = None
+    linked_amount: Optional[float] = None
+    linked_currency: Optional[str] = None
     raw_hash: str
     has_receipt: bool = False
     created_at: datetime
