@@ -7,13 +7,24 @@ import unittest
 from unittest.mock import MagicMock, patch
 import urllib.error
 
+from datetime import date
+
 from app.services.jev_client import (
+    CIRCUIT_FAILURE_THRESHOLD,
     call_jev,
     classify_transaction_jev,
+    is_jev_circuit_open,
+    reset_jev_circuit,
 )
+from app.services.period_service import resolve_period_dates
 
 
 class TestPlutusJevClient(unittest.TestCase):
+    def setUp(self):
+        reset_jev_circuit()
+
+    def tearDown(self):
+        reset_jev_circuit()
     @patch("urllib.request.urlopen")
     def test_call_jev_success(self, mock_urlopen):
         mock_resp = MagicMock()
@@ -59,6 +70,31 @@ class TestPlutusJevClient(unittest.TestCase):
         cat, is_anomaly = classify_transaction_jev("Unknown Store", 45.00)
         self.assertEqual(cat, "General")
         self.assertFalse(is_anomaly)
+
+    @patch("urllib.request.urlopen")
+    def test_circuit_breaker_opens_after_consecutive_failures(self, mock_urlopen):
+        mock_urlopen.side_effect = urllib.error.URLError("Timed out")
+        for _ in range(CIRCUIT_FAILURE_THRESHOLD):
+            verdict, _ = call_jev("Categorize expense", "Merchant: Test, Amount: $10.00")
+            self.assertIsNone(verdict)
+        self.assertTrue(is_jev_circuit_open())
+        self.assertEqual(mock_urlopen.call_count, CIRCUIT_FAILURE_THRESHOLD)
+
+        # Subsequent call short-circuits without invoking urlopen
+        verdict, latency = call_jev("Categorize expense", "Merchant: Test2, Amount: $20.00")
+        self.assertIsNone(verdict)
+        self.assertEqual(latency, 0.0)
+        self.assertEqual(mock_urlopen.call_count, CIRCUIT_FAILURE_THRESHOLD)
+
+    def test_resolve_period_dates_last_week_and_custom(self):
+        ref = date(2026, 11, 17)  # Tuesday
+        start, end = resolve_period_dates("last_week", today=ref)
+        self.assertEqual(start, date(2026, 11, 9))
+        self.assertEqual(end, date(2026, 11, 15))
+
+        c_start, c_end = resolve_period_dates(None, date(2026, 10, 1), date(2026, 10, 15), today=ref)
+        self.assertEqual(c_start, date(2026, 10, 1))
+        self.assertEqual(c_end, date(2026, 10, 15))
 
 
 if __name__ == "__main__":

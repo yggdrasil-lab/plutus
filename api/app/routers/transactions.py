@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session, joinedload
 from app.db import get_db
 from app.models import Account, Transaction
 from app.schemas import TransactionCreate, TransactionRead, TransactionUpdate
+from app.services.period_service import resolve_period_dates
 from app.services.receipt_service import reconcile_unlinked_receipts
 from app.services.statement_parser import generate_transaction_hash
 from app.services.transfer_service import reconcile_transfers
@@ -35,29 +36,16 @@ def list_transactions(
     end_date: Optional[date] = Query(default=None),
     category: Optional[str] = Query(default=None),
     tag: Optional[str] = Query(default=None),
-    period: Optional[str] = Query(default=None, description="'week', 'month', 'last_month', or 'all'"),
+    period: Optional[str] = Query(
+        default=None,
+        description="'week', 'last_week', 'month', 'last_month', or 'all'",
+    ),
     account_id: Optional[int] = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
     db: Session = Depends(get_db),
 ):
     """List transactions with optional date range, period, account_id, and category filters."""
-    if period:
-        today = date.today()
-        if period == "week":
-            start_date = today - timedelta(days=today.weekday())
-            end_date = start_date + timedelta(days=6)
-        elif period == "month":
-            start_date = date(today.year, today.month, 1)
-            end_date = today
-        elif period == "last_month":
-            first_this_month = date(today.year, today.month, 1)
-            end_date = first_this_month - timedelta(days=1)
-            start_date = date(end_date.year, end_date.month, 1)
-        elif period == "all":
-            start_date = None
-            end_date = None
-        else:
-            raise HTTPException(status_code=400, detail="Invalid period. Choose 'week', 'month', 'last_month', or 'all'.")
+    start_date, end_date = resolve_period_dates(period, start_date, end_date)
 
     stmt = select(Transaction).options(
         joinedload(Transaction.account),

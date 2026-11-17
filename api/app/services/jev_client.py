@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -18,6 +19,40 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 USER_AGENT = "Yggdrasil-Plutus/1.0 (PlutusApi)"
+
+CIRCUIT_FAILURE_THRESHOLD = 3
+CIRCUIT_COOLDOWN_SECONDS = 60.0
+_CIRCUIT_LOCK = threading.Lock()
+_CONSECUTIVE_FAILURES = 0
+_CIRCUIT_OPEN_UNTIL = 0.0
+
+
+def is_jev_circuit_open() -> bool:
+    """Return True when the Jev circuit breaker is currently open."""
+    with _CIRCUIT_LOCK:
+        return time.monotonic() < _CIRCUIT_OPEN_UNTIL
+
+
+def reset_jev_circuit() -> None:
+    """Reset the Jev circuit breaker state (used on success and in tests)."""
+    global _CONSECUTIVE_FAILURES, _CIRCUIT_OPEN_UNTIL
+    with _CIRCUIT_LOCK:
+        _CONSECUTIVE_FAILURES = 0
+        _CIRCUIT_OPEN_UNTIL = 0.0
+
+
+def _record_jev_failure() -> None:
+    """Record a failed Jev call and open the circuit after consecutive failures."""
+    global _CONSECUTIVE_FAILURES, _CIRCUIT_OPEN_UNTIL
+    with _CIRCUIT_LOCK:
+        _CONSECUTIVE_FAILURES += 1
+        if _CONSECUTIVE_FAILURES >= CIRCUIT_FAILURE_THRESHOLD:
+            _CIRCUIT_OPEN_UNTIL = time.monotonic() + CIRCUIT_COOLDOWN_SECONDS
+            logger.warning(
+                "Jev circuit breaker opened for %.0fs after %d consecutive failures.",
+                CIRCUIT_COOLDOWN_SECONDS,
+                _CONSECUTIVE_FAILURES,
+            )
 
 TRANSACTION_GATES_SCHEMA = {
     "questions": {
@@ -88,6 +123,9 @@ def call_jev(
         method="POST",
     )
 
+    if is_jev_circuit_open():
+        return None, 0.0
+
     t0 = time.time()
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -97,12 +135,15 @@ def call_jev(
                 choices = body.get("choices", [])
                 if choices:
                     content = choices[0].get("message", {}).get("content", "").strip()
+                    reset_jev_circuit()
                     return content, elapsed
     except Exception as exc:
         elapsed = time.time() - t0
         logger.warning("Jev invocation failed (%s) in %.3fs; falling back to deterministic heuristics.", exc, elapsed)
+        _record_jev_failure()
         return None, elapsed
 
+    _record_jev_failure()
     return None, time.time() - t0
 
 

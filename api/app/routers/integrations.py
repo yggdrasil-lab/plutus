@@ -325,13 +325,13 @@ async def upload_statement(
 
 
 SYNC_HANDLERS: dict[
-    str, Callable[[Session, int, Optional[date], Optional[date]], SyncResult]
+    str, Callable[[Session, int, Optional[date], Optional[date], bool], SyncResult]
 ] = {
-    "akahu": lambda db, days, start_date, end_date: sync_akahu(
-        db, days=days, start_date=start_date, end_date=end_date
+    "akahu": lambda db, days, start_date, end_date, skip_llm: sync_akahu(
+        db, days=days, start_date=start_date, end_date=end_date, skip_llm=skip_llm
     ),
-    "wise": lambda db, days, start_date, end_date: sync_wise(
-        db, days=days, start_date=start_date, end_date=end_date
+    "wise": lambda db, days, start_date, end_date, skip_llm: sync_wise(
+        db, days=days, start_date=start_date, end_date=end_date, skip_llm=skip_llm
     ),
 }
 
@@ -347,6 +347,10 @@ def sync_external_provider(
     end_date: Optional[date] = Query(
         default=None,
         description="Optional inclusive backfill end date (YYYY-MM-DD)",
+    ),
+    skip_llm: bool = Query(
+        default=False,
+        description="Skip Jev LLM categorization/tagging and use deterministic rules and heuristics",
     ),
     db: Session = Depends(get_db),
     _authorized: bool = Depends(verify_integration_token),
@@ -367,7 +371,7 @@ def sync_external_provider(
 
     targets = list(SYNC_HANDLERS.values()) if normalized == "all" else [SYNC_HANDLERS[normalized]]
     try:
-        results = [handler(db, days, start_date, end_date) for handler in targets]
+        results = [handler(db, days, start_date, end_date, skip_llm) for handler in targets]
     except ConnectorConfigError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
