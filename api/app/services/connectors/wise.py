@@ -224,6 +224,7 @@ def sync_wise(
     days: int = 14,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    skip_llm: bool = False,
     gateway: Optional[BankFeedGateway] = None,
 ) -> SyncResult:
     """Pull Wise profiles, currency balances, and statements via injected or HTTP gateway."""
@@ -233,4 +234,4 @@ def sync_wise(
         start_date=start_date,
         end_date=end_date,
     )
-    return sync_provider_feeds(db, provider="wise", feeds=feeds)
+    return sync_provider_feeds(db, provider="wise", feeds=feeds, skip_llm=skip_llm)

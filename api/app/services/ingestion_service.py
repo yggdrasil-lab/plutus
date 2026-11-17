@@ -163,6 +163,8 @@ def get_or_create_external_account(
 def _resolve_category_and_merchant(
     item: NormalizedTx,
     active_rules: list[CategorizationRule],
+    *,
+    skip_llm: bool = False,
 ) -> tuple[str, str, list[str], Optional[str]]:
     """Resolve final (merchant, category, extra_tags, recurrence) using rules, upstream category, and Jev."""
     desc = item.raw_description or item.merchant
@@ -181,13 +183,16 @@ def _resolve_category_and_merchant(
         resolved_cat = rule_cat
     elif item.category and item.category != "General":
         resolved_cat = item.category
+    elif skip_llm:
+        resolved_cat = auto_categorize(merchant_name)
+        return merchant_name, resolved_cat, [], None
     else:
         jev_cat, _, jev_tags = classify_transaction_jev_with_tags(merchant_name, item.amount, item.notes)
         resolved_cat = jev_cat if jev_cat and jev_cat != "General" else auto_categorize(merchant_name)
         cat_lower = resolved_cat.strip().lower()
         return merchant_name, resolved_cat, [t for t in jev_tags if t.strip().lower() != cat_lower], None
 
-    if not item.tags and not extra_tags:
+    if not skip_llm and not item.tags and not extra_tags:
         _, _, jev_tags = classify_transaction_jev_with_tags(merchant_name, item.amount, item.notes)
         extra_tags = jev_tags
 
@@ -205,6 +210,8 @@ def ingest_normalized_transactions(
     db: Session,
     account: Account,
     items: list[NormalizedTx] | tuple[NormalizedTx, ...],
+    *,
+    skip_llm: bool = False,
 ) -> tuple[int, int, list[Transaction]]:
     """Deduplicate, categorize, persist, and reconcile normalized transactions."""
     if not items:
@@ -286,7 +293,11 @@ def ingest_normalized_transactions(
         if ext_note:
             seen_external_notes.add(ext_note)
 
-        merchant_name, tx_cat, rule_tags, rule_recurrence = _resolve_category_and_merchant(item, active_rules)
+        merchant_name, tx_cat, rule_tags, rule_recurrence = _resolve_category_and_merchant(
+            item,
+            active_rules,
+            skip_llm=skip_llm,
+        )
         tx_currency = (item.currency or account.currency or "NZD")[:10].upper()
         tx_fx_rate = item.exchange_rate
         if tx_fx_rate is None and tx_currency != "NZD":
@@ -392,6 +403,7 @@ def sync_provider_feeds(
     *,
     provider: str,
     feeds: list[ProviderAccountFeed],
+    skip_llm: bool = False,
 ) -> SyncResult:
     """Persist a list of ProviderAccountFeed contracts into Plutus uniformly."""
     today = date.today()
@@ -416,7 +428,12 @@ def sync_provider_feeds(
             )
             snapshots_updated += 1
 
-        created, skipped, _ = ingest_normalized_transactions(db, account, feed.transactions)
+        created, skipped, _ = ingest_normalized_transactions(
+            db,
+            account,
+            feed.transactions,
+            skip_llm=skip_llm,
+        )
         total_created += created
         total_skipped += skipped
         summaries.append(

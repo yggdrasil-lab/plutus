@@ -15,6 +15,7 @@ from app.schemas import (
     CategorySpendingReport,
     SpendingBreakdownResponse,
 )
+from app.services.period_service import resolve_period_dates
 from app.services.recurrence_service import get_active_recurring_commitments
 
 router = APIRouter(prefix="/budgets", tags=["Budgets & Spending Awareness"])
@@ -127,32 +128,17 @@ def initialize_default_budgets(
 
 @router.get("/breakdown", response_model=SpendingBreakdownResponse)
 def get_spending_breakdown(
-    period: str = Query(default="month", description="'week', 'month', 'last_month', or 'all'"),
+    period: Optional[str] = Query(
+        default="month",
+        description="'week', 'last_week', 'month', 'last_month', or 'all' (omit when passing start_date/end_date)",
+    ),
+    start_date: Optional[date] = Query(default=None),
+    end_date: Optional[date] = Query(default=None),
     db: Session = Depends(get_db),
 ):
     """Retrieve detailed category spending breakdown, budget utilization, and overspending warnings."""
-    today = date.today()
-    start_date: Optional[date] = None
-    end_date: Optional[date] = None
-
-    if period == "week":
-        # Monday of current week
-        start_date = today - timedelta(days=today.weekday())
-        end_date = start_date + timedelta(days=6)
-    elif period == "month":
-        # 1st day of current month
-        start_date = date(today.year, today.month, 1)
-        end_date = today
-    elif period == "last_month":
-        # Full calendar month prior to current month
-        first_this_month = date(today.year, today.month, 1)
-        end_date = first_this_month - timedelta(days=1)
-        start_date = date(end_date.year, end_date.month, 1)
-    elif period == "all":
-        start_date = None
-        end_date = None
-    else:
-        raise HTTPException(status_code=400, detail="Invalid period. Choose 'week', 'month', 'last_month', or 'all'.")
+    effective_period = None if (start_date is not None or end_date is not None) else period
+    start_date, end_date = resolve_period_dates(effective_period, start_date, end_date)
 
     # Fetch active budget rules
     budget_rules = {r.category.lower(): r for r in db.scalars(select(BudgetRule).where(BudgetRule.is_active == True)).all()}

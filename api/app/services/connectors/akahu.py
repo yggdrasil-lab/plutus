@@ -324,6 +324,7 @@ def sync_akahu(
     days: int = 14,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    skip_llm: bool = False,
     gateway: Optional[BankFeedGateway] = None,
 ) -> SyncResult:
     """Pull Akahu accounts and transactions via injected or HTTP gateway."""
@@ -336,4 +337,4 @@ def sync_akahu(
         start_date=start_date,
         end_date=end_date,
     )
-    return sync_provider_feeds(db, provider="akahu", feeds=feeds)
+    return sync_provider_feeds(db, provider="akahu", feeds=feeds, skip_llm=skip_llm)

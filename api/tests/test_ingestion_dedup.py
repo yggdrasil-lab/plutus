@@ -97,3 +97,43 @@ def test_jev_tags_applied_when_untagged_even_with_category():
         assert created == 1
         assert txs[0].category == "Insurance"
         assert json.loads(txs[0].tags) == ["car"]
+
+
+def test_skip_llm_bypasses_jev_and_uses_heuristics():
+    from unittest.mock import patch
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine)
+
+    with SessionLocal() as db:
+        acc = Account(
+            name="ANZ Freedom",
+            institution="ANZ",
+            account_type="checking",
+            tier="cash",
+            currency="NZD",
+        )
+        db.add(acc)
+        db.commit()
+        db.refresh(acc)
+
+        with patch("app.services.ingestion_service.classify_transaction_jev_with_tags") as mock_jev:
+            created, _, txs = ingest_normalized_transactions(
+                db,
+                acc,
+                [
+                    NormalizedTx(
+                        transaction_date=date(2026, 11, 2),
+                        amount=-85.00,
+                        currency="NZD",
+                        merchant="PAK N SAVE ALBANY",
+                        category="General",
+                        notes="akahu:trans_skip_1",
+                    )
+                ],
+                skip_llm=True,
+            )
+        mock_jev.assert_not_called()
+        assert created == 1
+        assert txs[0].category == "Groceries"
