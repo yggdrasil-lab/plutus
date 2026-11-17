@@ -21,11 +21,33 @@ TRANSFER_KEYWORDS = re.compile(
     re.I,
 )
 
+NON_TRANSFER_NOISE = re.compile(
+    r"\b(?:service charge|base rewards|cashcare|bank fee|account fee)\b",
+    re.I,
+)
+
+CRYPTO_CURRENCIES = {"BTC", "ETH", "SOL", "USDC", "USDT"}
+HIGH_DENOM_FIAT = {"PHP", "JPY", "IDR", "KRW", "VND"}
+
+
+def _is_plausible_offline_fx_rate(from_currency: str, to_currency: str, implied_rate: float) -> bool:
+    """Return True if an implied FX rate is plausible when no market rate is available."""
+    src = (from_currency or "").upper()
+    dst = (to_currency or "").upper()
+    if src in CRYPTO_CURRENCIES or dst in CRYPTO_CURRENCIES:
+        return True
+    if src in HIGH_DENOM_FIAT or dst in HIGH_DENOM_FIAT:
+        return 0.005 <= implied_rate <= 200.0
+    return 0.3 <= implied_rate <= 3.5
+
 
 def _is_transfer_like(tx: Transaction) -> bool:
     """Return True if a transaction is categorized as a transfer or contains transfer keywords."""
     tx_cat = (tx.category or "").strip().lower()
     if tx_cat not in ("general", "transfers", "transfer"):
+        return False
+    merchant_text = f"{tx.merchant or ''} {tx.raw_description or ''}"
+    if NON_TRANSFER_NOISE.search(merchant_text):
         return False
     return bool(
         tx_cat in ("transfers", "transfer")
@@ -146,6 +168,12 @@ def match_transfer_pair(tx: Transaction, db: Session) -> Optional[Transaction]:
                     break
 
             if net_out > 0:
+                is_fiat_pair = (
+                    cand_outflow.currency.upper() not in CRYPTO_CURRENCIES
+                    and cand_inflow.currency.upper() not in CRYPTO_CURRENCIES
+                )
+                if is_fiat_pair and (out_amt < 1.0 or in_amt < 1.0):
+                    continue
                 implied_rate = in_amt / net_out
                 if has_transfer_signal and implied_rate > 0:
                     market = get_exchange_rate(
@@ -157,6 +185,12 @@ def match_transfer_pair(tx: Transaction, db: Session) -> Optional[Transaction]:
                     if market is not None and market[0] > 0:
                         if abs(implied_rate - market[0]) / market[0] > 0.12:
                             continue
+                    elif not _is_plausible_offline_fx_rate(
+                        cand_outflow.currency,
+                        cand_inflow.currency,
+                        implied_rate,
+                    ):
+                        continue
                     best_match = cand
                     precision = 8 if implied_rate < 0.01 else 6 if implied_rate < 1.0 else 4
                     cand_outflow.exchange_rate = round(implied_rate, precision)

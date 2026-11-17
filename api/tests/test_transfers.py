@@ -564,6 +564,70 @@ TRANSFER-98765433,05-11-2026,500.00,NZD,Client Payment Invoice 101,Freelance,500
         self.assertIsNone(deposit.linked_transaction_id)
         self.assertIsNone(amazon.linked_transaction_id)
 
+    def test_rejects_implausible_fx_rate_and_bank_noise_when_offline(self):
+        from unittest.mock import patch
+
+        asb_nzd = Account(
+            name="ANZ Freedom",
+            institution="ANZ",
+            account_type="checking",
+            tier="cash",
+            currency="NZD",
+        )
+        dbs_sgd = Account(
+            name="DBS Savings",
+            institution="DBS Bank",
+            account_type="savings",
+            tier="cash",
+            currency="SGD",
+        )
+        self.db.add_all([asb_nzd, dbs_sgd])
+        self.db.commit()
+        self.db.refresh(asb_nzd)
+        self.db.refresh(dbs_sgd)
+
+        nzd_out = Transaction(
+            transaction_date=date(2026, 10, 12),
+            account_id=asb_nzd.id,
+            amount=-1990.66,
+            currency="NZD",
+            merchant="Credit Card payment",
+            category="Transfers",
+            raw_hash="nzd-cc-1990",
+        )
+        sgd_giro = Transaction(
+            transaction_date=date(2026, 10, 14),
+            account_id=dbs_sgd.id,
+            amount=65.54,
+            currency="SGD",
+            merchant="GIRO Payments / Collections via GIRO",
+            category="Transfers",
+            raw_hash="sgd-giro-65",
+        )
+        sgd_reward = Transaction(
+            transaction_date=date(2026, 10, 13),
+            account_id=dbs_sgd.id,
+            amount=0.13,
+            currency="SGD",
+            merchant="BASE REWARDS",
+            category="Transfers",
+            raw_hash="sgd-reward-013",
+        )
+        self.db.add_all([nzd_out, sgd_giro, sgd_reward])
+        self.db.commit()
+
+        with patch("app.services.transfer_service.get_exchange_rate", return_value=None):
+            matched = match_transfer_pair(nzd_out, self.db)
+
+        self.assertIsNone(matched)
+        self.db.refresh(nzd_out)
+        self.db.refresh(sgd_giro)
+        self.db.refresh(sgd_reward)
+        self.assertIsNone(nzd_out.linked_transaction_id)
+        self.assertIsNone(nzd_out.exchange_rate)
+        self.assertIsNone(sgd_giro.linked_transaction_id)
+        self.assertIsNone(sgd_reward.linked_transaction_id)
+
 
 if __name__ == "__main__":
     unittest.main()

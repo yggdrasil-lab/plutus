@@ -229,4 +229,16 @@ def get_exchange_rate(
     if latest_fallback:
         return float(latest_fallback.rate), latest_fallback.source
 
+    inverse_fallback = db.scalar(
+        select(ExchangeRate)
+        .where(
+            ExchangeRate.from_currency == dst,
+            ExchangeRate.to_currency == src,
+        )
+        .order_by(desc(ExchangeRate.rate_date))
+        .limit(1)
+    )
+    if inverse_fallback and float(inverse_fallback.rate) > 0:
+        return 1.0 / float(inverse_fallback.rate), f"{inverse_fallback.source}_inverse"
+
     return None
