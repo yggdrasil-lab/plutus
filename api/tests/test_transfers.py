@@ -628,6 +628,50 @@ TRANSFER-98765433,05-11-2026,500.00,NZD,Client Payment Invoice 101,Freelance,500
         self.assertIsNone(sgd_giro.linked_transaction_id)
         self.assertIsNone(sgd_reward.linked_transaction_id)
 
+    def test_same_account_subaccount_dbs_to_dbs_transfer(self):
+        dbs_combo = Account(
+            name="DBS Bank DBS Savings / Multiplier",
+            institution="DBS Bank",
+            account_type="savings",
+            tier="cash",
+            currency="SGD",
+        )
+        self.db.add(dbs_combo)
+        self.db.commit()
+        self.db.refresh(dbs_combo)
+
+        tx_out = Transaction(
+            transaction_date=date(2026, 10, 1),
+            account_id=dbs_combo.id,
+            amount=-85.00,
+            currency="SGD",
+            merchant="Funds Transfer",
+            raw_description="Funds Transfer [DBS Savings Account (019-9-083519-0)]",
+            category="Transfers",
+            raw_hash="dbs-savings-out-85",
+        )
+        tx_in = Transaction(
+            transaction_date=date(2026, 10, 1),
+            account_id=dbs_combo.id,
+            amount=85.00,
+            currency="SGD",
+            merchant="Advice Funds Transfer",
+            raw_description="Advice Funds Transfer [DBS Multiplier Account (120-2-099110-1)]",
+            category="Transfers",
+            raw_hash="dbs-mult-in-85",
+        )
+        self.db.add_all([tx_out, tx_in])
+        self.db.commit()
+
+        matched = match_transfer_pair(tx_out, self.db)
+        self.assertIsNotNone(matched)
+        self.assertEqual(matched.id, tx_in.id)
+        self.db.refresh(tx_out)
+        self.db.refresh(tx_in)
+        self.assertEqual(tx_out.linked_transaction_id, tx_in.id)
+        self.assertEqual(tx_in.linked_transaction_id, tx_out.id)
+        self.assertEqual(float(tx_out.exchange_rate), 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()
