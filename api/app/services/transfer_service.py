@@ -25,6 +25,15 @@ NON_TRANSFER_NOISE = re.compile(
     r"\b(?:service charge|base rewards|cashcare|bank fee|account fee)\b",
     re.I,
 )
+SUBACCOUNT_TAG_RE = re.compile(r"\[([^\]]+)\]\s*$")
+
+
+def _extract_subaccount_tag(raw_description: Optional[str]) -> Optional[str]:
+    """Extract trailing `[Subaccount]` tag from statement descriptions if present."""
+    if not raw_description:
+        return None
+    match = SUBACCOUNT_TAG_RE.search(raw_description.strip())
+    return match.group(1).strip().lower() if match else None
 
 CRYPTO_CURRENCIES = {"BTC", "ETH", "SOL", "USDC", "USDT"}
 HIGH_DENOM_FIAT = {"PHP", "JPY", "IDR", "KRW", "VND"}
@@ -77,7 +86,6 @@ def match_transfer_pair(tx: Transaction, db: Session) -> Optional[Transaction]:
         stmt = (
             select(Transaction)
             .where(Transaction.id != tx.id)
-            .where(Transaction.account_id != tx.account_id)
             .where(Transaction.amount > 0)
             .where(Transaction.linked_transaction_id.is_(None))
             .where(Transaction.transaction_date >= date_min)
@@ -87,7 +95,6 @@ def match_transfer_pair(tx: Transaction, db: Session) -> Optional[Transaction]:
         stmt = (
             select(Transaction)
             .where(Transaction.id != tx.id)
-            .where(Transaction.account_id != tx.account_id)
             .where(Transaction.amount < 0)
             .where(Transaction.linked_transaction_id.is_(None))
             .where(Transaction.transaction_date >= date_min)
@@ -121,6 +128,19 @@ def match_transfer_pair(tx: Transaction, db: Session) -> Optional[Transaction]:
 
         out_amt = abs(float(cand_outflow.amount))
         in_amt = float(cand_inflow.amount)
+
+        if cand_outflow.account_id == cand_inflow.account_id:
+            if abs((cand_outflow.transaction_date - cand_inflow.transaction_date).days) > 1:
+                continue
+            if not (_is_transfer_like(cand_outflow) and _is_transfer_like(cand_inflow)):
+                continue
+            if abs(out_amt - in_amt) > 0.05:
+                continue
+            sub_out = _extract_subaccount_tag(cand_outflow.raw_description)
+            sub_in = _extract_subaccount_tag(cand_inflow.raw_description)
+            if sub_out and sub_in and sub_out == sub_in:
+                continue
+
         fee = float(cand_outflow.fee_amount or 0.0)
         net_out = out_amt - fee
         if abs(net_out - in_amt) <= 0.05 or abs(out_amt - in_amt) <= 0.05:
@@ -139,6 +159,9 @@ def match_transfer_pair(tx: Transaction, db: Session) -> Optional[Transaction]:
             cand_outflow = cand if cand.amount < 0 else outflow_tx
             cand_inflow = cand if cand.amount > 0 else inflow_tx
             if not cand_outflow or not cand_inflow:
+                continue
+
+            if cand_outflow.account_id == cand_inflow.account_id:
                 continue
 
             if cand_outflow.currency == cand_inflow.currency:
