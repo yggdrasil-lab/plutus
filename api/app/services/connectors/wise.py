@@ -5,6 +5,7 @@
 # ============================================================================
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import httpx
 from sqlalchemy.orm import Session
@@ -141,10 +142,13 @@ class HttpWiseGateway:
 # 3. PURE NORMALIZERS (Zero I/O)
 # ============================================================================
 def _parse_iso_date(value: Optional[str]) -> date:
-    """Parse Wise ISO-8601 timestamp into a date."""
+    """Parse Wise ISO-8601 UTC timestamp into the configured local date (e.g. Pacific/Auckland)."""
     if not value:
-        return date.today()
-    return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
+        return datetime.now(ZoneInfo(settings.timezone)).date()
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(ZoneInfo(settings.timezone))
+    return dt.date()
 
 
 def _extract_wise_merchant(tx: dict) -> tuple[str, str]:
