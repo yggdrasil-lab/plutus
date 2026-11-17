@@ -229,6 +229,73 @@ class TestCategorizationRules(unittest.TestCase):
         txs_after = self.client.get("/transactions").json()
         self.assertEqual(txs_after[0]["tags"], ["gym-membership"])
 
+    def test_income_rule_skips_debits_and_retroactive_skips_paired_transfers(self):
+        income_rule = CategorizationRule(
+            name="From Arnie",
+            description_pattern="Funds Transfer",
+            match_type="contains",
+            amount_equals=85.0,
+            target_category="Income",
+            rename_merchant="From Arnie",
+            is_active=True,
+        )
+        self.db.add(income_rule)
+        self.db.flush()
+
+        # Inflow (+85) matches Income rule; outflow (-85) must not
+        self.assertTrue(matches_rule(income_rule, "Funds Transfer [DBS Savings]", 85.0))
+        self.assertFalse(matches_rule(income_rule, "Funds Transfer [DBS Savings]", -85.0))
+
+        t_in = Transaction(
+            transaction_date=date(2026, 9, 30),
+            account_id=self.acc.id,
+            amount=85.0,
+            currency="SGD",
+            merchant="Funds Transfer",
+            raw_description="Funds Transfer [DBS Savings]",
+            raw_hash="arnie-in-1",
+            category="General",
+        )
+        t_out = Transaction(
+            transaction_date=date(2026, 10, 1),
+            account_id=self.acc.id,
+            amount=-85.0,
+            currency="SGD",
+            merchant="Funds Transfer",
+            raw_description="Funds Transfer [DBS Savings]",
+            raw_hash="arnie-out-1",
+            category="Transfers",
+        )
+        t_dest = Transaction(
+            transaction_date=date(2026, 10, 1),
+            account_id=self.acc.id,
+            amount=85.0,
+            currency="SGD",
+            merchant="Advice Funds Transfer",
+            raw_description="Advice Funds Transfer [DBS Multiplier]",
+            raw_hash="arnie-dest-1",
+            category="Transfers",
+        )
+        self.db.add_all([t_in, t_out, t_dest])
+        self.db.flush()
+        t_out.linked_transaction_id = t_dest.id
+        t_dest.linked_transaction_id = t_out.id
+        self.db.commit()
+
+        from app.services.rules_engine import apply_rules_to_existing_transactions
+
+        apply_rules_to_existing_transactions(self.db, rule_ids=[income_rule.id])
+        self.db.refresh(t_in)
+        self.db.refresh(t_out)
+        self.db.refresh(t_dest)
+
+        self.assertEqual(t_in.category, "Income")
+        self.assertEqual(t_in.merchant, "From Arnie")
+        self.assertEqual(t_out.category, "Transfers")
+        self.assertEqual(t_out.merchant, "Funds Transfer")
+        self.assertEqual(t_dest.category, "Transfers")
+        self.assertEqual(t_dest.merchant, "Advice Funds Transfer")
+
 
 if __name__ == "__main__":
     unittest.main()
