@@ -59,6 +59,10 @@ def matches_rule(rule: CategorizationRule, raw_description: str, amount: float) 
         if abs(tx_amt - target_amt) > 0.01:
             return False
 
+    # 3. Income rules only match inflows (positive amounts)
+    if (rule.target_category or "").strip().lower() == "income" and float(amount) <= 0:
+        return False
+
     return True
 
 
@@ -101,6 +105,9 @@ def apply_rules_to_existing_transactions(
     rules_by_id: dict[int, CategorizationRule] = {r.id: r for r in rules}
 
     for tx in transactions:
+        # Paired transfers are already reconciled; never clobber them with category rules.
+        if tx.linked_transaction_id is not None:
+            continue
         desc = tx.raw_description or tx.merchant
         amt = float(tx.amount)
         cat, rename, rule_id = evaluate_rules(desc, amt, rules)
