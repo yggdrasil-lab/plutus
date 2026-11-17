@@ -1,6 +1,8 @@
 services:
   plutus-db:
     image: postgres:16-alpine
+    stop_signal: SIGINT
+    stop_grace_period: 60s
     environment:
       - POSTGRES_USER=plutus
       - POSTGRES_DB=plutus
