@@ -137,3 +137,11 @@ def test_skip_llm_bypasses_jev_and_uses_heuristics():
         mock_jev.assert_not_called()
         assert created == 1
         assert txs[0].category == "Groceries"
+
+
+def test_wise_parse_iso_date_uses_configured_timezone():
+    from app.services.connectors.wise import _parse_iso_date
+
+    # 2026-10-27 12:00:00Z is 2026-10-28 01:00:00 NZDT (UTC+13)
+    assert _parse_iso_date("2026-10-27T12:00:00.000Z") == date(2026, 10, 28)
+    assert _parse_iso_date("2026-10-27T01:00:00.000Z") == date(2026, 10, 27)
