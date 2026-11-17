@@ -1,9 +1,11 @@
 """Unit tests for Akahu, Wise, and DBS email alert connectors (SOLID / FakeGateway)."""
 
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 import sys
+from typing import Optional
 import unittest
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
@@ -16,8 +18,16 @@ from app.config import settings
 from app.db import Base, get_db
 from app.main import app
 from app.models import Account, AssetSnapshot, Transaction
-from app.services.connectors.akahu import normalize_akahu_feeds, sync_akahu
-from app.services.connectors.wise import normalize_wise_feed, sync_wise
+from app.services.connectors.akahu import (
+    HttpAkahuGateway,
+    normalize_akahu_feeds,
+    sync_akahu,
+)
+from app.services.connectors.wise import (
+    HttpWiseGateway,
+    normalize_wise_feed,
+    sync_wise,
+)
 from app.services.ingestion_service import (
     NormalizedTx,
     ProviderAccountFeed,
@@ -38,8 +48,16 @@ class FakeFeedGateway:
 
     def __init__(self, feeds: list[ProviderAccountFeed]) -> None:
         self._feeds = feeds
+        self.calls: list[dict] = []
 
-    def fetch_feeds(self, *, days: int) -> list[ProviderAccountFeed]:
+    def fetch_feeds(
+        self,
+        *,
+        days: int = 30,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+    ) -> list[ProviderAccountFeed]:
+        self.calls.append({"days": days, "start_date": start_date, "end_date": end_date})
         return self._feeds
 
 
@@ -346,3 +364,165 @@ class TestExternalConnectors(unittest.TestCase):
         self.assertEqual(len(all_accounts), 1)
         self.assertEqual(all_accounts[0].external_provider, "akahu")
         self.assertEqual(all_accounts[0].external_account_id, "acc_anz_live")
+
+    def test_sync_all_endpoint_passes_start_date_and_validates_range(self):
+        from app.routers import integrations as integrations_router
+
+        captured: list[tuple[str, int, Optional[date], Optional[date]]] = []
+
+        def fake_akahu(db, days, start_date, end_date):
+            captured.append(("akahu", days, start_date, end_date))
+            return {
+                "provider": "akahu",
+                "accounts_synced": 1,
+                "transactions_created": 2,
+                "transactions_skipped": 0,
+                "snapshots_updated": 1,
+                "accounts": [],
+            }
+
+        def fake_wise(db, days, start_date, end_date):
+            captured.append(("wise", days, start_date, end_date))
+            return {
+                "provider": "wise",
+                "accounts_synced": 1,
+                "transactions_created": 3,
+                "transactions_skipped": 1,
+                "snapshots_updated": 1,
+                "accounts": [],
+            }
+
+        with patch.dict(
+            integrations_router.SYNC_HANDLERS,
+            {
+                "akahu": lambda db, days, sd, ed: integrations_router.SyncResult(**fake_akahu(db, days, sd, ed)),
+                "wise": lambda db, days, sd, ed: integrations_router.SyncResult(**fake_wise(db, days, sd, ed)),
+            },
+        ):
+            resp = self.client.post("/integrations/sync/all?start_date=2024-08-01")
+
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["provider"], "all")
+        self.assertEqual(body["accounts_synced"], 2)
+        self.assertEqual(body["transactions_created"], 5)
+        self.assertEqual(body["transactions_skipped"], 1)
+        self.assertEqual(
+            captured,
+            [
+                ("akahu", 30, date(2024, 8, 1), None),
+                ("wise", 30, date(2024, 8, 1), None),
+            ],
+        )
+
+        bad_resp = self.client.post(
+            "/integrations/sync/all?start_date=2026-11-18&end_date=2026-11-17"
+        )
+        self.assertEqual(bad_resp.status_code, 422)
+
+    def test_http_wise_gateway_chunks_over_469_days_and_deduplicates_boundaries(self):
+        gateway = HttpWiseGateway(api_token="test-wise-token")
+        statement_calls: list[dict] = []
+
+        boundary_tx = {
+            "referenceNumber": "WISE-BOUNDARY-1",
+            "date": "2025-08-01T00:00:00Z",
+            "amount": {"value": -25.00, "currency": "SGD"},
+            "details": {"description": "Boundary Coffee"},
+        }
+        no_ref_tx = {
+            "date": "2025-08-01T00:00:00Z",
+            "amount": {"value": -10.00, "currency": "SGD"},
+            "details": {"description": "No Ref Boundary"},
+        }
+
+        def fake_get_json(_self, _client, url: str, _label: str, params=None):
+            if url.endswith("/profiles"):
+                return [{"id": 999, "type": "PERSONAL"}]
+            if url.endswith("/balances"):
+                return [
+                    {
+                        "id": 101,
+                        "currency": "SGD",
+                        "type": "STANDARD",
+                        "amount": {"value": 500.0, "currency": "SGD"},
+                    }
+                ]
+            if url.endswith("/statement.json"):
+                statement_calls.append(dict(params or {}))
+                idx = len(statement_calls)
+                if idx == 1:
+                    return {
+                        "transactions": [
+                            {
+                                "referenceNumber": "WISE-W1-ONLY",
+                                "date": "2024-09-15T10:00:00Z",
+                                "amount": {"value": -40.00, "currency": "SGD"},
+                                "details": {"description": "Window 1"},
+                            },
+                            boundary_tx,
+                            no_ref_tx,
+                        ]
+                    }
+                if idx == 2:
+                    return {
+                        "transactions": [
+                            dict(boundary_tx),
+                            dict(no_ref_tx),
+                            {
+                                "referenceNumber": "WISE-W2-ONLY",
+                                "date": "2026-01-10T10:00:00Z",
+                                "amount": {"value": -60.00, "currency": "SGD"},
+                                "details": {"description": "Window 2"},
+                            },
+                        ]
+                    }
+                return {
+                    "transactions": [
+                        {
+                            "referenceNumber": "WISE-W3-ONLY",
+                            "date": "2026-10-05T10:00:00Z",
+                            "amount": {"value": -15.00, "currency": "SGD"},
+                            "details": {"description": "Window 3"},
+                        }
+                    ]
+                }
+            raise AssertionError(f"Unexpected URL: {url}")
+
+        with patch.object(HttpWiseGateway, "_get_json", fake_get_json):
+            feeds = gateway.fetch_feeds(
+                start_date=date(2024, 8, 1),
+                end_date=date(2026, 11, 17),
+            )
+
+        self.assertEqual(len(statement_calls), 3)
+        for call_params in statement_calls:
+            win_start = datetime.fromisoformat(call_params["intervalStart"].replace("Z", "+00:00"))
+            win_end = datetime.fromisoformat(call_params["intervalEnd"].replace("Z", "+00:00"))
+            self.assertLessEqual((win_end - win_start).days, 365)
+
+        self.assertEqual(statement_calls[0]["intervalStart"], "2024-08-01T00:00:00.000Z")
+        self.assertEqual(statement_calls[-1]["intervalEnd"], "2026-11-17T23:59:59.000Z")
+        self.assertEqual(len(feeds), 1)
+        self.assertEqual(len(feeds[0].transactions), 5)
+
+    def test_http_akahu_gateway_uses_explicit_date_window(self):
+        gateway = HttpAkahuGateway(app_token="app_tok", user_token="usr_tok")
+        captured_dt: list[tuple[datetime, datetime]] = []
+
+        def fake_get_accounts(_self, _client):
+            return []
+
+        def fake_get_transactions(_self, _client, *, start_dt: datetime, end_dt: datetime):
+            captured_dt.append((start_dt, end_dt))
+            return []
+
+        with (
+            patch.object(HttpAkahuGateway, "_get_accounts", fake_get_accounts),
+            patch.object(HttpAkahuGateway, "_get_transactions", fake_get_transactions),
+        ):
+            gateway.fetch_feeds(start_date=date(2024, 8, 1), end_date=date(2024, 8, 31))
+
+        self.assertEqual(len(captured_dt), 1)
+        self.assertEqual(captured_dt[0][0].isoformat(), "2024-08-01T00:00:00+00:00")
+        self.assertEqual(captured_dt[0][1].isoformat(), "2024-08-31T23:59:59+00:00")

@@ -5,7 +5,7 @@
 # ============================================================================
 from collections import Counter
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 import hashlib
 import json
@@ -72,9 +72,38 @@ class ProviderAccountFeed:
 class BankFeedGateway(Protocol):
     """Abstract gateway for external bank/wallet feed providers."""
 
-    def fetch_feeds(self, *, days: int) -> list[ProviderAccountFeed]:
-        """Fetch normalized account balances and transactions for the lookback window."""
+    def fetch_feeds(
+        self,
+        *,
+        days: int = 30,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+    ) -> list[ProviderAccountFeed]:
+        """Fetch normalized account balances and transactions for the lookback or date window."""
         ...
+
+
+def resolve_utc_sync_window(
+    *,
+    days: int = 30,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+) -> tuple[datetime, datetime]:
+    """Resolve an explicit (start_date, end_date) or relative days lookback into UTC datetimes."""
+    if start_date is not None and end_date is not None and start_date > end_date:
+        raise ValueError("start_date must be on or before end_date.")
+
+    if end_date is not None:
+        end_dt = datetime.combine(end_date, time(23, 59, 59), tzinfo=timezone.utc)
+    else:
+        end_dt = datetime.now(timezone.utc)
+
+    if start_date is not None:
+        start_dt = datetime.combine(start_date, time.min, tzinfo=timezone.utc)
+    else:
+        start_dt = end_dt - timedelta(days=days)
+
+    return start_dt, end_dt
 
 
 # ============================================================================

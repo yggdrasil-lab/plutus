@@ -19,6 +19,7 @@ from app.services.ingestion_service import (
     ExternalAccountSpec,
     NormalizedTx,
     ProviderAccountFeed,
+    resolve_utc_sync_window,
     sync_provider_feeds,
 )
 from app.services.statement_parser import auto_categorize
@@ -184,11 +185,22 @@ class HttpAkahuGateway:
         }
         self._timeout = timeout
 
-    def fetch_feeds(self, *, days: int) -> list[ProviderAccountFeed]:
+    def fetch_feeds(
+        self,
+        *,
+        days: int = 30,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+    ) -> list[ProviderAccountFeed]:
         """Fetch raw Akahu accounts and paginated transactions, then normalize."""
+        start_dt, end_dt = resolve_utc_sync_window(
+            days=days,
+            start_date=start_date,
+            end_date=end_date,
+        )
         with httpx.Client(timeout=self._timeout) as client:
             raw_accounts = self._get_accounts(client)
-            raw_transactions = self._get_transactions(client, days=days)
+            raw_transactions = self._get_transactions(client, start_dt=start_dt, end_dt=end_dt)
         return normalize_akahu_feeds(raw_accounts, raw_transactions)
 
     def _get_accounts(self, client: httpx.Client) -> list[dict]:
@@ -199,9 +211,13 @@ class HttpAkahuGateway:
             )
         return resp.json().get("items", [])
 
-    def _get_transactions(self, client: httpx.Client, *, days: int) -> list[dict]:
-        end_dt = datetime.now(timezone.utc)
-        start_dt = end_dt - timedelta(days=days)
+    def _get_transactions(
+        self,
+        client: httpx.Client,
+        *,
+        start_dt: datetime,
+        end_dt: datetime,
+    ) -> list[dict]:
         base_params = {
             "start": start_dt.isoformat().replace("+00:00", "Z"),
             "end": end_dt.isoformat().replace("+00:00", "Z"),
@@ -306,6 +322,8 @@ def sync_akahu(
     db: Session,
     *,
     days: int = 14,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
     gateway: Optional[BankFeedGateway] = None,
 ) -> SyncResult:
     """Pull Akahu accounts and transactions via injected or HTTP gateway."""
@@ -313,5 +331,9 @@ def sync_akahu(
         app_token=settings.akahu_app_token,
         user_token=settings.akahu_user_token,
     )
-    feeds = resolved_gateway.fetch_feeds(days=days)
+    feeds = resolved_gateway.fetch_feeds(
+        days=days,
+        start_date=start_date,
+        end_date=end_date,
+    )
     return sync_provider_feeds(db, provider="akahu", feeds=feeds)

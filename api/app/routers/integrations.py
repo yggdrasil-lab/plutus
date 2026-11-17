@@ -324,9 +324,15 @@ async def upload_statement(
     return parse_result
 
 
-SYNC_HANDLERS: dict[str, Callable[[Session, int], SyncResult]] = {
-    "akahu": lambda db, days: sync_akahu(db, days=days),
-    "wise": lambda db, days: sync_wise(db, days=days),
+SYNC_HANDLERS: dict[
+    str, Callable[[Session, int, Optional[date], Optional[date]], SyncResult]
+] = {
+    "akahu": lambda db, days, start_date, end_date: sync_akahu(
+        db, days=days, start_date=start_date, end_date=end_date
+    ),
+    "wise": lambda db, days, start_date, end_date: sync_wise(
+        db, days=days, start_date=start_date, end_date=end_date
+    ),
 }
 
 
@@ -334,10 +340,24 @@ SYNC_HANDLERS: dict[str, Callable[[Session, int], SyncResult]] = {
 def sync_external_provider(
     provider: str,
     days: int = Query(default=30, ge=1, le=90, description="Lookback window in days"),
+    start_date: Optional[date] = Query(
+        default=None,
+        description="Optional inclusive backfill start date (YYYY-MM-DD)",
+    ),
+    end_date: Optional[date] = Query(
+        default=None,
+        description="Optional inclusive backfill end date (YYYY-MM-DD)",
+    ),
     db: Session = Depends(get_db),
     _authorized: bool = Depends(verify_integration_token),
 ):
     """Trigger live sync for Akahu or Wise accounts and transactions."""
+    if start_date is not None and end_date is not None and start_date > end_date:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="start_date must be on or before end_date.",
+        )
+
     normalized = provider.strip().lower()
     if normalized != "all" and normalized not in SYNC_HANDLERS:
         raise HTTPException(
@@ -347,7 +367,7 @@ def sync_external_provider(
 
     targets = list(SYNC_HANDLERS.values()) if normalized == "all" else [SYNC_HANDLERS[normalized]]
     try:
-        results = [handler(db, days) for handler in targets]
+        results = [handler(db, days, start_date, end_date) for handler in targets]
     except ConnectorConfigError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
