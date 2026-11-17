@@ -254,6 +254,15 @@ class TestBudgetsRouter(unittest.TestCase):
         self.assertEqual(b_data["period"], "last_month")
         self.assertEqual(b_data["total_spend"], 80.0)
 
+    def test_week_and_last_week_breakdown(self):
+        res_week = self.client.get("/budgets/breakdown?period=week")
+        self.assertEqual(res_week.status_code, 200)
+        self.assertIn("total_spend", res_week.json())
+
+        res_last_week = self.client.get("/budgets/breakdown?period=last_week")
+        self.assertEqual(res_last_week.status_code, 200)
+        self.assertIn("total_spend", res_last_week.json())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -137,8 +137,9 @@ def get_spending_breakdown(
     db: Session = Depends(get_db),
 ):
     """Retrieve detailed category spending breakdown, budget utilization, and overspending warnings."""
+    today = date.today()
     effective_period = None if (start_date is not None or end_date is not None) else period
-    start_date, end_date = resolve_period_dates(effective_period, start_date, end_date)
+    start_date, end_date = resolve_period_dates(effective_period, start_date, end_date, today=today)
 
     # Fetch active budget rules
     budget_rules = {r.category.lower(): r for r in db.scalars(select(BudgetRule).where(BudgetRule.is_active == True)).all()}
