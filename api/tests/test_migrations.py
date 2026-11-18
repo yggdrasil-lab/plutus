@@ -31,4 +31,4 @@ def test_alembic_upgrade_head_creates_loans_and_commits(tmp_path: Path, monkeypa
     assert "loans" in tables
     assert "transactions" in tables
     assert version is not None
-    assert version[0] == "0009_snapshot_balance_precision"
+    assert version[0] == "0010_add_budget_rule_period"

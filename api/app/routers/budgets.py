@@ -20,12 +20,16 @@ from app.schemas import (
 )
 from app.services.burn_service import (
     TRANSFER_CATEGORIES,
+    WEEKS_PER_YEAR,
+    annual_to_weekly,
+    calculate_annual_category_spend_map,
     calculate_category_average_burn,
     calculate_weekly_burn_summary,
     list_recurring_commitment_details,
     monthly_to_weekly,
     sync_budgets_from_average_burn,
     to_nzd_amount,
+    weekly_to_annual,
     weekly_to_monthly,
 )
 from app.services.period_service import resolve_period_dates
@@ -48,8 +52,13 @@ DEFAULT_BASELINE_BUDGETS = [
 def _resolve_budget_limits(
     weekly: Optional[float],
     monthly: Optional[float],
+    annual: Optional[float] = None,
 ) -> tuple[float, float]:
-    """Resolve paired (weekly_limit, monthly_limit) values when either is omitted."""
+    """Resolve paired (weekly_limit, monthly_limit) values when any limit is provided."""
+    if annual is not None:
+        resolved_weekly = weekly if weekly is not None else annual_to_weekly(annual)
+        resolved_monthly = monthly if monthly is not None else round(float(annual) / 12.0, 2)
+        return resolved_weekly, resolved_monthly
     if weekly is None and monthly is None:
         return 100.0, weekly_to_monthly(100.0)
     if weekly is not None and monthly is None:
@@ -82,19 +91,34 @@ def _build_category_report(
     is_tx_transfer: bool,
     rule: Optional[BudgetRule],
     period: Optional[str],
+    *,
+    annual_cat_spend: Optional[float] = None,
 ) -> CategorySpendingReport:
     """Build one CategorySpendingReport with budget utilization and warning level."""
+    rule_period = (rule.budget_period or "monthly").strip().lower() if rule else "monthly"
+    is_annual_rule = bool(rule and not is_tx_transfer and rule_period == "annual")
+    display_spend = (
+        round(annual_cat_spend, 2)
+        if (is_annual_rule and annual_cat_spend is not None)
+        else cat_spend
+    )
+
     pct = round((cat_spend / total_spend * 100), 1) if (total_spend > 0 and not is_tx_transfer) else 0.0
     budget_limit: Optional[float] = None
+    annual_limit_val: Optional[float] = None
     percent_used: Optional[float] = None
     is_over = False
     warning = "normal"
 
     if rule and not is_tx_transfer:
-        budget_limit = float(rule.weekly_limit if period == "week" else rule.monthly_limit)
+        if is_annual_rule:
+            annual_limit_val = weekly_to_annual(rule.weekly_limit)
+            budget_limit = annual_limit_val
+        else:
+            budget_limit = float(rule.weekly_limit if period == "week" else rule.monthly_limit)
         if budget_limit > 0:
-            percent_used = round((cat_spend / budget_limit * 100), 1)
-            is_over = cat_spend > budget_limit
+            percent_used = round((display_spend / budget_limit * 100), 1)
+            is_over = display_spend > budget_limit
             if is_over:
                 warning = "danger"
             elif percent_used >= 80.0:
@@ -102,7 +126,7 @@ def _build_category_report(
 
     return CategorySpendingReport(
         category=category,
-        total_spend=cat_spend,
+        total_spend=display_spend,
         transaction_count=count,
         percentage=pct,
         budget_limit=budget_limit,
@@ -110,6 +134,8 @@ def _build_category_report(
         is_over_budget=is_over,
         warning_level=warning,
         is_transfer=is_tx_transfer,
+        budget_period=rule_period if (rule and not is_tx_transfer) else "monthly",
+        annual_limit=annual_limit_val,
     )
 
 
@@ -130,16 +156,32 @@ def upsert_budget_rule(
     payload: BudgetRuleCreate,
     db: Session = Depends(get_db),
 ):
-    """Create or update a spending target budget for a given category."""
+    """Create or update a spending target budget (weekly, monthly, or annual) for a category."""
     cat = payload.category.strip()
     if not cat:
         raise HTTPException(status_code=400, detail="Category name cannot be empty")
 
-    weekly, monthly = _resolve_budget_limits(payload.weekly_limit, payload.monthly_limit)
+    weekly, monthly = _resolve_budget_limits(
+        payload.weekly_limit, payload.monthly_limit, payload.annual_limit
+    )
     existing = db.scalar(select(BudgetRule).where(func.lower(BudgetRule.category) == cat.lower()))
+    if payload.budget_period is not None:
+        resolved_period = payload.budget_period
+    elif existing is not None:
+        resolved_period = existing.budget_period
+    elif (
+        payload.annual_limit is not None
+        and payload.weekly_limit is None
+        and payload.monthly_limit is None
+    ):
+        resolved_period = "annual"
+    else:
+        resolved_period = "monthly"
+
     if existing:
         existing.weekly_limit = weekly
         existing.monthly_limit = monthly
+        existing.budget_period = resolved_period
         existing.is_active = payload.is_active
         db.commit()
         db.refresh(existing)
@@ -149,6 +191,7 @@ def upsert_budget_rule(
         category=cat,
         weekly_limit=weekly,
         monthly_limit=monthly,
+        budget_period=resolved_period,
         is_active=payload.is_active,
     )
     db.add(new_rule)
@@ -218,6 +261,8 @@ def get_average_burn_report(
                 recurring_weekly_burn=item.recurring_weekly_burn,
                 average_weekly_burn=item.average_weekly_burn,
                 suggested_monthly_limit=item.suggested_monthly_limit,
+                suggested_annual_limit=item.suggested_annual_limit,
+                budget_period=item.budget_period,
                 variable_percentage=item.variable_percentage,
                 total_percentage=item.total_percentage,
             )
@@ -255,6 +300,12 @@ def get_spending_breakdown(
         r.category.lower(): r
         for r in db.scalars(select(BudgetRule).where(BudgetRule.is_active == True)).all()
     }
+    annual_cats = {
+        cat_lower
+        for cat_lower, rule in budget_rules.items()
+        if (rule.budget_period or "monthly").strip().lower() == "annual"
+    }
+    annual_spend_map = calculate_annual_category_spend_map(db, today, annual_cats)
 
     stmt = select(Transaction)
     if start_date:
@@ -280,7 +331,7 @@ def get_spending_breakdown(
             continue
 
         if amt < 0:
-            if period == "week" and tx.recurrence is not None:
+            if period == "week" and (tx.recurrence is not None or cat_lower in annual_cats):
                 continue
             total_spend += amt_nzd
             _accumulate_category(category_spend_map, cat, amt_nzd)
@@ -292,6 +343,13 @@ def get_spending_breakdown(
             cat = rec_tx.category or "General"
             total_spend += weekly_nzd
             _accumulate_category(category_spend_map, cat, weekly_nzd)
+        for cat_lower in annual_cats:
+            annual_total_nzd = annual_spend_map.get(cat_lower, 0.0)
+            if annual_total_nzd > 0:
+                rule = budget_rules[cat_lower]
+                weekly_equiv = round(annual_total_nzd / WEEKS_PER_YEAR, 2)
+                total_spend += weekly_equiv
+                _accumulate_category(category_spend_map, rule.category, weekly_equiv)
 
     total_spend = round(total_spend, 2)
     total_income = round(total_income, 2)
@@ -303,8 +361,9 @@ def get_spending_breakdown(
 
     for cat, data_dict in category_spend_map.items():
         cat_spend = round(data_dict["spend"], 2)
+        cat_lower = cat.lower()
         is_tx_transfer = data_dict.get("is_transfer", False)
-        processed_lower_cats.add(cat.lower())
+        processed_lower_cats.add(cat_lower)
         reports.append(
             _build_category_report(
                 category=cat,
@@ -312,25 +371,24 @@ def get_spending_breakdown(
                 count=data_dict["count"],
                 total_spend=total_spend,
                 is_tx_transfer=is_tx_transfer,
-                rule=budget_rules.get(cat.lower()),
+                rule=budget_rules.get(cat_lower),
                 period=period,
+                annual_cat_spend=annual_spend_map.get(cat_lower),
             )
         )
 
     for cat_lower, rule in budget_rules.items():
         if cat_lower not in processed_lower_cats:
-            budget_limit = float(rule.weekly_limit if period == "week" else rule.monthly_limit)
             reports.append(
-                CategorySpendingReport(
+                _build_category_report(
                     category=rule.category,
-                    total_spend=0.0,
-                    transaction_count=0,
-                    percentage=0.0,
-                    budget_limit=budget_limit,
-                    percent_used=0.0,
-                    is_over_budget=False,
-                    warning_level="normal",
-                    is_transfer=False,
+                    cat_spend=0.0,
+                    count=0,
+                    total_spend=total_spend,
+                    is_tx_transfer=False,
+                    rule=rule,
+                    period=period,
+                    annual_cat_spend=annual_spend_map.get(cat_lower, 0.0),
                 )
             )
 

@@ -18,6 +18,7 @@ TRANSFER_CATEGORIES = ("transfers", "transfer")
 DEFAULT_WEEKLY_BURN = 1000.0
 WEEKS_PER_YEAR = 52.0
 MONTHS_PER_YEAR = 12.0
+DAYS_PER_YEAR = 365
 MIN_SIGNIFICANT_WEEKLY_BURN = 1.0
 DEFAULT_CATEGORIES = [
     "Groceries",
@@ -47,13 +48,15 @@ class WeeklyBurnSummary:
 
 @dataclass(frozen=True)
 class CategoryBurnEstimate:
-    """Average weekly burn breakdown and monthly limit suggestion for one category."""
+    """Average weekly burn breakdown and budget limit suggestions for one category."""
 
     category: str
     variable_weekly_burn: float
     recurring_weekly_burn: float
     average_weekly_burn: float
     suggested_monthly_limit: float
+    suggested_annual_limit: float = 0.0
+    budget_period: str = "monthly"
     variable_percentage: float = 0.0
     total_percentage: float = 0.0
 
@@ -83,6 +86,16 @@ def weekly_to_monthly(weekly_amount: float) -> float:
 def monthly_to_weekly(monthly_amount: float) -> float:
     """Convert a monthly NZD limit to its 12/52 weekly equivalent."""
     return round(float(monthly_amount) * MONTHS_PER_YEAR / WEEKS_PER_YEAR, 2)
+
+
+def weekly_to_annual(weekly_amount: float) -> float:
+    """Convert a weekly NZD limit to its 52-week annual equivalent."""
+    return round(float(weekly_amount) * WEEKS_PER_YEAR, 2)
+
+
+def annual_to_weekly(annual_amount: float) -> float:
+    """Convert an annual NZD limit to its 52-week amortized weekly equivalent."""
+    return round(float(annual_amount) / WEEKS_PER_YEAR, 2)
 
 
 # ============================================================================
@@ -196,12 +209,35 @@ def repair_transaction_fx_rates(
 # ============================================================================
 # 5. WEEKLY BURN & AVERAGE-BURN BUDGET ENGINE
 # ============================================================================
+def get_active_budget_periods(db: Session) -> dict[str, str]:
+    """Return lowercase category -> configured budget_period ('weekly', 'monthly', 'annual')."""
+    rows = db.execute(
+        select(BudgetRule.category, BudgetRule.budget_period).where(BudgetRule.is_active == True)
+    ).all()
+    return {
+        cat.strip().lower(): (period or "monthly").strip().lower()
+        for cat, period in rows
+        if cat and cat.strip()
+    }
+
+
+def get_annual_budget_categories(db: Session) -> set[str]:
+    """Return lowercase category keys configured as 52-week annual budgets."""
+    return {cat for cat, period in get_active_budget_periods(db).items() if period == "annual"}
+
+
 def _fetch_variable_expense_rows(
     db: Session,
     start_date: date,
     end_date: date,
+    *,
+    exclude_categories: set[str] | tuple[str, ...] = (),
 ):
     """Query non-recurring, non-transfer expense rows in [start_date, end_date]."""
+    excluded = tuple(
+        {c.lower() for c in TRANSFER_CATEGORIES}
+        | {c.strip().lower() for c in exclude_categories if c and c.strip()}
+    )
     return db.execute(
         select(
             Transaction.category,
@@ -213,14 +249,69 @@ def _fetch_variable_expense_rows(
             Transaction.transaction_date <= end_date,
             Transaction.amount < 0,
             Transaction.recurrence.is_(None),
-            func.lower(Transaction.category).not_in(TRANSFER_CATEGORIES),
+            func.lower(Transaction.category).not_in(excluded),
         )
     ).all()
 
 
-def _sum_variable_spend_nzd(db: Session, start_date: date, end_date: date) -> float:
+def _fetch_specific_category_expense_rows(
+    db: Session,
+    start_date: date,
+    end_date: date,
+    categories: set[str],
+):
+    """Query non-recurring expense rows matching any category in categories (lowercase)."""
+    normalized = tuple(sorted({c.strip().lower() for c in categories if c and c.strip()}))
+    if not normalized:
+        return []
+    return db.execute(
+        select(
+            Transaction.category,
+            Transaction.amount,
+            Transaction.currency,
+            Transaction.exchange_rate,
+        ).where(
+            Transaction.transaction_date >= start_date,
+            Transaction.transaction_date <= end_date,
+            Transaction.amount < 0,
+            Transaction.recurrence.is_(None),
+            func.lower(Transaction.category).in_(normalized),
+        )
+    ).all()
+
+
+def calculate_annual_category_spend_map(
+    db: Session,
+    as_of: date,
+    categories: set[str],
+) -> dict[str, float]:
+    """Sum trailing 365-day NZD spend per lowercase category for annual-budget categories."""
+    if not categories:
+        return {}
+    rows = _fetch_specific_category_expense_rows(
+        db,
+        as_of - timedelta(days=DAYS_PER_YEAR),
+        as_of,
+        categories,
+    )
+    totals: dict[str, float] = {}
+    for raw_cat, amt, cur, fx in rows:
+        key = (raw_cat or "General").strip().lower() or "general"
+        totals[key] = totals.get(key, 0.0) + to_nzd_amount(amt, cur, fx)
+    return totals
+
+
+def _sum_variable_spend_nzd(
+    db: Session,
+    start_date: date,
+    end_date: date,
+    *,
+    exclude_categories: set[str] | tuple[str, ...] = (),
+) -> float:
     """Sum NZD-normalized variable expenses in [start_date, end_date]."""
-    rows = _fetch_variable_expense_rows(db, start_date, end_date)
+    rows = _fetch_variable_expense_rows(
+        db, start_date, end_date, exclude_categories=exclude_categories
+    )
     return sum(to_nzd_amount(amt, cur, fx) for _, amt, cur, fx in rows)
 
 
@@ -239,10 +330,18 @@ def calculate_weekly_burn_summary(
 ) -> WeeklyBurnSummary:
     """Calculate effective weekly burn (variable average + amortized recurring) and this-week spend."""
     weekly_budget = _get_active_weekly_budget(db)
+    annual_cats = get_annual_budget_categories(db)
     lookback_start = as_of - timedelta(days=lookback_weeks * 7)
 
-    variable_total_nzd = _sum_variable_spend_nzd(db, lookback_start, as_of)
-    variable_weekly_burn = round(variable_total_nzd / float(lookback_weeks), 2)
+    regular_total_nzd = _sum_variable_spend_nzd(
+        db, lookback_start, as_of, exclude_categories=annual_cats
+    )
+    regular_weekly_burn = regular_total_nzd / float(lookback_weeks)
+
+    annual_spend_map = calculate_annual_category_spend_map(db, as_of, annual_cats)
+    annual_weekly_burn = sum(annual_spend_map.values()) / WEEKS_PER_YEAR
+
+    variable_weekly_burn = round(regular_weekly_burn + annual_weekly_burn, 2)
 
     recurring_weekly_burn = round(
         sum(weekly_nzd for _, weekly_nzd in get_active_recurring_commitments(db, as_of)),
@@ -251,7 +350,10 @@ def calculate_weekly_burn_summary(
     trailing_weekly_burn = round(variable_weekly_burn + recurring_weekly_burn, 2)
 
     start_of_week = as_of - timedelta(days=as_of.weekday())
-    this_week_variable_spend = round(_sum_variable_spend_nzd(db, start_of_week, as_of), 2)
+    this_week_regular = _sum_variable_spend_nzd(
+        db, start_of_week, as_of, exclude_categories=annual_cats
+    )
+    this_week_variable_spend = round(this_week_regular + annual_weekly_burn, 2)
     this_week_spend = round(this_week_variable_spend + recurring_weekly_burn, 2)
 
     if trailing_weekly_burn > 0.0:
@@ -289,9 +391,14 @@ def calculate_category_average_burn(
     as_of: date,
     lookback_weeks: int = 12,
 ) -> list[CategoryBurnEstimate]:
-    """Calculate per-category weekly burn averages combining variable history and recurring commitments."""
+    """Calculate per-category weekly burn averages, spreading annual categories over 52 weeks."""
+    rule_periods = get_active_budget_periods(db)
+    annual_cats = {k for k, period in rule_periods.items() if period == "annual"}
+
     lookback_start = as_of - timedelta(days=lookback_weeks * 7)
-    variable_rows = _fetch_variable_expense_rows(db, lookback_start, as_of)
+    variable_rows = _fetch_variable_expense_rows(
+        db, lookback_start, as_of, exclude_categories=annual_cats
+    )
 
     canonical_names: dict[str, str] = {}
     variable_totals: dict[str, float] = {}
@@ -301,6 +408,16 @@ def calculate_category_average_burn(
         canonical_names.setdefault(key, cat_name)
         variable_totals[key] = variable_totals.get(key, 0.0) + to_nzd_amount(amt, cur, fx)
 
+    annual_rows = _fetch_specific_category_expense_rows(
+        db, as_of - timedelta(days=DAYS_PER_YEAR), as_of, annual_cats
+    )
+    annual_totals: dict[str, float] = {}
+    for raw_cat, amt, cur, fx in annual_rows:
+        cat_name = (raw_cat or "General").strip() or "General"
+        key = cat_name.lower()
+        canonical_names.setdefault(key, cat_name)
+        annual_totals[key] = annual_totals.get(key, 0.0) + to_nzd_amount(amt, cur, fx)
+
     recurring_totals: dict[str, float] = {}
     for rec_tx, weekly_nzd in get_active_recurring_commitments(db, as_of):
         cat_name = (rec_tx.category or "General").strip() or "General"
@@ -308,15 +425,18 @@ def calculate_category_average_burn(
         canonical_names.setdefault(key, cat_name)
         recurring_totals[key] = recurring_totals.get(key, 0.0) + weekly_nzd
 
-    raw_rows: list[tuple[str, float, float, float]] = []
+    raw_rows: list[tuple[str, str, float, float, float]] = []
     for key, display_name in canonical_names.items():
-        var_wk = round(variable_totals.get(key, 0.0) / float(lookback_weeks), 2)
+        if key in annual_cats:
+            var_wk = round(annual_totals.get(key, 0.0) / WEEKS_PER_YEAR, 2)
+        else:
+            var_wk = round(variable_totals.get(key, 0.0) / float(lookback_weeks), 2)
         rec_wk = round(recurring_totals.get(key, 0.0), 2)
         avg_wk = round(var_wk + rec_wk, 2)
-        raw_rows.append((display_name, var_wk, rec_wk, avg_wk))
+        raw_rows.append((key, display_name, var_wk, rec_wk, avg_wk))
 
-    total_var_wk = sum(item[1] for item in raw_rows)
-    total_avg_wk = sum(item[3] for item in raw_rows)
+    total_var_wk = sum(item[2] for item in raw_rows)
+    total_avg_wk = sum(item[4] for item in raw_rows)
 
     estimates = [
         CategoryBurnEstimate(
@@ -325,10 +445,12 @@ def calculate_category_average_burn(
             recurring_weekly_burn=rec_wk,
             average_weekly_burn=avg_wk,
             suggested_monthly_limit=weekly_to_monthly(avg_wk),
+            suggested_annual_limit=weekly_to_annual(avg_wk),
+            budget_period=rule_periods.get(key, "monthly"),
             variable_percentage=round(var_wk / total_var_wk * 100.0, 1) if total_var_wk > 0 else 0.0,
             total_percentage=round(avg_wk / total_avg_wk * 100.0, 1) if total_avg_wk > 0 else 0.0,
         )
-        for display_name, var_wk, rec_wk, avg_wk in raw_rows
+        for key, display_name, var_wk, rec_wk, avg_wk in raw_rows
     ]
 
     estimates.sort(key=lambda item: (-item.average_weekly_burn, item.category))
