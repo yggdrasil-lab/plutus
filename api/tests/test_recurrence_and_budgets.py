@@ -109,6 +109,20 @@ def test_amortized_recurrence_for_weekly_budget_and_runway():
         assert by_cat["Utilities"] == 12.0
         assert "General" not in by_cat
 
+        # Monthly breakdown spreads annual/quarterly recurring over the year and excludes one-off
+        rule_ins = client.post("/budgets", json={"category": "Insurance", "monthly_limit": 60.0})
+        assert rule_ins.status_code == 200
+        monthly = client.get("/budgets/breakdown?period=month").json()
+        m_by_cat = {c["category"]: c for c in monthly["categories"]}
+        assert m_by_cat["Insurance"]["total_spend"] == 43.33
+        assert m_by_cat["Insurance"]["is_over_budget"] is False
+        assert m_by_cat["Insurance"]["warning_level"] == "normal"
+        if (today - timedelta(days=5)).month == today.month:
+            assert m_by_cat["Utilities"]["total_spend"] == 52.0
+        if (today - timedelta(days=2)).month == today.month:
+            assert m_by_cat["Groceries"]["total_spend"] == 400.0
+        assert "General" not in m_by_cat
+
         # Test PATCH /transactions/{id} recurrence update
         patch_res = client.patch("/transactions/1", json={"recurrence": "weekly"})
         assert patch_res.status_code == 200

@@ -19,6 +19,7 @@ from app.schemas import (
     SpendingBreakdownResponse,
 )
 from app.services.burn_service import (
+    MONTHS_PER_YEAR,
     TRANSFER_CATEGORIES,
     WEEKS_PER_YEAR,
     annual_to_weekly,
@@ -295,6 +296,7 @@ def get_spending_breakdown(
     today = date.today()
     effective_period = None if (start_date is not None or end_date is not None) else period
     start_date, end_date = resolve_period_dates(effective_period, start_date, end_date, today=today)
+    ref_date = end_date or today
 
     budget_rules = {
         r.category.lower(): r
@@ -305,7 +307,9 @@ def get_spending_breakdown(
         for cat_lower, rule in budget_rules.items()
         if (rule.budget_period or "monthly").strip().lower() == "annual"
     }
-    annual_spend_map = calculate_annual_category_spend_map(db, today, annual_cats)
+    annual_spend_map = calculate_annual_category_spend_map(db, ref_date, annual_cats)
+    is_weekly_period = period in ("week", "last_week")
+    is_monthly_period = period in ("month", "last_month")
 
     stmt = select(Transaction)
     if start_date:
@@ -331,25 +335,35 @@ def get_spending_breakdown(
             continue
 
         if amt < 0:
-            if period == "week" and (tx.recurrence is not None or cat_lower in annual_cats):
+            rec = (tx.recurrence or "").strip().lower()
+            if is_weekly_period and (rec or cat_lower in annual_cats):
+                continue
+            if is_monthly_period and (
+                rec in ("annual", "quarterly", "one-off") or cat_lower in annual_cats
+            ):
                 continue
             total_spend += amt_nzd
             _accumulate_category(category_spend_map, cat, amt_nzd)
         elif amt > 0:
             total_income += amt_nzd
 
-    if period == "week":
-        for rec_tx, weekly_nzd in get_active_recurring_commitments(db, today):
+    if is_weekly_period or is_monthly_period:
+        for rec_tx, weekly_nzd in get_active_recurring_commitments(db, ref_date):
+            rec = (rec_tx.recurrence or "").strip().lower()
+            if is_monthly_period and rec not in ("annual", "quarterly"):
+                continue
             cat = rec_tx.category or "General"
-            total_spend += weekly_nzd
-            _accumulate_category(category_spend_map, cat, weekly_nzd)
+            amortized_nzd = weekly_to_monthly(weekly_nzd) if is_monthly_period else weekly_nzd
+            total_spend += amortized_nzd
+            _accumulate_category(category_spend_map, cat, amortized_nzd)
+        divisor = MONTHS_PER_YEAR if is_monthly_period else WEEKS_PER_YEAR
         for cat_lower in annual_cats:
             annual_total_nzd = annual_spend_map.get(cat_lower, 0.0)
             if annual_total_nzd > 0:
                 rule = budget_rules[cat_lower]
-                weekly_equiv = round(annual_total_nzd / WEEKS_PER_YEAR, 2)
-                total_spend += weekly_equiv
-                _accumulate_category(category_spend_map, rule.category, weekly_equiv)
+                period_equiv = round(annual_total_nzd / divisor, 2)
+                total_spend += period_equiv
+                _accumulate_category(category_spend_map, rule.category, period_equiv)
 
     total_spend = round(total_spend, 2)
     total_income = round(total_income, 2)
