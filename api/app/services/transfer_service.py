@@ -9,7 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import Transaction
-from app.services.fx_service import get_exchange_rate
+from app.services.fx_service import FxRateFetcher, get_exchange_rate, has_exact_exchange_rate
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +17,11 @@ TRANSFER_KEYWORDS = re.compile(
     r"\b(?:transfer|tfr|trsf|wire|swift|telegraphic|remit|remittance|internal|"
     r"wise|transferwise|currencyfair|sharesies|dbs|posb|bdo|bpi|unionbank|metrobank|"
     r"paynow|instapay|pesonet|crypto|bitcoin|btc|sats|satoshis|binance|easycrypto|"
-    r"coinbase|kraken|fx|conversion|exchange|cross-border)\b",
+    r"lightning|coinbase|kraken|swyftx|fx|conversion|exchange|cross-border)\b",
+    re.I,
+)
+CRYPTO_COUNTERPARTY_KEYWORDS = re.compile(
+    r"\b(?:crypto|bitcoin|btc|sats|satoshis|binance|easycrypto|lightning|coinbase|kraken|swyftx)\b",
     re.I,
 )
 
@@ -39,12 +43,19 @@ CRYPTO_CURRENCIES = {"BTC", "ETH", "SOL", "USDC", "USDT"}
 HIGH_DENOM_FIAT = {"PHP", "JPY", "IDR", "KRW", "VND"}
 
 
-def _is_plausible_offline_fx_rate(from_currency: str, to_currency: str, implied_rate: float) -> bool:
+def _is_plausible_offline_fx_rate(
+    from_currency: str,
+    to_currency: str,
+    implied_rate: float,
+    *,
+    counterparty_text: str = "",
+) -> bool:
     """Return True if an implied FX rate is plausible when no market rate is available."""
     src = (from_currency or "").upper()
     dst = (to_currency or "").upper()
     if src in CRYPTO_CURRENCIES or dst in CRYPTO_CURRENCIES:
-        return True
+        # Never guess fiat<->crypto pairs offline unless the fiat leg explicitly names a crypto platform.
+        return CRYPTO_COUNTERPARTY_KEYWORDS.search(counterparty_text or "") is not None
     if src in HIGH_DENOM_FIAT or dst in HIGH_DENOM_FIAT:
         return 0.005 <= implied_rate <= 200.0
     return 0.3 <= implied_rate <= 3.5
@@ -153,8 +164,13 @@ def match_transfer_pair(tx: Transaction, db: Session) -> Optional[Transaction]:
                     cand_outflow.fee_amount = diff
             break
 
-    # Pass 2: Multi-Currency (FX / Remittance / Crypto) Match
+    # Pass 2: Multi-Currency (FX / Remittance / Crypto) Best-Scored Match
     if not best_match:
+        best_score: Optional[tuple[int, float]] = None
+        best_candidate_outflow_rate: Optional[float] = None
+        best_candidate_out: Optional[Transaction] = None
+        best_candidate_in: Optional[Transaction] = None
+
         for cand in candidates:
             cand_outflow = cand if cand.amount < 0 else outflow_tx
             cand_inflow = cand if cand.amount > 0 else inflow_tx
@@ -171,54 +187,104 @@ def match_transfer_pair(tx: Transaction, db: Session) -> Optional[Transaction]:
 
             out_amt = abs(float(cand_outflow.amount))
             in_amt = float(cand_inflow.amount)
-            desc_text = f"{cand_outflow.merchant} {cand_outflow.raw_description or ''} {cand_inflow.merchant} {cand_inflow.raw_description or ''}".lower()
+            out_code = cand_outflow.currency.upper()
+            in_code = cand_inflow.currency.upper()
+            desc_out = f"{cand_outflow.merchant} {cand_outflow.raw_description or ''}"
+            desc_in = f"{cand_inflow.merchant} {cand_inflow.raw_description or ''}"
+            desc_text = f"{desc_out} {desc_in}".lower()
             has_transfer_signal = (
                 cand_outflow.category.lower() in ("transfers", "transfer")
                 or cand_inflow.category.lower() in ("transfers", "transfer")
                 or TRANSFER_KEYWORDS.search(desc_text) is not None
             )
+            if not has_transfer_signal:
+                continue
 
-            rate = float(cand_outflow.exchange_rate or cand_inflow.exchange_rate or 0.0)
             fee = float(cand_outflow.fee_amount or cand_inflow.fee_amount or 0.0)
             net_out = out_amt - fee if out_amt > fee else out_amt
+            if net_out <= 0 or in_amt <= 0:
+                continue
 
-            if rate > 0:
-                expected_in = round(net_out * rate, 4)
-                if in_amt > 0 and abs(expected_in - in_amt) / in_amt <= 0.08:
-                    best_match = cand
-                    cand_outflow.exchange_rate = rate
-                    cand_inflow.exchange_rate = rate
-                    break
+            is_fiat_pair = out_code not in CRYPTO_CURRENCIES and in_code not in CRYPTO_CURRENCIES
+            if is_fiat_pair and (out_amt < 1.0 or in_amt < 1.0):
+                continue
 
-            if net_out > 0:
-                is_fiat_pair = (
-                    cand_outflow.currency.upper() not in CRYPTO_CURRENCIES
-                    and cand_inflow.currency.upper() not in CRYPTO_CURRENCIES
-                )
-                if is_fiat_pair and (out_amt < 1.0 or in_amt < 1.0):
+            implied_rate = in_amt / net_out
+            date_diff = abs((cand_inflow.transaction_date - cand_outflow.transaction_date).days)
+            crypto_leg_date = (
+                cand_inflow.transaction_date
+                if in_code in CRYPTO_CURRENCIES
+                else cand_outflow.transaction_date
+                if out_code in CRYPTO_CURRENCIES
+                else tx.transaction_date
+            )
+
+            # Explicit pre-populated rate on cand_outflow only matches direct in/out semantics
+            # when converting into NZD (since single-tx exchange_rate represents currency -> NZD).
+            out_rate = float(cand_outflow.exchange_rate or 0.0)
+            if out_rate > 0 and in_code == "NZD":
+                expected_in = round(net_out * out_rate, 4)
+                rel_diff = abs(expected_in - in_amt) / in_amt
+                if rel_diff <= 0.08:
+                    score = (date_diff, rel_diff)
+                    if best_score is None or score < best_score:
+                        best_score = score
+                        best_match = cand
+                        best_candidate_outflow_rate = out_rate
+                        best_candidate_out = cand_outflow
+                        best_candidate_in = cand_inflow
                     continue
-                implied_rate = in_amt / net_out
-                if has_transfer_signal and implied_rate > 0:
-                    market = get_exchange_rate(
-                        db,
-                        rate_date=tx.transaction_date,
-                        from_currency=cand_outflow.currency,
-                        to_currency=cand_inflow.currency,
-                    )
-                    if market is not None and market[0] > 0:
-                        if abs(implied_rate - market[0]) / market[0] > 0.12:
-                            continue
-                    elif not _is_plausible_offline_fx_rate(
-                        cand_outflow.currency,
-                        cand_inflow.currency,
-                        implied_rate,
-                    ):
-                        continue
-                    best_match = cand
+
+            market = get_exchange_rate(
+                db,
+                rate_date=crypto_leg_date,
+                from_currency=out_code,
+                to_currency=in_code,
+            )
+            if market is not None and market[0] > 0:
+                rel_diff = abs(implied_rate - market[0]) / market[0]
+                if rel_diff > 0.12:
+                    continue
+            else:
+                fiat_desc = desc_out if in_code in CRYPTO_CURRENCIES else desc_in
+                if not _is_plausible_offline_fx_rate(
+                    out_code,
+                    in_code,
+                    implied_rate,
+                    counterparty_text=fiat_desc,
+                ):
+                    continue
+                rel_diff = 0.0
+
+            score = (date_diff, rel_diff)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_match = cand
+                best_candidate_out = cand_outflow
+                best_candidate_in = cand_inflow
+                if in_code in CRYPTO_CURRENCIES and out_code == "NZD":
+                    # Quote fiat->crypto NZD leg in NZD per 1 unit crypto (e.g. 122849.82 NZD/BTC)
+                    best_candidate_outflow_rate = round(net_out / in_amt, 8)
+                else:
                     precision = 8 if implied_rate < 0.01 else 6 if implied_rate < 1.0 else 4
-                    cand_outflow.exchange_rate = round(implied_rate, precision)
-                    cand_inflow.exchange_rate = round(implied_rate, precision)
-                    break
+                    best_candidate_outflow_rate = round(implied_rate, precision)
+
+        if best_match and best_candidate_out and best_candidate_in:
+            in_code = best_candidate_in.currency.upper()
+            out_code = best_candidate_out.currency.upper()
+            if in_code in CRYPTO_CURRENCIES:
+                market_crypto_nzd = get_exchange_rate(
+                    db,
+                    rate_date=best_candidate_in.transaction_date,
+                    from_currency=in_code,
+                    to_currency="NZD",
+                )
+                if market_crypto_nzd is not None and market_crypto_nzd[0] > 0:
+                    best_candidate_in.exchange_rate = round(float(market_crypto_nzd[0]), 8)
+                elif best_candidate_outflow_rate is not None and out_code == "NZD":
+                    best_candidate_in.exchange_rate = best_candidate_outflow_rate
+            if out_code not in CRYPTO_CURRENCIES and best_candidate_outflow_rate is not None:
+                best_candidate_out.exchange_rate = best_candidate_outflow_rate
 
     if best_match:
         tx.linked_transaction_id = best_match.id
@@ -254,8 +320,10 @@ def reconcile_transfers(db: Session) -> int:
             | (Transaction.merchant.ilike("%crypto%"))
             | (Transaction.merchant.ilike("%bitcoin%"))
             | (Transaction.merchant.ilike("%btc%"))
+            | (Transaction.merchant.ilike("%lightning%"))
             | (Transaction.merchant.ilike("%wise%"))
             | (Transaction.merchant.ilike("%conversion%"))
+            | (Transaction.raw_description.ilike("%lightning%"))
             | (Transaction.raw_description.ilike("%wire%"))
             | (Transaction.raw_description.ilike("%remit%"))
             | (Transaction.raw_description.ilike("%crypto%"))
@@ -280,3 +348,102 @@ def reconcile_transfers(db: Session) -> int:
             matched_count += 1
 
     return matched_count
+
+
+def repair_crypto_transfers_and_rates(
+    db: Session,
+    *,
+    fetcher: Optional[FxRateFetcher] = None,
+) -> int:
+    """Repair inverted/fallback crypto FX rates and unlink mismatched crypto transfer legs."""
+    crypto_rows = [
+        tx
+        for tx in db.scalars(select(Transaction).order_by(Transaction.transaction_date.asc())).all()
+        if (tx.currency or "").strip().upper() in CRYPTO_CURRENCIES
+    ]
+    if not crypto_rows:
+        return 0
+
+    repaired = 0
+    for tx in crypto_rows:
+        code = (tx.currency or "").strip().upper()
+        needs_exact_check = (
+            not has_exact_exchange_rate(db, rate_date=tx.transaction_date, from_currency=code, to_currency="NZD")
+            or tx.exchange_rate is None
+            or float(tx.exchange_rate) < 1.0
+        )
+        resolved_nzd = get_exchange_rate(
+            db,
+            rate_date=tx.transaction_date,
+            from_currency=code,
+            to_currency="NZD",
+            fetcher=fetcher,
+        )
+        if resolved_nzd is not None and resolved_nzd[0] > 0:
+            target_rate = round(float(resolved_nzd[0]), 8)
+            cur_rate = float(tx.exchange_rate or 0.0)
+            if cur_rate <= 0 or cur_rate < 1.0 or abs(cur_rate - target_rate) / target_rate > 0.001 or needs_exact_check:
+                if abs(cur_rate - target_rate) > 1e-8:
+                    tx.exchange_rate = target_rate
+                    repaired += 1
+
+        if tx.linked_transaction_id is not None:
+            partner = db.get(Transaction, tx.linked_transaction_id)
+            if partner is None:
+                tx.linked_transaction_id = None
+                repaired += 1
+                continue
+
+            outflow = partner if partner.amount < 0 else tx
+            inflow = tx if tx.amount > 0 else partner
+            out_code = (outflow.currency or "").strip().upper()
+            in_code = (inflow.currency or "").strip().upper()
+            if out_code == in_code:
+                continue
+
+            out_amt = abs(float(outflow.amount))
+            fee = float(outflow.fee_amount or inflow.fee_amount or 0.0)
+            net_out = out_amt - fee if out_amt > fee else out_amt
+            in_amt = float(inflow.amount)
+            implied_rate = (in_amt / net_out) if (net_out > 0 and in_amt > 0) else 0.0
+
+            market = get_exchange_rate(
+                db,
+                rate_date=tx.transaction_date,
+                from_currency=out_code,
+                to_currency=in_code,
+                fetcher=fetcher,
+            )
+            unlink = False
+            if market is not None and market[0] > 0 and implied_rate > 0:
+                if abs(implied_rate - market[0]) / market[0] > 0.12:
+                    unlink = True
+            elif out_code != "NZD" and in_code != "NZD":
+                desc_partner = f"{partner.merchant or ''} {partner.raw_description or ''}"
+                if CRYPTO_COUNTERPARTY_KEYWORDS.search(desc_partner) is None:
+                    unlink = True
+
+            if unlink:
+                tx.linked_transaction_id = None
+                partner.linked_transaction_id = None
+                if partner.currency.strip().upper() == "NZD":
+                    partner.exchange_rate = 1.0
+                else:
+                    partner_nzd = get_exchange_rate(
+                        db,
+                        rate_date=partner.transaction_date,
+                        from_currency=partner.currency,
+                        to_currency="NZD",
+                        fetcher=fetcher,
+                    )
+                    partner.exchange_rate = round(float(partner_nzd[0]), 8) if partner_nzd else None
+                repaired += 1
+            elif out_code == "NZD" and in_code in CRYPTO_CURRENCIES and net_out > 0 and in_amt > 0:
+                expected_nzd_per_crypto = round(net_out / in_amt, 8)
+                if abs(float(outflow.exchange_rate or 0.0) - expected_nzd_per_crypto) > 1e-4:
+                    outflow.exchange_rate = expected_nzd_per_crypto
+                    repaired += 1
+
+    if repaired > 0:
+        db.commit()
+    return repaired

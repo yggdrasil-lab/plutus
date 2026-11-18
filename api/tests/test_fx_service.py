@@ -95,6 +95,40 @@ class TestFxService(unittest.TestCase):
         self.assertAlmostEqual(float(snap.exchange_rate), 1.25, places=4)
         self.assertAlmostEqual(float(snap.balance_nzd), 1250.0, places=2)
 
+    def test_historical_crypto_uses_coinbase_beyond_365_days_and_caches_canonical_direction(self):
+        from unittest.mock import MagicMock, patch
+        from app.services.fx_service import HttpFxRateFetcher
+
+        d_hist = date(2024, 11, 13)
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"data": {"amount": "148616.57", "base": "BTC", "currency": "NZD"}}
+
+        with patch("httpx.Client.get", return_value=resp) as mock_get:
+            # Query NZD -> BTC (reverse direction used during transfer reconciliation)
+            inv = get_exchange_rate(
+                self.db,
+                rate_date=d_hist,
+                from_currency="NZD",
+                to_currency="BTC",
+                fetcher=HttpFxRateFetcher(),
+            )
+            self.assertEqual(mock_get.call_count, 1)
+
+        self.assertIsNotNone(inv)
+        self.assertAlmostEqual(inv[0], 1.0 / 148616.57, places=10)
+        self.assertEqual(inv[1], "coinbase_inverse")
+
+        # Forward BTC -> NZD should now hit cache without calling HTTP again
+        cached_row = self.db.query(ExchangeRate).filter(
+            ExchangeRate.rate_date == d_hist,
+            ExchangeRate.from_currency == "BTC",
+            ExchangeRate.to_currency == "NZD",
+        ).one()
+        self.assertAlmostEqual(float(cached_row.rate), 148616.57, places=2)
+        fwd = get_exchange_rate(self.db, rate_date=d_hist, from_currency="BTC", to_currency="NZD")
+        self.assertAlmostEqual(fwd[0], 148616.57, places=2)
+
 
 if __name__ == "__main__":
     unittest.main()

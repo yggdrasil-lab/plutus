@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.db import Base
 from app.models import Account, AssetSnapshot, ExchangeRate, Transaction
 from app.services.connectors import ConnectorConfigError
+from app.services.ingestion_service import ProviderAccountFeed
 from app.services.connectors.bitcoin import (
     HttpBitcoinGateway,
     derive_address_from_xpub,
@@ -193,14 +194,14 @@ class TestBitcoinConnector(unittest.TestCase):
         deposit_tx = {
             "txid": "a" * 64,
             "fee": 400,
-            "status": {"confirmed": True, "block_time": 1731240000},  # 2024-11-10 UTC
+            "status": {"confirmed": True, "block_time": 1731240000},  # 2024-11-10 12:00 UTC = 2024-11-11 NZDT
             "vin": [{"prevout": {"scriptpubkey_address": "bc1qexternal", "value": 2_000_400}}],
             "vout": [{"scriptpubkey_address": addr0, "value": 2_000_000}],
         }
         spend_with_change_tx = {
             "txid": "b" * 64,
             "fee": 500,
-            "status": {"confirmed": True, "block_time": 1742040000},  # 2025-03-15 UTC
+            "status": {"confirmed": True, "block_time": 1742040000},  # 2025-03-15 12:00 UTC = 2025-03-16 NZDT
             "vin": [{"prevout": {"scriptpubkey_address": addr0, "value": 2_000_000}}],
             "vout": [
                 {"scriptpubkey_address": "bc1qmerchant", "value": 500_000},
@@ -211,10 +212,12 @@ class TestBitcoinConnector(unittest.TestCase):
         norm = normalize_bitcoin_transactions([deposit_tx, spend_with_change_tx, deposit_tx], {addr0, change0})
         self.assertEqual(len(norm), 2)
         self.assertEqual(norm[0].amount, -0.005005)
+        self.assertEqual(norm[0].transaction_date, date(2025, 3, 16))
         self.assertEqual(norm[0].fee_amount, 0.000005)
         self.assertEqual(norm[0].category, "Transfers")
         self.assertEqual(norm[0].notes, f"btc:{'b' * 64}")
         self.assertEqual(norm[1].amount, 0.02)
+        self.assertEqual(norm[1].transaction_date, date(2024, 11, 11))
         self.assertEqual(norm[1].notes, f"btc:{'a' * 64}")
 
         def fake_get(url):
@@ -244,6 +247,7 @@ class TestBitcoinConnector(unittest.TestCase):
         gateway = HttpBitcoinGateway(f"BitBox02:{BIP84_TEST_ZPUB}", gap_limit=1, request_delay=0.0)
         with (
             patch("httpx.Client.get", side_effect=lambda url, **_kw: fake_get(url)),
+            patch("app.services.fx_service.HttpFxRateFetcher._fetch_coinbase", return_value=None),
             patch("app.services.fx_service.HttpFxRateFetcher._fetch_coingecko", return_value=None) as mock_cg,
         ):
             res1 = sync_bitcoin(self.db, gateway=gateway)
@@ -262,6 +266,71 @@ class TestBitcoinConnector(unittest.TestCase):
         self.assertAlmostEqual(float(txs[1].amount), -0.005005, places=8)
         self.assertEqual(txs[0].category, "Transfers")
         self.assertAlmostEqual(float(txs[0].exchange_rate), 150000.0, places=2)
+
+    def test_resync_corrects_utc_btc_date_to_auckland_and_refreshes_rate(self):
+        acc = Account(
+            name="BitBox02",
+            account_type="crypto",
+            tier="growth",
+            institution="Bitcoin On-Chain",
+            currency="BTC",
+            external_provider="bitcoin",
+            external_account_id="btc:test",
+        )
+        self.db.add(acc)
+        self.db.commit()
+        self.db.refresh(acc)
+
+        # Simulate legacy row ingested with UTC date 2025-09-16 instead of 2025-09-17 NZST
+        legacy_tx = Transaction(
+            transaction_date=date(2025, 9, 16),
+            account_id=acc.id,
+            amount=0.02523897,
+            currency="BTC",
+            merchant="Bitcoin On-Chain Deposit (759e9f6655f5)",
+            category="Transfers",
+            raw_hash="legacy_utc_btc_hash",
+            exchange_rate=117339.0,
+            notes="btc:" + ("c" * 64),
+        )
+        self.db.add(ExchangeRate(rate_date=date(2025, 9, 17), from_currency="BTC", to_currency="NZD", rate=195080.73, source="coinbase"))
+        self.db.add(legacy_tx)
+        self.db.commit()
+
+        # 2025-09-16T23:46:22Z == 2025-09-17 11:46:22+12:00 NZST
+        raw_tx = {
+            "txid": "c" * 64,
+            "fee": 500,
+            "status": {"confirmed": True, "block_time": 1758066382},
+            "vin": [{"prevout": {"scriptpubkey_address": "bc1qexternal", "value": 2_524_397}}],
+            "vout": [{"scriptpubkey_address": "bc1qmywallet", "value": 2_523_897}],
+        }
+        norm = normalize_bitcoin_transactions([raw_tx], {"bc1qmywallet"})
+        self.assertEqual(norm[0].transaction_date, date(2025, 9, 17))
+
+        source = parse_watch_sources(f"BitBox02:{BIP84_TEST_ZPUB}")[0]
+        feed = normalize_bitcoin_feed(source, 2_523_897, addresses_scanned=1, transactions=norm)
+        fake_gateway = MagicMock()
+        fake_gateway.fetch_feeds.return_value = [
+            ProviderAccountFeed(
+                account=feed.account.__class__(
+                    provider="bitcoin",
+                    external_id="btc:test",
+                    name="BitBox02",
+                    institution="Bitcoin On-Chain",
+                    account_type="crypto",
+                    tier="growth",
+                    currency="BTC",
+                    current_balance=0.02523897,
+                ),
+                transactions=norm,
+            )
+        ]
+
+        sync_bitcoin(self.db, gateway=fake_gateway)
+        self.db.refresh(legacy_tx)
+        self.assertEqual(legacy_tx.transaction_date, date(2025, 9, 17))
+        self.assertAlmostEqual(float(legacy_tx.exchange_rate), 195080.73, places=2)
 
 
 if __name__ == "__main__":

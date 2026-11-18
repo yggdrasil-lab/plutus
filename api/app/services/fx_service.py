@@ -25,6 +25,7 @@ CRYPTO_COINGECKO_IDS: dict[str, str] = {
 WISE_RATES_URL = "https://api.wise.com/v1/rates"
 FRANKFURTER_BASE_URL = "https://api.frankfurter.dev/v1"
 COINGECKO_BASE_URL = "https://api.coingecko.com/api/v3"
+COINBASE_PRICES_URL = "https://api.coinbase.com/v2/prices"
 
 
 class FxRateFetcher(Protocol):
@@ -59,9 +60,27 @@ class HttpFxRateFetcher:
         dst = to_currency.upper()
 
         if src in CRYPTO_COINGECKO_IDS:
-            if (date.today() - rate_date).days > 365:
+            if rate_date < date.today():
+                cb_rate = self._fetch_coinbase(rate_date=rate_date, from_currency=src, to_currency=dst)
+                if cb_rate is not None:
+                    return cb_rate, "coinbase"
+                if (date.today() - rate_date).days <= 365:
+                    return self._fetch_coingecko(rate_date=rate_date, coin_id=CRYPTO_COINGECKO_IDS[src], to_currency=dst)
                 return None
-            return self._fetch_coingecko(rate_date=rate_date, coin_id=CRYPTO_COINGECKO_IDS[src], to_currency=dst)
+
+            cg_rate = self._fetch_coingecko(rate_date=rate_date, coin_id=CRYPTO_COINGECKO_IDS[src], to_currency=dst)
+            if cg_rate is not None:
+                return cg_rate
+            cb_rate = self._fetch_coinbase(rate_date=rate_date, from_currency=src, to_currency=dst)
+            if cb_rate is not None:
+                return cb_rate, "coinbase"
+            return None
+
+        if dst in CRYPTO_COINGECKO_IDS:
+            inverse = self.fetch_rate(rate_date=rate_date, from_currency=dst, to_currency=src)
+            if inverse is not None and inverse[0] > 0:
+                return 1.0 / float(inverse[0]), f"{inverse[1]}_inverse"
+            return None
 
         if self._wise_api_token:
             wise_rate = self._fetch_wise(rate_date=rate_date, from_currency=src, to_currency=dst)
@@ -72,6 +91,20 @@ class HttpFxRateFetcher:
         if frank_rate is not None:
             return frank_rate, "frankfurter"
 
+        return None
+
+    def _fetch_coinbase(self, *, rate_date: date, from_currency: str, to_currency: str) -> Optional[float]:
+        """Fetch historical or spot crypto exchange rate from Coinbase public prices API."""
+        url = f"{COINBASE_PRICES_URL}/{from_currency}-{to_currency}/spot"
+        try:
+            with httpx.Client(timeout=self._timeout) as client:
+                resp = client.get(url, params={"date": rate_date.isoformat()})
+            if resp.status_code == 200:
+                val = ((resp.json().get("data") or {}).get("amount"))
+                if val is not None and float(val) > 0:
+                    return float(val)
+        except Exception as exc:
+            logger.debug("Coinbase FX lookup failed for %s->%s (%s): %s", from_currency, to_currency, rate_date, exc)
         return None
 
     def _fetch_wise(self, *, rate_date: date, from_currency: str, to_currency: str) -> Optional[float]:
@@ -213,17 +246,39 @@ def cache_exchange_rate(
     return row
 
 
-def get_exchange_rate(
+def has_exact_exchange_rate(
     db: Session,
     *,
     rate_date: date,
     from_currency: str,
     to_currency: str = "NZD",
-    fetcher: Optional[FxRateFetcher] = None,
-) -> Optional[tuple[float, str]]:
-    """Resolve an exchange rate from DB cache, external provider (Wise/Frankfurter/CoinGecko), or latest cached fallback."""
+) -> bool:
+    """Return True when an exact-date rate exists in cache for (rate_date, from_currency, to_currency)."""
     src = (from_currency or "NZD").strip().upper()[:10]
     dst = (to_currency or "NZD").strip().upper()[:10]
+    if src == dst:
+        return True
+    return (
+        db.scalar(
+            select(ExchangeRate.id).where(
+                ExchangeRate.rate_date == rate_date,
+                ExchangeRate.from_currency == src,
+                ExchangeRate.to_currency == dst,
+            )
+        )
+        is not None
+    )
+
+
+def _resolve_exact_date_rate(
+    db: Session,
+    *,
+    rate_date: date,
+    src: str,
+    dst: str,
+    fetcher: FxRateFetcher,
+) -> Optional[tuple[float, str]]:
+    """Resolve an exchange rate strictly for `rate_date` using cache or external fetcher."""
     if src == dst:
         return 1.0, "identity"
 
@@ -237,8 +292,31 @@ def get_exchange_rate(
     if cached:
         return float(cached.rate), cached.source
 
-    resolved_fetcher = fetcher or HttpFxRateFetcher(wise_api_token=settings.wise_api_token)
-    fetched = resolved_fetcher.fetch_rate(rate_date=rate_date, from_currency=src, to_currency=dst)
+    exact_inverse = db.scalar(
+        select(ExchangeRate).where(
+            ExchangeRate.rate_date == rate_date,
+            ExchangeRate.from_currency == dst,
+            ExchangeRate.to_currency == src,
+        )
+    )
+    if exact_inverse and float(exact_inverse.rate) > 0:
+        return 1.0 / float(exact_inverse.rate), f"{exact_inverse.source}_inverse"
+
+    if dst in CRYPTO_COINGECKO_IDS and src not in CRYPTO_COINGECKO_IDS:
+        fetched_fwd = fetcher.fetch_rate(rate_date=rate_date, from_currency=dst, to_currency=src)
+        if fetched_fwd is not None and fetched_fwd[0] > 0:
+            rate_val, source = fetched_fwd
+            cache_exchange_rate(
+                db,
+                rate_date=rate_date,
+                from_currency=dst,
+                to_currency=src,
+                rate=rate_val,
+                source=source,
+            )
+            return 1.0 / float(rate_val), f"{source}_inverse"
+
+    fetched = fetcher.fetch_rate(rate_date=rate_date, from_currency=src, to_currency=dst)
     if fetched is not None:
         rate_val, source = fetched
         cache_exchange_rate(
@@ -250,6 +328,52 @@ def get_exchange_rate(
             source=source,
         )
         return rate_val, source
+
+    return None
+
+
+def get_exchange_rate(
+    db: Session,
+    *,
+    rate_date: date,
+    from_currency: str,
+    to_currency: str = "NZD",
+    fetcher: Optional[FxRateFetcher] = None,
+) -> Optional[tuple[float, str]]:
+    """Resolve an exchange rate from exact-date cache, external providers, NZD triangulation, or latest fallback."""
+    src = (from_currency or "NZD").strip().upper()[:10]
+    dst = (to_currency or "NZD").strip().upper()[:10]
+    if src == dst:
+        return 1.0, "identity"
+
+    resolved_fetcher = fetcher or HttpFxRateFetcher(wise_api_token=settings.wise_api_token)
+    exact = _resolve_exact_date_rate(
+        db,
+        rate_date=rate_date,
+        src=src,
+        dst=dst,
+        fetcher=resolved_fetcher,
+    )
+    if exact is not None:
+        return exact
+
+    if src != "NZD" and dst != "NZD":
+        src_to_nzd = _resolve_exact_date_rate(
+            db,
+            rate_date=rate_date,
+            src=src,
+            dst="NZD",
+            fetcher=resolved_fetcher,
+        )
+        dst_to_nzd = _resolve_exact_date_rate(
+            db,
+            rate_date=rate_date,
+            src=dst,
+            dst="NZD",
+            fetcher=resolved_fetcher,
+        )
+        if src_to_nzd is not None and dst_to_nzd is not None and dst_to_nzd[0] > 0:
+            return src_to_nzd[0] / dst_to_nzd[0], f"{src_to_nzd[1]}/{dst_to_nzd[1]}"
 
     latest_fallback = db.scalar(
         select(ExchangeRate)
