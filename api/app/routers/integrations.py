@@ -15,7 +15,6 @@ from fastapi import (
     UploadFile,
     status,
 )
-from fastapi.responses import PlainTextResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -181,30 +180,6 @@ def quick_log_expense(
     reconcile_transfers(db)
 
     return tx
-
-
-@router.get("/sample-statement", response_class=PlainTextResponse)
-def get_sample_statement(
-    institution: str = Query(default="ASB"),
-    _authorized: bool = Depends(verify_integration_token),
-):
-    """Generate a realistic dynamic sample CSV statement for demonstration and testing."""
-    today = date.today()
-    d1 = (today - timedelta(days=1)).strftime("%Y/%m/%d")
-    d2 = (today - timedelta(days=2)).strftime("%Y/%m/%d")
-    d3 = (today - timedelta(days=3)).strftime("%Y/%m/%d")
-    d4 = (today - timedelta(days=4)).strftime("%Y/%m/%d")
-    d5 = (today - timedelta(days=5)).strftime("%Y/%m/%d")
-
-    csv_lines = [
-        "Date,Unique Id,Tran Type,Cheque Number,Payee,Memo,Amount,Balance",
-        f"{d1},1001,DEBIT,,PAK N SAVE ALBANY,Weekly Groceries,-142.50,4250.00",
-        f"{d2},1002,DEBIT,,SPOTIFY AUCKLAND,Family Plan,-18.99,4392.50",
-        f"{d3},1003,DEBIT,,BP CONNECT TAKAPUNA,Fuel,-85.00,4411.49",
-        f"{d4},1004,DEBIT,,CAFE MIMOSA TAKAPUNA,Morning Coffee,-6.50,4496.49",
-        f"{d5},1005,CREDIT,,EMPLOYER SALARY,Fortnightly Pay,2850.00,4502.99",
-    ]
-    return "\n".join(csv_lines)
 
 
 @router.post("/statement", response_model=StatementParseResult)

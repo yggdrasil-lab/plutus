@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.db import SessionLocal
-from app.routers import accounts, admin, budgets, health, institutions, integrations, loans, mcp, products, receipts, rules, runway, transactions
+from app.routers import accounts, budgets, health, institutions, integrations, loans, mcp, products, receipts, rules, runway, transactions
 from app.services.burn_service import repair_transaction_fx_rates
 from app.services.connectors.akahu import normalize_existing_legacy_categories
 from app.services.sync_scheduler import periodic_sync_loop
@@ -84,7 +84,6 @@ app.include_router(receipts.router)
 app.include_router(products.router)
 app.include_router(runway.router)
 app.include_router(integrations.router)
-app.include_router(admin.router)
 
 
 # Mount Streamable HTTP MCP server at /mcp
