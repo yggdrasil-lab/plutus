@@ -141,6 +141,20 @@ class HttpFxRateFetcher:
         return None
 
 
+def to_nzd_amount(
+    amount: float,
+    currency: Optional[str],
+    exchange_rate: Optional[float],
+) -> float:
+    """Convert an expense or income amount to absolute NZD using stored FX only for foreign currencies."""
+    abs_amt = abs(float(amount))
+    code = (currency or "NZD").strip().upper()
+    if code == "NZD":
+        return abs_amt
+    rate = float(exchange_rate) if (exchange_rate is not None and float(exchange_rate) > 0) else 1.0
+    return abs_amt * rate
+
+
 def cache_exchange_rate(
     db: Session,
     *,

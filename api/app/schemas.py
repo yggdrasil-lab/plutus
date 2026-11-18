@@ -202,6 +202,23 @@ class SpendingBreakdownResponse(BaseModel):
     over_budget_count: int = 0
 
 
+class CategoryBurnEstimateRead(BaseModel):
+    category: str
+    variable_weekly_burn: float
+    recurring_weekly_burn: float
+    average_weekly_burn: float
+    suggested_monthly_limit: float
+
+
+class AverageBurnReportResponse(BaseModel):
+    lookback_weeks: int
+    as_of_date: date
+    variable_weekly_burn: float
+    recurring_weekly_burn: float
+    effective_weekly_burn: float
+    categories: list[CategoryBurnEstimateRead] = Field(default_factory=list)
+
+
 # --- Outlook-style Categorization Rule Schemas ---
 class CategorizationRuleBase(BaseModel):
     name: str = Field(..., max_length=100)
@@ -448,6 +465,9 @@ class RunwayTierBreakdown(BaseModel):
     is_perpetual: bool
     perpetual_threshold_weekly_income: float
     weekly_burn_rate: float
+    variable_weekly_burn: float = 0.0
+    recurring_weekly_burn: float = 0.0
+    this_week_variable_spend: float = 0.0
     tier_labels: dict[str, str] = Field(default_factory=dict)
 
 

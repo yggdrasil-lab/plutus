@@ -1,19 +1,30 @@
-"""Budgets and category spending guardrails router."""
+"""Budgets, average-burn estimation, and category spending guardrails router."""
 
-from datetime import date, timedelta
+from datetime import date
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import delete, desc, func, select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.models import BudgetRule, Transaction
 from app.schemas import (
+    AverageBurnReportResponse,
     BudgetRuleCreate,
     BudgetRuleRead,
+    CategoryBurnEstimateRead,
     CategorySpendingReport,
     SpendingBreakdownResponse,
+)
+from app.services.burn_service import (
+    TRANSFER_CATEGORIES,
+    calculate_category_average_burn,
+    calculate_weekly_burn_summary,
+    monthly_to_weekly,
+    sync_budgets_from_average_burn,
+    to_nzd_amount,
+    weekly_to_monthly,
 )
 from app.services.period_service import resolve_period_dates
 from app.services.recurrence_service import get_active_recurring_commitments
@@ -30,6 +41,74 @@ DEFAULT_BASELINE_BUDGETS = [
     ("Leisure", 50.0, 216.67),
     ("Insurance", 55.0, 238.33),
 ]
+
+
+def _resolve_budget_limits(
+    weekly: Optional[float],
+    monthly: Optional[float],
+) -> tuple[float, float]:
+    """Resolve paired (weekly_limit, monthly_limit) values when either is omitted."""
+    if weekly is None and monthly is None:
+        return 100.0, weekly_to_monthly(100.0)
+    if weekly is not None and monthly is None:
+        return weekly, weekly_to_monthly(weekly)
+    if monthly is not None and weekly is None:
+        return monthly_to_weekly(monthly), monthly
+    assert weekly is not None and monthly is not None
+    return weekly, monthly
+
+
+def _accumulate_category(
+    category_map: dict[str, dict],
+    category: str,
+    amount_nzd: float,
+    *,
+    is_transfer: bool = False,
+) -> None:
+    """Add an NZD amount and transaction count to a category accumulator."""
+    if category not in category_map:
+        category_map[category] = {"spend": 0.0, "count": 0, "is_transfer": is_transfer}
+    category_map[category]["spend"] += amount_nzd
+    category_map[category]["count"] += 1
+
+
+def _build_category_report(
+    category: str,
+    cat_spend: float,
+    count: int,
+    total_spend: float,
+    is_tx_transfer: bool,
+    rule: Optional[BudgetRule],
+    period: Optional[str],
+) -> CategorySpendingReport:
+    """Build one CategorySpendingReport with budget utilization and warning level."""
+    pct = round((cat_spend / total_spend * 100), 1) if (total_spend > 0 and not is_tx_transfer) else 0.0
+    budget_limit: Optional[float] = None
+    percent_used: Optional[float] = None
+    is_over = False
+    warning = "normal"
+
+    if rule and not is_tx_transfer:
+        budget_limit = float(rule.weekly_limit if period == "week" else rule.monthly_limit)
+        if budget_limit > 0:
+            percent_used = round((cat_spend / budget_limit * 100), 1)
+            is_over = cat_spend > budget_limit
+            if is_over:
+                warning = "danger"
+            elif percent_used >= 80.0:
+                warning = "warning"
+
+    return CategorySpendingReport(
+        category=category,
+        total_spend=cat_spend,
+        transaction_count=count,
+        percentage=pct,
+        budget_limit=budget_limit,
+        percent_used=percent_used,
+        is_over_budget=is_over,
+        warning_level=warning,
+        is_transfer=is_tx_transfer,
+    )
 
 
 @router.get("", response_model=list[BudgetRuleRead])
@@ -54,19 +133,7 @@ def upsert_budget_rule(
     if not cat:
         raise HTTPException(status_code=400, detail="Category name cannot be empty")
 
-    weekly = payload.weekly_limit
-    monthly = payload.monthly_limit
-
-    if weekly is None and monthly is None:
-        weekly = 100.0
-        monthly = round(weekly * 52 / 12, 2)
-    elif weekly is not None and monthly is None:
-        monthly = round(weekly * 52 / 12, 2)
-    elif monthly is not None and weekly is None:
-        weekly = round(monthly * 12 / 52, 2)
-
-    assert weekly is not None and monthly is not None
-
+    weekly, monthly = _resolve_budget_limits(payload.weekly_limit, payload.monthly_limit)
     existing = db.scalar(select(BudgetRule).where(func.lower(BudgetRule.category) == cat.lower()))
     if existing:
         existing.weekly_limit = weekly
@@ -121,9 +188,46 @@ def initialize_default_budgets(
             created.append(rule)
     if created:
         db.commit()
-        for r in created:
-            db.refresh(r)
+        for rule in created:
+            db.refresh(rule)
     return db.scalars(select(BudgetRule).order_by(BudgetRule.category)).all()
+
+
+@router.get("/average-burn", response_model=AverageBurnReportResponse)
+def get_average_burn_report(
+    lookback_weeks: int = Query(default=12, ge=1, le=52),
+    db: Session = Depends(get_db),
+):
+    """Compute average weekly burn across categories from trailing variable spend and recurring items."""
+    today = date.today()
+    summary = calculate_weekly_burn_summary(db, today, lookback_weeks=lookback_weeks)
+    estimates = calculate_category_average_burn(db, today, lookback_weeks=lookback_weeks)
+    return AverageBurnReportResponse(
+        lookback_weeks=lookback_weeks,
+        as_of_date=today,
+        variable_weekly_burn=summary.variable_weekly_burn,
+        recurring_weekly_burn=summary.recurring_weekly_burn,
+        effective_weekly_burn=summary.effective_weekly_burn,
+        categories=[
+            CategoryBurnEstimateRead(
+                category=item.category,
+                variable_weekly_burn=item.variable_weekly_burn,
+                recurring_weekly_burn=item.recurring_weekly_burn,
+                average_weekly_burn=item.average_weekly_burn,
+                suggested_monthly_limit=item.suggested_monthly_limit,
+            )
+            for item in estimates
+        ],
+    )
+
+
+@router.post("/sync-from-burn", response_model=list[BudgetRuleRead])
+def sync_budgets_from_burn(
+    lookback_weeks: int = Query(default=12, ge=1, le=52),
+    db: Session = Depends(get_db),
+):
+    """Auto-calculate and upsert weekly/monthly BudgetRules from actual average weekly burn."""
+    return sync_budgets_from_average_burn(db, date.today(), lookback_weeks=lookback_weeks)
 
 
 @router.get("/breakdown", response_model=SpendingBreakdownResponse)
@@ -141,16 +245,16 @@ def get_spending_breakdown(
     effective_period = None if (start_date is not None or end_date is not None) else period
     start_date, end_date = resolve_period_dates(effective_period, start_date, end_date, today=today)
 
-    # Fetch active budget rules
-    budget_rules = {r.category.lower(): r for r in db.scalars(select(BudgetRule).where(BudgetRule.is_active == True)).all()}
+    budget_rules = {
+        r.category.lower(): r
+        for r in db.scalars(select(BudgetRule).where(BudgetRule.is_active == True)).all()
+    }
 
-    # Base transaction query
     stmt = select(Transaction)
     if start_date:
         stmt = stmt.where(Transaction.transaction_date >= start_date)
     if end_date:
         stmt = stmt.where(Transaction.transaction_date <= end_date)
-
     txs = db.scalars(stmt).all()
 
     total_spend = 0.0
@@ -162,86 +266,51 @@ def get_spending_breakdown(
         amt = float(tx.amount)
         cat = tx.category or "General"
         cat_lower = cat.lower()
+        amt_nzd = to_nzd_amount(amt, tx.currency, tx.exchange_rate)
 
-        if cat_lower in ("transfers", "transfer"):
-            # Internal account transfer: track volume, do not count as operational spend or income
-            total_transfers += abs(amt)
-            if "Transfers" not in category_spend_map:
-                category_spend_map["Transfers"] = {"spend": 0.0, "count": 0, "is_transfer": True}
-            category_spend_map["Transfers"]["spend"] += abs(amt)
-            category_spend_map["Transfers"]["count"] += 1
+        if cat_lower in TRANSFER_CATEGORIES:
+            total_transfers += amt_nzd
+            _accumulate_category(category_spend_map, "Transfers", amt_nzd, is_transfer=True)
             continue
 
         if amt < 0:
             if period == "week" and tx.recurrence is not None:
                 continue
-            # Operational Expense
-            abs_spend = abs(amt) * (float(tx.exchange_rate or 1.0) if period == "week" else 1.0)
-            total_spend += abs_spend
-            if cat not in category_spend_map:
-                category_spend_map[cat] = {"spend": 0.0, "count": 0, "is_transfer": False}
-            category_spend_map[cat]["spend"] += abs_spend
-            category_spend_map[cat]["count"] += 1
+            total_spend += amt_nzd
+            _accumulate_category(category_spend_map, cat, amt_nzd)
         elif amt > 0:
-            # Operational Income
-            total_income += amt
+            total_income += amt_nzd
 
     if period == "week":
         for rec_tx, weekly_nzd in get_active_recurring_commitments(db, today):
             cat = rec_tx.category or "General"
             total_spend += weekly_nzd
-            if cat not in category_spend_map:
-                category_spend_map[cat] = {"spend": 0.0, "count": 0, "is_transfer": False}
-            category_spend_map[cat]["spend"] += weekly_nzd
-            category_spend_map[cat]["count"] += 1
+            _accumulate_category(category_spend_map, cat, weekly_nzd)
 
     total_spend = round(total_spend, 2)
     total_income = round(total_income, 2)
     total_transfers = round(total_transfers, 2)
     net_savings = round(total_income - total_spend, 2)
 
-    # Compile category reports
     reports: list[CategorySpendingReport] = []
-    processed_lower_cats = set()
+    processed_lower_cats: set[str] = set()
 
     for cat, data_dict in category_spend_map.items():
         cat_spend = round(data_dict["spend"], 2)
-        count = data_dict["count"]
         is_tx_transfer = data_dict.get("is_transfer", False)
-        pct = round((cat_spend / total_spend * 100), 1) if (total_spend > 0 and not is_tx_transfer) else 0.0
         processed_lower_cats.add(cat.lower())
-
-        rule = budget_rules.get(cat.lower())
-        budget_limit: Optional[float] = None
-        percent_used: Optional[float] = None
-        is_over = False
-        warning = "normal"
-
-        if rule and not is_tx_transfer:
-            budget_limit = float(rule.weekly_limit if period == "week" else rule.monthly_limit)
-            if budget_limit > 0:
-                percent_used = round((cat_spend / budget_limit * 100), 1)
-                is_over = cat_spend > budget_limit
-                if is_over:
-                    warning = "danger"
-                elif percent_used >= 80.0:
-                    warning = "warning"
-
         reports.append(
-            CategorySpendingReport(
+            _build_category_report(
                 category=cat,
-                total_spend=cat_spend,
-                transaction_count=count,
-                percentage=pct,
-                budget_limit=budget_limit,
-                percent_used=percent_used,
-                is_over_budget=is_over,
-                warning_level=warning,
-                is_transfer=is_tx_transfer,
+                cat_spend=cat_spend,
+                count=data_dict["count"],
+                total_spend=total_spend,
+                is_tx_transfer=is_tx_transfer,
+                rule=budget_rules.get(cat.lower()),
+                period=period,
             )
         )
 
-    # Include budgeted categories that have 0 spending in this period
     for cat_lower, rule in budget_rules.items():
         if cat_lower not in processed_lower_cats:
             budget_limit = float(rule.weekly_limit if period == "week" else rule.monthly_limit)
@@ -259,13 +328,11 @@ def get_spending_breakdown(
                 )
             )
 
-    # Sort: operational categories by spend descending, transfers grouped at the bottom
     reports.sort(key=lambda r: (r.is_transfer, -r.total_spend, r.category))
-
     over_budget_count = sum(1 for r in reports if r.is_over_budget and not r.is_transfer)
 
     return SpendingBreakdownResponse(
-        period=period,
+        period=period or "custom",
         start_date=start_date,
         end_date=end_date,
         total_spend=total_spend,

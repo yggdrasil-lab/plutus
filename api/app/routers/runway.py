@@ -1,16 +1,14 @@
 """Financial runway and time horizon router."""
 
-from datetime import date, timedelta
+from datetime import date
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import desc, func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.config import settings
 from app.db import get_db
-from app.models import Account, AssetSnapshot, BudgetRule, Loan, Transaction
-from app.services.loan_service import summarize_loans
+from app.models import Loan
 from app.schemas import (
     RunwayAiSynthesisRead,
     RunwayResponse,
@@ -19,7 +17,15 @@ from app.schemas import (
     RunwaySynthesizeRequest,
     RunwayTierBreakdown,
 )
+from app.services.burn_service import (
+    calculate_weekly_burn_summary,
+    get_active_categories,
+    get_effective_weekly_burn,
+    get_latest_account_balances,
+    resolve_tier_labels,
+)
 from app.services.llm_synthesizer import synthesize_runway_scenario_llm
+from app.services.loan_service import summarize_loans
 from app.services.runway import (
     calculate_compounding_runway,
     calculate_emergency_runway,
@@ -29,142 +35,50 @@ from app.services.runway import (
 
 router = APIRouter(prefix="/runway", tags=["Runway & Freedom Clock"])
 
-
-def get_latest_account_balances(db: Session) -> dict[str, float]:
-    """Retrieve the latest balance in NZD for all active accounts grouped by tier."""
-    accounts = db.scalars(select(Account).where(Account.is_active == True)).all()
-    balances = {"cash": 0.0, "growth": 0.0, "locked": 0.0}
-
-    for acc in accounts:
-        latest_snapshot = db.scalar(
-            select(AssetSnapshot)
-            .where(AssetSnapshot.account_id == acc.id)
-            .order_by(desc(AssetSnapshot.snapshot_date))
-        )
-        bal_nzd = float(latest_snapshot.balance_nzd) if latest_snapshot else 0.0
-        tier = acc.tier.lower()
-        if tier in balances:
-            balances[tier] += bal_nzd
-        else:
-            balances["cash"] += bal_nzd
-
-    return balances
-
-
-from app.services.recurrence_service import get_active_recurring_commitments
-
-
-def get_effective_weekly_burn(db: Session, as_of: date) -> tuple[float, float, float]:
-    """Calculate effective weekly burn rate and current week spending vs budget.
-
-    Non-recurring variable expenses (`recurrence` is NULL) in the trailing 28 days
-    are averaged over 4 weeks, recurring expenses are amortized to their weekly
-    equivalent, and `one-off` capital purchases are excluded from burn.
-
-    Returns:
-        tuple of (effective_weekly_burn, this_week_spend, this_week_budget)
-    """
-    # 1. Budget sum
-    budget_sum = db.scalar(select(func.sum(BudgetRule.weekly_limit)).where(BudgetRule.is_active == True))
-    weekly_budget = float(budget_sum or 0.0)
-
-    # 2. Trailing burn rate: variable (4w avg) + amortized recurring commitments
-    four_weeks_ago = as_of - timedelta(days=28)
-    variable_rows = db.execute(
-        select(Transaction.amount, Transaction.exchange_rate).where(
-            Transaction.transaction_date >= four_weeks_ago,
-            Transaction.transaction_date <= as_of,
-            Transaction.amount < 0,
-            Transaction.recurrence.is_(None),
-            func.lower(Transaction.category).not_in(("transfers", "transfer")),
-        )
-    ).all()
-    variable_total_nzd = sum(abs(float(amt)) * float(fx or 1.0) for amt, fx in variable_rows)
-    variable_weekly_burn = variable_total_nzd / 4.0
-
-    recurring_weekly_burn = sum(
-        weekly_nzd for _, weekly_nzd in get_active_recurring_commitments(db, as_of)
-    )
-    trailing_weekly_burn = round(variable_weekly_burn + recurring_weekly_burn, 2)
-
-    # 3. Spend in current calendar week (Monday to Sunday, excluding internal transfers)
-    start_of_week = as_of - timedelta(days=as_of.weekday())
-    current_week_spend = db.scalar(
-        select(func.sum(Transaction.amount)).where(
-            Transaction.transaction_date >= start_of_week,
-            Transaction.transaction_date <= as_of,
-            Transaction.amount < 0,
-            func.lower(Transaction.category).not_in(("transfers", "transfer")),
-        )
-    )
-    this_week_spend = abs(float(current_week_spend or 0.0))
-
-    # Baseline burn: use trailing average if available, else budget, else default 1000 NZD/w
-    if trailing_weekly_burn > 0.0:
-        effective_burn = trailing_weekly_burn
-    elif weekly_budget > 0.0:
-        effective_burn = weekly_budget
-    else:
-        effective_burn = 1000.0
-
-    target_budget = weekly_budget if weekly_budget > 0.0 else effective_burn
-    return effective_burn, this_week_spend, target_budget
+BASELINE_ANNUAL_RETURN = 0.05
 
 
 @router.get("", response_model=RunwayResponse)
 def get_current_runway(
     as_of: Optional[date] = Query(default=None),
-    annual_return: Optional[float] = Query(default=0.05, ge=0.0, le=0.3, description="Real annual expected return"),
+    annual_return: Optional[float] = Query(
+        default=BASELINE_ANNUAL_RETURN,
+        ge=0.0,
+        le=0.3,
+        description="Real annual expected return",
+    ),
     db: Session = Depends(get_db),
 ):
     """Calculate current financial runway in weeks based on asset balances, burn rate, and growth."""
     today = as_of or date.today()
+    expected_return = annual_return if annual_return is not None else BASELINE_ANNUAL_RETURN
     balances = get_latest_account_balances(db)
-    weekly_burn, this_week_spend, target_budget = get_effective_weekly_burn(db, today)
+    burn_summary = calculate_weekly_burn_summary(db, today)
+
+    weekly_burn = burn_summary.effective_weekly_burn
+    this_week_spend = burn_summary.this_week_spend
+    target_budget = burn_summary.weekly_budget_target
 
     cash_bal = balances["cash"]
     growth_bal = balances["growth"]
     locked_bal = balances["locked"]
     total_liquid = cash_bal + growth_bal
 
-    # Emergency runway (cash only, 0% growth)
     emergency_weeks = calculate_emergency_runway(cash_bal, weekly_burn)
-
-    # Compounding growth runway (total liquid assets)
     growth_weeks, is_perpetual = calculate_compounding_runway(
         accessible_assets=total_liquid,
         weekly_burn=weekly_burn,
-        annual_real_return=annual_return,
+        annual_real_return=expected_return,
     )
 
-    # Weekly yield at assumed growth rate
-    weekly_g = calculate_weekly_growth_rate(annual_return)
+    weekly_g = calculate_weekly_growth_rate(expected_return)
     perpetual_threshold_income = round(total_liquid * weekly_g, 2)
 
-    # Primary hero metric
     primary_weeks = 9999.0 if is_perpetual else (growth_weeks or emergency_weeks)
     primary_years = round(primary_weeks / 52.0, 2) if not is_perpetual else 999.0
 
-    # Time banked this week
     time_banked = calculate_time_banked(target_budget, this_week_spend)
-
-    # Locked runway: weeks of expenses preserved in locked/pension tier
     locked_weeks = round(locked_bal / weekly_burn, 1) if weekly_burn > 0 else 0.0
-
-    # Resolve dynamic tier labels from actual active accounts
-    active_accounts = db.scalars(select(Account).where(Account.is_active == True)).all()
-    locked_accs = [a.name for a in active_accounts if a.tier.lower() == "locked"]
-    locked_label = locked_accs[0] if len(locked_accs) == 1 else "Locked Reserve"
-    growth_accs = [a.name for a in active_accounts if a.tier.lower() == "growth"]
-    growth_label = growth_accs[0] if len(growth_accs) == 1 else "Growth"
-    cash_accs = [a.name for a in active_accounts if a.tier.lower() == "cash" and a.account_type != "credit_card"]
-    cash_label = cash_accs[0] if len(cash_accs) == 1 else "Cash Floor"
-
-    tier_labels = {
-        "cash": cash_label,
-        "growth": growth_label,
-        "locked": locked_label,
-    }
 
     loans = db.scalars(select(Loan).where(Loan.is_active == True)).all()
     loan_summary = summarize_loans(loans, today)
@@ -184,21 +98,11 @@ def get_current_runway(
         is_perpetual=is_perpetual,
         perpetual_threshold_weekly_income=perpetual_threshold_income,
         weekly_burn_rate=weekly_burn,
-        tier_labels=tier_labels,
+        variable_weekly_burn=burn_summary.variable_weekly_burn,
+        recurring_weekly_burn=burn_summary.recurring_weekly_burn,
+        this_week_variable_spend=burn_summary.this_week_variable_spend,
+        tier_labels=resolve_tier_labels(db),
     )
-
-    # Categories for quick spend tagging
-    active_categories = db.scalars(
-        select(BudgetRule.category)
-        .where(BudgetRule.is_active == True)
-        .order_by(BudgetRule.category)
-    ).all()
-    categories = list(active_categories)
-    if not categories:
-        tx_cats = db.scalars(select(Transaction.category).distinct()).all()
-        categories = sorted(list(set(c for c in tx_cats if c)))
-    if not categories:
-        categories = ["Groceries", "Dining", "Transport", "Subscriptions", "Housing", "General"]
 
     return RunwayResponse(
         as_of_date=today,
@@ -209,7 +113,7 @@ def get_current_runway(
         weekly_spend_this_week=this_week_spend,
         weekly_budget_target=target_budget,
         breakdown=breakdown,
-        categories=categories,
+        categories=get_active_categories(db),
     )
 
 
@@ -223,36 +127,36 @@ def simulate_runway_scenario(
     balances = get_latest_account_balances(db)
     weekly_burn, _, _ = get_effective_weekly_burn(db, today)
 
-    # Baseline calculation
     baseline_liquid = balances["cash"] + balances["growth"]
     locked_bal = balances["locked"]
     loans = db.scalars(select(Loan).where(Loan.is_active == True)).all()
     loan_summary = summarize_loans(loans, today)
     total_liabilities = float(loan_summary["total_liabilities"])
     loan_weekly_relief = float(loan_summary["total_weekly_payment"])
-    baseline_return = 0.05
+
     baseline_weeks, baseline_perpetual = calculate_compounding_runway(
         accessible_assets=baseline_liquid,
         weekly_burn=weekly_burn,
-        annual_real_return=baseline_return,
+        annual_real_return=BASELINE_ANNUAL_RETURN,
     )
 
-    # Simulated calculation
     burn_delta = payload.weekly_burn_adjustment - (loan_weekly_relief if payload.pay_off_loans else 0.0)
     liquid_delta = payload.lump_sum_adjustment - (total_liabilities if payload.pay_off_loans else 0.0)
     simulated_burn = max(1.0, weekly_burn + burn_delta)
     simulated_liquid = max(0.0, baseline_liquid + liquid_delta)
-    simulated_return = payload.custom_annual_return if payload.custom_annual_return is not None else baseline_return
+    simulated_return = (
+        payload.custom_annual_return
+        if payload.custom_annual_return is not None
+        else BASELINE_ANNUAL_RETURN
+    )
 
     sim_weeks, is_perpetual = calculate_compounding_runway(
         accessible_assets=simulated_liquid,
         weekly_burn=simulated_burn,
         annual_real_return=simulated_return,
     )
-
     sim_years = round(sim_weeks / 52.0, 2) if sim_weeks is not None else None
 
-    # Calculate delta
     delta_weeks: Optional[float] = None
     if not is_perpetual and not baseline_perpetual and sim_weeks is not None and baseline_weeks is not None:
         delta_weeks = round(sim_weeks - baseline_weeks, 2)
@@ -277,7 +181,7 @@ def trigger_runway_synthesis(
     payload: RunwaySynthesizeRequest,
     db: Session = Depends(get_db),
 ):
-    """Forces on-demand research-grounded AI synthesis of financial freedom scenario and recommendations."""
+    """Force on-demand research-grounded AI synthesis of financial freedom scenario and recommendations."""
     today = date.today()
     balances = get_latest_account_balances(db)
     weekly_burn, _, _ = get_effective_weekly_burn(db, today)
@@ -291,7 +195,7 @@ def trigger_runway_synthesis(
     growth_weeks, is_perpetual = calculate_compounding_runway(
         accessible_assets=total_liquid,
         weekly_burn=weekly_burn,
-        annual_real_return=0.05,
+        annual_real_return=BASELINE_ANNUAL_RETURN,
     )
 
     runway_telemetry = {

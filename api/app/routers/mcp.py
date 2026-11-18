@@ -20,7 +20,7 @@ from starlette.routing import Route
 
 from app.config import settings
 from app.models import Account, AssetSnapshot, BudgetRule, Transaction
-from app.routers.runway import get_effective_weekly_burn, get_latest_account_balances
+from app.services.burn_service import get_effective_weekly_burn, get_latest_account_balances
 from app.services.receipt_service import reconcile_unlinked_receipts
 from app.services.runway import (
     calculate_compounding_runway,

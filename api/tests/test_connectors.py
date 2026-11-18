@@ -395,9 +395,10 @@ class TestExternalConnectors(unittest.TestCase):
         with patch.dict(
             integrations_router.SYNC_HANDLERS,
             {
-                "akahu": lambda db, days, sd, ed: integrations_router.SyncResult(**fake_akahu(db, days, sd, ed)),
-                "wise": lambda db, days, sd, ed: integrations_router.SyncResult(**fake_wise(db, days, sd, ed)),
+                "akahu": lambda db, days, sd, ed, _skip_llm=False: integrations_router.SyncResult(**fake_akahu(db, days, sd, ed)),
+                "wise": lambda db, days, sd, ed, _skip_llm=False: integrations_router.SyncResult(**fake_wise(db, days, sd, ed)),
             },
+            clear=True,
         ):
             resp = self.client.post("/integrations/sync/all?start_date=2024-08-01")
 
