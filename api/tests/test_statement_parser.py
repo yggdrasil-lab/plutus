@@ -4,7 +4,7 @@ import sys
 import unittest
 import unittest.mock
 from unittest.mock import patch, MagicMock
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 # Add api directory to sys.path
@@ -75,10 +75,23 @@ class TestStatementParser(unittest.TestCase):
         self.assertEqual(result.opening_balance, 5000.00)
 
     def test_parse_sample_statement_format(self):
-        """Verify sample statement format parses correctly."""
-        from app.routers.integrations import get_sample_statement
-
-        sample_csv = get_sample_statement(institution="ASB")
+        """Verify standard 8-column ASB CSV format parses correctly."""
+        today = date.today()
+        d1 = (today - timedelta(days=1)).strftime("%Y/%m/%d")
+        d2 = (today - timedelta(days=2)).strftime("%Y/%m/%d")
+        d3 = (today - timedelta(days=3)).strftime("%Y/%m/%d")
+        d4 = (today - timedelta(days=4)).strftime("%Y/%m/%d")
+        d5 = (today - timedelta(days=5)).strftime("%Y/%m/%d")
+        sample_csv = "\n".join(
+            [
+                "Date,Unique Id,Tran Type,Cheque Number,Payee,Memo,Amount,Balance",
+                f"{d1},1001,DEBIT,,PAK N SAVE ALBANY,Weekly Groceries,-142.50,4250.00",
+                f"{d2},1002,DEBIT,,SPOTIFY AUCKLAND,Family Plan,-18.99,4392.50",
+                f"{d3},1003,DEBIT,,BP CONNECT TAKAPUNA,Fuel,-85.00,4411.49",
+                f"{d4},1004,DEBIT,,CAFE MIMOSA TAKAPUNA,Morning Coffee,-6.50,4496.49",
+                f"{d5},1005,CREDIT,,EMPLOYER SALARY,Fortnightly Pay,2850.00,4502.99",
+            ]
+        )
         result = parse_csv_statement(sample_csv, institution="ASB")
         self.assertEqual(result.transaction_count, 5)
         self.assertGreater(len(result.transactions), 0)
