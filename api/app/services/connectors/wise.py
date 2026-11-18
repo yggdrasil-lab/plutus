@@ -200,17 +200,25 @@ def normalize_wise_feed(
         if tx_amount is None:
             continue
         merchant, raw_desc = _extract_wise_merchant(tx)
+        tx_currency = (tx_amt_obj.get("currency") or currency).upper()
         fee_val = (tx.get("totalFees") or {}).get("value")
-        fx_rate = (tx.get("exchangeDetails") or {}).get("rate")
+        exchange_details = tx.get("exchangeDetails") or {}
+        to_currency = ((exchange_details.get("toAmount") or {}).get("currency") or "").upper()
+        raw_fx_rate = exchange_details.get("rate")
+        fx_rate = (
+            float(raw_fx_rate)
+            if (raw_fx_rate is not None and tx_currency != "NZD" and to_currency == "NZD")
+            else None
+        )
         txs.append(
             NormalizedTx(
                 transaction_date=_parse_iso_date(tx.get("date")),
                 amount=float(tx_amount),
-                currency=(tx_amt_obj.get("currency") or currency).upper(),
+                currency=tx_currency,
                 merchant=merchant,
                 category="General",
                 raw_description=raw_desc,
-                exchange_rate=float(fx_rate) if fx_rate is not None else None,
+                exchange_rate=fx_rate,
                 fee_amount=abs(float(fee_val)) if fee_val is not None else None,
                 notes=f"wise:{tx.get('referenceNumber', '')}" if tx.get("referenceNumber") else None,
             )

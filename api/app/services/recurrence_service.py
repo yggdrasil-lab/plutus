@@ -5,6 +5,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models import Transaction
+from app.services.fx_service import to_nzd_amount
 
 RECURRENCE_WEEKLY_FACTOR: dict[str, float] = {
     "weekly": 1.0,
@@ -54,6 +55,6 @@ def get_active_recurring_commitments(
         if key in seen:
             continue
         seen.add(key)
-        amt_nzd = abs(float(tx.amount)) * float(tx.exchange_rate or 1.0)
+        amt_nzd = to_nzd_amount(tx.amount, tx.currency, tx.exchange_rate)
         commitments.append((tx, round(amt_nzd * factor, 2)))
     return commitments
