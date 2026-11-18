@@ -10,10 +10,12 @@ from decimal import Decimal
 import hashlib
 import json
 from typing import Optional, Protocol
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.models import Account, AssetSnapshot, CategorizationRule, Transaction
 from app.schemas import SyncAccountSummary, SyncResult
 from app.services.fx_service import get_exchange_rate
@@ -251,8 +253,20 @@ def ingest_normalized_transactions(
         if n and n.startswith(("akahu:", "wise:", "btc:"))
     )
 
+    existing_btc_by_note = {
+        tx.notes: tx
+        for tx in db.scalars(
+            select(Transaction).where(
+                Transaction.account_id == account.id,
+                Transaction.notes.like("btc:%"),
+            )
+        ).all()
+        if tx.notes
+    }
+
     created: list[Transaction] = []
     skipped = 0
+    reconcile_needed = False
 
     for item in items:
         ext_note = (
@@ -261,6 +275,32 @@ def ingest_normalized_transactions(
             else None
         )
         if ext_note and (ext_note in existing_external_notes or ext_note in seen_external_notes):
+            if ext_note in existing_btc_by_note and ext_note not in seen_external_notes:
+                seen_external_notes.add(ext_note)
+                existing_tx = existing_btc_by_note[ext_note]
+                date_changed = existing_tx.transaction_date != item.transaction_date
+                if date_changed:
+                    existing_tx.transaction_date = item.transaction_date
+                    if existing_tx.linked_transaction_id is not None:
+                        partner = db.get(Transaction, existing_tx.linked_transaction_id)
+                        existing_tx.linked_transaction_id = None
+                        if partner is not None:
+                            partner.linked_transaction_id = None
+                            if (partner.currency or "").strip().upper() == "NZD":
+                                partner.exchange_rate = 1.0
+                    reconcile_needed = True
+                if date_changed or existing_tx.exchange_rate is None or float(existing_tx.exchange_rate) < 1.0:
+                    tx_currency = (item.currency or account.currency or "BTC")[:10].upper()
+                    resolved = get_exchange_rate(
+                        db,
+                        rate_date=item.transaction_date,
+                        from_currency=tx_currency,
+                        to_currency="NZD",
+                    )
+                    if resolved is not None and resolved[0] > 0:
+                        existing_tx.exchange_rate = round(float(resolved[0]), 8)
+                if existing_tx.linked_transaction_id is None:
+                    reconcile_needed = True
             skipped += 1
             continue
 
@@ -342,6 +382,8 @@ def ingest_normalized_transactions(
     if created:
         reconcile_unlinked_receipts(db)
         reconcile_transfers(db)
+    elif reconcile_needed:
+        reconcile_transfers(db)
 
     return len(created), skipped, created
 
@@ -412,7 +454,7 @@ def sync_provider_feeds(
     skip_llm: bool = False,
 ) -> SyncResult:
     """Persist a list of ProviderAccountFeed contracts into Plutus uniformly."""
-    today = date.today()
+    today = datetime.now(ZoneInfo(settings.timezone)).date()
     summaries: list[SyncAccountSummary] = []
     total_created = 0
     total_skipped = 0

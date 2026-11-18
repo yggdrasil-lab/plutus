@@ -10,6 +10,7 @@ import hmac
 import re
 import time
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from ecdsa import SECP256k1
 from ecdsa.ellipticcurve import Point
@@ -266,11 +267,12 @@ def normalize_bitcoin_transactions(
         if net_sats == 0:
             continue
 
+        local_tz = ZoneInfo(settings.timezone)
         block_time = (tx.get("status") or {}).get("block_time")
         tx_date = (
-            datetime.fromtimestamp(int(block_time), tz=timezone.utc).date()
+            datetime.fromtimestamp(int(block_time), tz=timezone.utc).astimezone(local_tz).date()
             if block_time
-            else date.today()
+            else datetime.now(local_tz).date()
         )
         if start_date and tx_date < start_date:
             continue

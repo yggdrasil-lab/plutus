@@ -16,6 +16,7 @@ from app.routers import accounts, budgets, health, institutions, integrations, l
 from app.services.burn_service import repair_transaction_fx_rates
 from app.services.connectors.akahu import normalize_existing_legacy_categories
 from app.services.sync_scheduler import periodic_sync_loop
+from app.services.transfer_service import repair_crypto_transfers_and_rates
 
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,9 @@ async def lifespan(_app: FastAPI):
             repaired_fx = repair_transaction_fx_rates(db)
             if repaired_fx:
                 logger.info("Repaired %d transaction FX rates on startup.", repaired_fx)
+            repaired_crypto = repair_crypto_transfers_and_rates(db)
+            if repaired_crypto:
+                logger.info("Repaired %d crypto transfer/FX records on startup.", repaired_crypto)
         if settings.sync_interval_hours > 0:
             task = asyncio.create_task(periodic_sync_loop(stop_event, settings.sync_interval_hours))
     try:

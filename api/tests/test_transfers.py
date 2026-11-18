@@ -340,7 +340,10 @@ class TestTransfersAndReceiptLinking(unittest.TestCase):
 
     def test_bitcoin_crypto_conversion_transfer(self):
         """Verify fiat-to-crypto purchase transfer (NZD outflow paired with BTC inflow)."""
+        from app.services.fx_service import cache_exchange_rate
+
         d = date(2026, 11, 4)
+        cache_exchange_rate(self.db, rate_date=d, from_currency="BTC", to_currency="NZD", rate=140000.0, source="coinbase")
 
         # NZD Outflow: $5,000 NZD sent to crypto platform
         res_out = self.client.post(
@@ -382,8 +385,10 @@ class TestTransfersAndReceiptLinking(unittest.TestCase):
 
         self.assertEqual(tx_out.linked_transaction_id, in_id)
         self.assertEqual(tx_in.linked_transaction_id, out_id)
-        # Implied rate: 0.035 / 5000 = 0.000007 BTC/NZD
-        self.assertAlmostEqual(float(tx_out.exchange_rate), 0.000007, places=6)
+        # NZD -> BTC transfer leg records implied NZD per BTC (5000 / 0.035 = 142857.14285714)
+        # while the BTC leg preserves that day's market BTC -> NZD rate (140000.0).
+        self.assertAlmostEqual(float(tx_out.exchange_rate), 142857.14285714, places=2)
+        self.assertAlmostEqual(float(tx_in.exchange_rate), 140000.0, places=2)
         self.assertEqual(tx_in.category, "Transfers")
 
     def test_wise_csv_statement_parser(self):
@@ -671,6 +676,99 @@ TRANSFER-98765433,05-11-2026,500.00,NZD,Client Payment Invoice 101,Freelance,500
         self.assertEqual(tx_out.linked_transaction_id, tx_in.id)
         self.assertEqual(tx_in.linked_transaction_id, tx_out.id)
         self.assertEqual(float(tx_out.exchange_rate), 1.0)
+
+    def test_btc_matches_lightning_pay_and_ignores_unrelated_wise_sgd_and_picks_exact_day(self):
+        from unittest.mock import patch
+        from app.models import ExchangeRate
+        from app.services.fx_service import cache_exchange_rate
+        from app.services.transfer_service import repair_crypto_transfers_and_rates
+
+        # Seed historical daily rates for 2025-03-11, 2025-03-12, 2025-03-13, and 2025-06-20
+        for d, btc_nzd in (
+            (date(2025, 3, 11), 137953.63),
+            (date(2025, 3, 12), 145155.44),
+            (date(2025, 3, 13), 145836.65),
+            (date(2025, 6, 20), 174452.42),
+        ):
+            cache_exchange_rate(self.db, rate_date=d, from_currency="BTC", to_currency="NZD", rate=btc_nzd, source="coinbase")
+        cache_exchange_rate(self.db, rate_date=date(2025, 6, 18), from_currency="SGD", to_currency="NZD", rate=1.28, source="wise")
+        cache_exchange_rate(self.db, rate_date=date(2025, 6, 20), from_currency="SGD", to_currency="NZD", rate=1.28, source="wise")
+
+        # Simulate hijacked Wise SGD -> BTC false match + Lightning Pay on same NZ day
+        wise_sgd = Account(name="Wise SGD", institution="Wise", account_type="checking", tier="cash", currency="SGD")
+        self.db.add(wise_sgd)
+        self.db.commit()
+        self.db.refresh(wise_sgd)
+
+        wise_out = Transaction(
+            transaction_date=date(2025, 6, 18),
+            account_id=wise_sgd.id,
+            amount=-1286.94,
+            currency="SGD",
+            merchant="Raymund Tienzo",
+            raw_description="Sent money to Raymund Tienzo",
+            category="Transfers",
+            exchange_rate=0.00002190,
+            raw_hash="wise-sgd-hijack",
+        )
+        lp_jun = Transaction(
+            transaction_date=date(2025, 6, 20),
+            account_id=self.acc_asb.id,
+            amount=-5000.00,
+            currency="NZD",
+            merchant="Lightning Pay",
+            category="Transfers",
+            raw_hash="lp-jun-20",
+        )
+        btc_jun = Transaction(
+            transaction_date=date(2025, 6, 20),
+            account_id=self.acc_btc.id,
+            amount=0.02817871,
+            currency="BTC",
+            merchant="Bitcoin On-Chain Deposit (0cf42e9239d0)",
+            category="Transfers",
+            exchange_rate=0.00002190,
+            raw_hash="btc-jun-20",
+        )
+        # Back-to-back Mar 11, 12, 13 Lightning Pay & BTC deposits
+        lp_mar11_a = Transaction(transaction_date=date(2025, 3, 11), account_id=self.acc_asb.id, amount=-5000.0, currency="NZD", merchant="Lightning Pay", category="Transfers", raw_hash="lp-m11-5k")
+        lp_mar11_b = Transaction(transaction_date=date(2025, 3, 11), account_id=self.acc_asb.id, amount=-1000.0, currency="NZD", merchant="Lightning Pay", category="Transfers", raw_hash="lp-m11-1k")
+        lp_mar12 = Transaction(transaction_date=date(2025, 3, 12), account_id=self.acc_asb.id, amount=-6000.0, currency="NZD", merchant="Lightning Pay", category="Transfers", raw_hash="lp-m12-6k")
+        lp_mar13 = Transaction(transaction_date=date(2025, 3, 13), account_id=self.acc_asb.id, amount=-5000.0, currency="NZD", merchant="Lightning Pay", category="Transfers", raw_hash="lp-m13-5k")
+
+        btc_mar11_a = Transaction(transaction_date=date(2025, 3, 11), account_id=self.acc_btc.id, amount=0.03553589, currency="BTC", merchant="Bitcoin On-Chain Deposit", category="Transfers", exchange_rate=117339.0, raw_hash="btc-m11-a")
+        btc_mar11_b = Transaction(transaction_date=date(2025, 3, 11), account_id=self.acc_btc.id, amount=0.00705732, currency="BTC", merchant="Bitcoin On-Chain Deposit", category="Transfers", exchange_rate=117339.0, raw_hash="btc-m11-b")
+        btc_mar12 = Transaction(transaction_date=date(2025, 3, 12), account_id=self.acc_btc.id, amount=0.04069698, currency="BTC", merchant="Bitcoin On-Chain Deposit", category="Transfers", exchange_rate=117339.0, raw_hash="btc-m12")
+        btc_mar13 = Transaction(transaction_date=date(2025, 3, 13), account_id=self.acc_btc.id, amount=0.03380166, currency="BTC", merchant="Bitcoin On-Chain Deposit", category="Transfers", exchange_rate=117339.0, raw_hash="btc-m13")
+
+        self.db.add_all([wise_out, lp_jun, btc_jun, lp_mar11_a, lp_mar11_b, lp_mar12, lp_mar13, btc_mar11_a, btc_mar11_b, btc_mar12, btc_mar13])
+        self.db.commit()
+
+        # Wire the bad link wise_out <-> btc_jun to simulate existing corrupted state
+        wise_out.linked_transaction_id = btc_jun.id
+        btc_jun.linked_transaction_id = wise_out.id
+        self.db.commit()
+
+        repair_crypto_transfers_and_rates(self.db)
+        reconcile_transfers(self.db)
+
+        for obj in [wise_out, lp_jun, btc_jun, lp_mar11_a, lp_mar11_b, lp_mar12, lp_mar13, btc_mar11_a, btc_mar11_b, btc_mar12, btc_mar13]:
+            self.db.refresh(obj)
+
+        # False Wise SGD hijack was broken and real Lightning Pay <-> BTC matched
+        self.assertIsNone(wise_out.linked_transaction_id)
+        self.assertEqual(btc_jun.linked_transaction_id, lp_jun.id)
+        self.assertAlmostEqual(float(btc_jun.exchange_rate), 174452.42, places=2)
+        self.assertAlmostEqual(float(lp_jun.exchange_rate), round(5000.0 / 0.02817871, 2), places=1)
+
+        # All 4 back-to-back March purchases paired on exact matching date and keep historical daily BTC/NZD rates
+        self.assertEqual(btc_mar11_a.linked_transaction_id, lp_mar11_a.id)
+        self.assertEqual(btc_mar11_b.linked_transaction_id, lp_mar11_b.id)
+        self.assertEqual(btc_mar12.linked_transaction_id, lp_mar12.id)
+        self.assertEqual(btc_mar13.linked_transaction_id, lp_mar13.id)
+        self.assertAlmostEqual(float(btc_mar11_a.exchange_rate), 137953.63, places=2)
+        self.assertAlmostEqual(float(btc_mar12.exchange_rate), 145155.44, places=2)
+        self.assertAlmostEqual(float(btc_mar13.exchange_rate), 145836.65, places=2)
 
 
 if __name__ == "__main__":
