@@ -106,7 +106,7 @@ class TestBitcoinConnector(unittest.TestCase):
         self.assertEqual(sats, 750)
         self.assertTrue(has_hist)
 
-        gateway = HttpBitcoinGateway(f"BitBox02:{BIP84_TEST_ZPUB}", gap_limit=2)
+        gateway = HttpBitcoinGateway(f"BitBox02:{BIP84_TEST_ZPUB}", gap_limit=2, request_delay=0.0)
         with patch("httpx.Client.get", side_effect=lambda url, **_kw: fake_get(url)):
             feeds = gateway.fetch_feeds()
 
@@ -115,6 +115,28 @@ class TestBitcoinConnector(unittest.TestCase):
         self.assertEqual(feeds[0].account.account_type, "crypto")
         self.assertEqual(feeds[0].account.tier, "growth")
         self.assertAlmostEqual(feeds[0].account.current_balance, 0.12623456, places=8)
+
+    def test_get_address_stats_retries_on_429(self):
+        resp_429 = MagicMock()
+        resp_429.status_code = 429
+        resp_429.headers = {"Retry-After": "1"}
+        resp_ok = MagicMock()
+        resp_ok.status_code = 200
+        resp_ok.json.return_value = {
+            "chain_stats": {"funded_txo_sum": 50_000, "spent_txo_sum": 0, "tx_count": 1},
+            "mempool_stats": {"funded_txo_sum": 0, "spent_txo_sum": 0, "tx_count": 0},
+        }
+        gateway = HttpBitcoinGateway(
+            "Cold:bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu",
+            request_delay=0.0,
+        )
+        with (
+            patch("httpx.Client.get", side_effect=[resp_429, resp_ok]),
+            patch("app.services.connectors.bitcoin.time.sleep") as mock_sleep,
+        ):
+            feeds = gateway.fetch_feeds()
+        mock_sleep.assert_called_once_with(1.0)
+        self.assertAlmostEqual(feeds[0].account.current_balance, 0.0005, places=8)
 
     def test_sync_bitcoin_creates_account_and_nzd_snapshot(self):
         self.db.add(
