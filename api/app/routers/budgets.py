@@ -23,6 +23,7 @@ from app.services.burn_service import (
     TRANSFER_CATEGORIES,
     WEEKS_PER_YEAR,
     annual_to_weekly,
+    calculate_annual_category_count_map,
     calculate_annual_category_spend_map,
     calculate_category_average_burn,
     calculate_weekly_burn_summary,
@@ -94,6 +95,7 @@ def _build_category_report(
     period: Optional[str],
     *,
     annual_cat_spend: Optional[float] = None,
+    annual_cat_count: Optional[int] = None,
 ) -> CategorySpendingReport:
     """Build one CategorySpendingReport with budget utilization and warning level."""
     rule_period = (rule.budget_period or "monthly").strip().lower() if rule else "monthly"
@@ -102,6 +104,11 @@ def _build_category_report(
         round(annual_cat_spend, 2)
         if (is_annual_rule and annual_cat_spend is not None)
         else cat_spend
+    )
+    display_count = (
+        annual_cat_count
+        if (is_annual_rule and annual_cat_count is not None)
+        else count
     )
 
     pct = round((cat_spend / total_spend * 100), 1) if (total_spend > 0 and not is_tx_transfer) else 0.0
@@ -128,7 +135,7 @@ def _build_category_report(
     return CategorySpendingReport(
         category=category,
         total_spend=display_spend,
-        transaction_count=count,
+        transaction_count=display_count,
         percentage=pct,
         budget_limit=budget_limit,
         percent_used=percent_used,
@@ -308,6 +315,7 @@ def get_spending_breakdown(
         if (rule.budget_period or "monthly").strip().lower() == "annual"
     }
     annual_spend_map = calculate_annual_category_spend_map(db, ref_date, annual_cats)
+    annual_count_map = calculate_annual_category_count_map(db, ref_date, annual_cats)
     is_weekly_period = period in ("week", "last_week")
     is_monthly_period = period in ("month", "last_month")
 
@@ -388,6 +396,7 @@ def get_spending_breakdown(
                 rule=budget_rules.get(cat_lower),
                 period=period,
                 annual_cat_spend=annual_spend_map.get(cat_lower),
+                annual_cat_count=annual_count_map.get(cat_lower, 0),
             )
         )
 
@@ -403,6 +412,7 @@ def get_spending_breakdown(
                     rule=rule,
                     period=period,
                     annual_cat_spend=annual_spend_map.get(cat_lower, 0.0),
+                    annual_cat_count=annual_count_map.get(cat_lower, 0),
                 )
             )
 

@@ -5,7 +5,7 @@ from typing import Optional
 
 from fastapi import HTTPException
 
-VALID_PERIODS = ("week", "last_week", "month", "last_month", "all")
+VALID_PERIODS = ("week", "last_week", "month", "last_month", "annual", "year", "all")
 
 
 def resolve_period_dates(
@@ -34,10 +34,12 @@ def resolve_period_dates(
         first_this_month = date(ref.year, ref.month, 1)
         prev_end = first_this_month - timedelta(days=1)
         return date(prev_end.year, prev_end.month, 1), prev_end
+    if period in ("annual", "year"):
+        return ref - timedelta(days=365), ref
     if period == "all":
         return None, None
 
     raise HTTPException(
         status_code=400,
-        detail="Invalid period. Choose 'week', 'last_week', 'month', 'last_month', or 'all'.",
+        detail="Invalid period. Choose 'week', 'last_week', 'month', 'last_month', 'annual', or 'all'.",
     )

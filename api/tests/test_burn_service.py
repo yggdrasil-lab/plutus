@@ -1,6 +1,7 @@
 """Unit tests for Plutus burn_service, Wise FX guard, FX repair, and average-burn budgets."""
 
 from datetime import date, timedelta
+import json
 from pathlib import Path
 import sys
 import unittest
@@ -408,9 +409,91 @@ class TestBurnService(unittest.TestCase):
         self.assertAlmostEqual(w_cats["Travel"]["total_spend"], 2600.00, places=2)
         self.assertFalse(w_cats["Travel"]["is_over_budget"])
         self.assertEqual(w_cats["Education"]["budget_period"], "annual")
+        self.assertEqual(w_cats["Education"]["transaction_count"], 1)
         self.assertAlmostEqual(w_cats["Education"]["budget_limit"], 1040.00, places=2)
         self.assertAlmostEqual(w_cats["Education"]["total_spend"], 520.00, places=2)
         self.assertFalse(w_cats["Education"]["is_over_budget"])
+
+        # Annual period query returns trailing 365d transactions even though outside current week
+        edu_txs = self.client.get("/transactions?category=Education&period=annual")
+        self.assertEqual(edu_txs.status_code, 200)
+        self.assertEqual(len(edu_txs.json()), 1)
+        self.assertEqual(edu_txs.json()[0]["merchant"], "Certification Exam")
+
+    def test_tag_spending_summary_and_tag_filter(self):
+        """Tag summary aggregates NZD spend and per-category breakdown across categories."""
+        today = date.today()
+        trip_tag = json.dumps(["japan-trip"])
+        self.db.add_all(
+            [
+                Transaction(
+                    transaction_date=today - timedelta(days=50),
+                    account_id=self.acc.id,
+                    amount=-1200.0,
+                    currency="NZD",
+                    merchant="ANA Flights",
+                    category="Travel",
+                    tags=trip_tag,
+                    raw_hash="tag-japan-flight",
+                ),
+                Transaction(
+                    transaction_date=today - timedelta(days=10),
+                    account_id=self.sgd_acc.id,
+                    amount=-100.0,
+                    currency="SGD",
+                    exchange_rate=1.30,
+                    merchant="Ichiran Ramen",
+                    category="Food",
+                    tags=trip_tag,
+                    raw_hash="tag-japan-food",
+                ),
+                Transaction(
+                    transaction_date=today - timedelta(days=8),
+                    account_id=self.acc.id,
+                    amount=-70.0,
+                    currency="NZD",
+                    merchant="Suica Topup",
+                    category="Transport",
+                    tags=trip_tag,
+                    raw_hash="tag-japan-transport",
+                ),
+                # Transfer should never be counted as spending
+                Transaction(
+                    transaction_date=today - timedelta(days=9),
+                    account_id=self.acc.id,
+                    amount=-500.0,
+                    currency="NZD",
+                    merchant="Wise Topup",
+                    category="Transfers",
+                    tags=trip_tag,
+                    raw_hash="tag-japan-transfer",
+                ),
+            ]
+        )
+        self.db.commit()
+
+        summary_res = self.client.get("/transactions/summary/tags?period=all")
+        self.assertEqual(summary_res.status_code, 200)
+        summary = summary_res.json()
+        # 1200 + 130 + 70 = 1400.0 NZD
+        self.assertAlmostEqual(summary["total_tagged_spend"], 1400.0, places=2)
+        self.assertEqual(len(summary["tags"]), 1)
+        japan = summary["tags"][0]
+        self.assertEqual(japan["tag"], "japan-trip")
+        self.assertAlmostEqual(japan["total_spend"], 1400.0, places=2)
+        self.assertEqual(japan["transaction_count"], 3)
+        by_cat = {c["category"]: c for c in japan["categories"]}
+        self.assertAlmostEqual(by_cat["Travel"]["total_spend"], 1200.0, places=2)
+        self.assertAlmostEqual(by_cat["Food"]["total_spend"], 130.0, places=2)
+        self.assertAlmostEqual(by_cat["Transport"]["total_spend"], 70.0, places=2)
+        self.assertAlmostEqual(by_cat["Travel"]["percentage"], 85.7, places=1)
+
+        list_res = self.client.get("/transactions?tag=japan-trip&period=all&limit=2")
+        self.assertEqual(list_res.status_code, 200)
+        self.assertEqual(len(list_res.json()), 2)
+        list_all = self.client.get("/transactions?tag=japan-trip&period=all")
+        self.assertEqual(list_all.status_code, 200)
+        self.assertEqual(len(list_all.json()), 4)
 
 
 if __name__ == "__main__":
