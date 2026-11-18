@@ -13,6 +13,7 @@ from app.config import settings
 from app.db import SessionLocal
 from app.schemas import SyncResult
 from app.services.connectors.akahu import sync_akahu
+from app.services.connectors.bitcoin import sync_bitcoin
 from app.services.connectors.wise import sync_wise
 
 logger = logging.getLogger("plutus.sync_scheduler")
@@ -30,6 +31,8 @@ def get_configured_providers() -> list[str]:
         providers.append("akahu")
     if settings.wise_api_token:
         providers.append("wise")
+    if settings.btc_watch_sources:
+        providers.append("bitcoin")
     return providers
 
 
@@ -39,6 +42,7 @@ def get_configured_providers() -> list[str]:
 PROVIDER_HANDLERS: dict[str, Callable[[Session, int], SyncResult]] = {
     "akahu": lambda db, days: sync_akahu(db, days=days),
     "wise": lambda db, days: sync_wise(db, days=days),
+    "bitcoin": lambda db, _days: sync_bitcoin(db),
 }
 
 

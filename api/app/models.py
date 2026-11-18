@@ -59,7 +59,7 @@ class AssetSnapshot(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     snapshot_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
     account_id: Mapped[int] = mapped_column(Integer, ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False)
-    balance: Mapped[float] = mapped_column(Numeric(14, 2), nullable=False)
+    balance: Mapped[float] = mapped_column(Numeric(18, 8), nullable=False)
     currency: Mapped[str] = mapped_column(String(3), nullable=False, default="NZD")
     exchange_rate: Mapped[float] = mapped_column(Numeric(10, 4), nullable=False, default=1.0)
     balance_nzd: Mapped[float] = mapped_column(Numeric(14, 2), nullable=False)

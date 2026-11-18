@@ -32,6 +32,7 @@ from app.schemas import (
 )
 from app.services.connectors import ConnectorConfigError, ConnectorUpstreamError
 from app.services.connectors.akahu import sync_akahu
+from app.services.connectors.bitcoin import sync_bitcoin
 from app.services.connectors.dbs_email import ingest_dbs_alert
 from app.services.connectors.wise import sync_wise
 from app.services.ingestion_service import (
@@ -333,6 +334,9 @@ SYNC_HANDLERS: dict[
     "wise": lambda db, days, start_date, end_date, skip_llm: sync_wise(
         db, days=days, start_date=start_date, end_date=end_date, skip_llm=skip_llm
     ),
+    "bitcoin": lambda db, _days, _start_date, _end_date, skip_llm: sync_bitcoin(
+        db, skip_llm=skip_llm
+    ),
 }
 
 
@@ -366,7 +370,7 @@ def sync_external_provider(
     if normalized != "all" and normalized not in SYNC_HANDLERS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unsupported sync provider '{provider}'. Use 'akahu', 'wise', or 'all'.",
+            detail=f"Unsupported sync provider '{provider}'. Use 'akahu', 'wise', 'bitcoin', or 'all'.",
         )
 
     targets = list(SYNC_HANDLERS.values()) if normalized == "all" else [SYNC_HANDLERS[normalized]]

@@ -76,6 +76,7 @@ jobs:
           PLUTUS_AKAHU_APP_TOKEN: ${{ secrets.AKAHU_APP_TOKEN }}
           PLUTUS_AKAHU_USER_TOKEN: ${{ secrets.AKAHU_USER_TOKEN }}
           PLUTUS_WISE_API_TOKEN: ${{ secrets.WISE_API_TOKEN }}
+          PLUTUS_BTC_WATCH_SOURCES: ${{ secrets.PLUTUS_BTC_WATCH_SOURCES }}
           IMAGE_TAG: plutus
         run: |
           curl -fsSL https://raw.githubusercontent.com/yggdrasil-lab/yggdrasil-os/main/deploy/deploy.sh -o /tmp/deploy.sh

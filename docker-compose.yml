@@ -52,6 +52,7 @@ services:
       - PLUTUS_AKAHU_APP_TOKEN=${PLUTUS_AKAHU_APP_TOKEN}
       - PLUTUS_AKAHU_USER_TOKEN=${PLUTUS_AKAHU_USER_TOKEN}
       - PLUTUS_WISE_API_TOKEN=${PLUTUS_WISE_API_TOKEN}
+      - PLUTUS_BTC_WATCH_SOURCES=${PLUTUS_BTC_WATCH_SOURCES}
       - TZ=Pacific/Auckland
     secrets:
       - plutus_mcp_token

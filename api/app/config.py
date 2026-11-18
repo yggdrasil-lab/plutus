@@ -30,6 +30,10 @@ class Settings(BaseSettings):
         default="",
         validation_alias=AliasChoices("PLUTUS_WISE_API_TOKEN", "WISE_API_TOKEN"),
     )
+    btc_watch_sources: str = Field(
+        default="",
+        validation_alias=AliasChoices("PLUTUS_BTC_WATCH_SOURCES", "PLUTUS_BTC_XPUB", "BTC_WATCH_SOURCES"),
+    )
     sync_interval_hours: int = 6
     discord_bot_token: str | None = Field(
         default=None,
