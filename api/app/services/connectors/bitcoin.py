@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import hashlib
 import hmac
 import re
+import time
 from typing import Optional
 
 from ecdsa import SECP256k1
@@ -26,7 +27,9 @@ from app.services.ingestion_service import (
 
 MEMPOOL_BASE_URL = "https://mempool.space/api"
 SATOSHIS_PER_BTC = 100_000_000
-DEFAULT_GAP_LIMIT = 20
+DEFAULT_GAP_LIMIT = 15
+DEFAULT_REQUEST_DELAY_SECONDS = 0.2
+MAX_RATE_LIMIT_RETRIES = 3
 
 _B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 _B58_INDEX = {c: i for i, c in enumerate(_B58_ALPHABET)}
@@ -263,11 +266,13 @@ class HttpBitcoinGateway:
         *,
         base_url: str = MEMPOOL_BASE_URL,
         gap_limit: int = DEFAULT_GAP_LIMIT,
+        request_delay: float = DEFAULT_REQUEST_DELAY_SECONDS,
         timeout: float = 15.0,
     ) -> None:
         self._sources = parse_watch_sources(raw_sources)
         self._base_url = base_url.rstrip("/")
         self._gap_limit = max(1, gap_limit)
+        self._request_delay = max(0.0, request_delay)
         self._timeout = timeout
 
     def fetch_feeds(self, **_kwargs) -> list[ProviderAccountFeed]:
@@ -285,12 +290,22 @@ class HttpBitcoinGateway:
         return feeds
 
     def _get_address_stats(self, client: httpx.Client, address: str) -> dict:
-        resp = client.get(f"{self._base_url}/address/{address}")
-        if resp.status_code >= 400:
-            raise ConnectorUpstreamError(
-                f"Mempool.space /address/{address} failed ({resp.status_code}): {resp.text[:200]}"
-            )
-        return resp.json()
+        url = f"{self._base_url}/address/{address}"
+        for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+            if self._request_delay > 0:
+                time.sleep(self._request_delay)
+            resp = client.get(url)
+            if resp.status_code == 429 and attempt < MAX_RATE_LIMIT_RETRIES:
+                retry_after = resp.headers.get("Retry-After")
+                wait_seconds = float(retry_after) if retry_after and retry_after.isdigit() else (1.5 * (2**attempt))
+                time.sleep(min(wait_seconds, 10.0))
+                continue
+            if resp.status_code >= 400:
+                raise ConnectorUpstreamError(
+                    f"Mempool.space /address/{address} failed ({resp.status_code}): {resp.text[:200]}"
+                )
+            return resp.json()
+        raise ConnectorUpstreamError(f"Mempool.space /address/{address} failed after retries (429)")
 
     def _scan_xpub(self, client: httpx.Client, xpub: str) -> tuple[int, int]:
         total_sats = 0
