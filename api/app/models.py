@@ -86,7 +86,7 @@ class Transaction(Base):
     raw_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
     linked_transaction_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("transactions.id", ondelete="SET NULL"), nullable=True, index=True)
     exchange_rate: Mapped[Optional[float]] = mapped_column(Numeric(18, 8), nullable=True)
-    fee_amount: Mapped[Optional[float]] = mapped_column(Numeric(12, 2), nullable=True)
+    fee_amount: Mapped[Optional[float]] = mapped_column(Numeric(18, 8), nullable=True)
     tags: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     recurrence: Mapped[Optional[str]] = mapped_column(String(20), nullable=True, index=True)
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

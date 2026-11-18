@@ -281,6 +281,8 @@ def normalize_bitcoin_transactions(
 
         amount_btc = round(net_sats / SATOSHIS_PER_BTC, 8)
         fee_sats = int(tx.get("fee", 0) or 0)
+        # Only outgoing spends pay the miner fee from this wallet; deposit miner fees are paid
+        # by the sender/broker (often batched) and conversion spreads live on the fiat leg.
         fee_btc = (
             round(fee_sats / SATOSHIS_PER_BTC, 8)
             if (net_sats < 0 and fee_sats > 0)

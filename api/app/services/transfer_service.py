@@ -1,6 +1,6 @@
 """Service for reconciling internal transfers, cross-border remittances, foreign exchange, and crypto conversions."""
 
-from datetime import timedelta
+from datetime import date, timedelta
 import logging
 import re
 from typing import Optional
@@ -41,6 +41,79 @@ def _extract_subaccount_tag(raw_description: Optional[str]) -> Optional[str]:
 
 CRYPTO_CURRENCIES = {"BTC", "ETH", "SOL", "USDC", "USDT"}
 HIGH_DENOM_FIAT = {"PHP", "JPY", "IDR", "KRW", "VND"}
+MIN_IMPLIED_CRYPTO_FEE_FIAT = 0.50
+MIN_IMPLIED_CRYPTO_FEE_RATIO = 0.001
+MAX_IMPLIED_CRYPTO_FEE_RATIO = 0.12
+
+
+def _has_exact_pair_rate(
+    db: Session,
+    *,
+    rate_date: date,
+    from_currency: str,
+    to_currency: str,
+) -> bool:
+    """Return True if an exact-date rate exists for (from_currency, to_currency) directly, inverted, or via NZD."""
+    src = (from_currency or "").strip().upper()
+    dst = (to_currency or "").strip().upper()
+    if src == dst:
+        return True
+    if has_exact_exchange_rate(db, rate_date=rate_date, from_currency=src, to_currency=dst):
+        return True
+    if has_exact_exchange_rate(db, rate_date=rate_date, from_currency=dst, to_currency=src):
+        return True
+    if src != "NZD" and dst != "NZD":
+        return (
+            has_exact_exchange_rate(db, rate_date=rate_date, from_currency=src, to_currency="NZD")
+            and has_exact_exchange_rate(db, rate_date=rate_date, from_currency=dst, to_currency="NZD")
+        )
+    return False
+
+
+def _extract_fiat_to_crypto_fee(
+    db: Session,
+    *,
+    outflow: Transaction,
+    inflow: Transaction,
+    fetcher: Optional[FxRateFetcher] = None,
+) -> Optional[float]:
+    """Derive implied fiat conversion/spread fee when exact-day crypto market rate is available."""
+    if outflow.fee_amount is not None:
+        return None
+    out_code = (outflow.currency or "").strip().upper()
+    in_code = (inflow.currency or "").strip().upper()
+    if out_code in CRYPTO_CURRENCIES or in_code not in CRYPTO_CURRENCIES:
+        return None
+
+    out_amt = abs(float(outflow.amount))
+    in_amt = float(inflow.amount)
+    if out_amt <= 0 or in_amt <= 0:
+        return None
+
+    market = get_exchange_rate(
+        db,
+        rate_date=inflow.transaction_date,
+        from_currency=in_code,
+        to_currency=out_code,
+        fetcher=fetcher,
+    )
+    if market is None or market[0] <= 0:
+        return None
+    if not _has_exact_pair_rate(
+        db,
+        rate_date=inflow.transaction_date,
+        from_currency=in_code,
+        to_currency=out_code,
+    ):
+        return None
+
+    implied_fee = round(out_amt - (in_amt * float(market[0])), 2)
+    if implied_fee < MIN_IMPLIED_CRYPTO_FEE_FIAT:
+        return None
+    fee_ratio = implied_fee / out_amt
+    if fee_ratio < MIN_IMPLIED_CRYPTO_FEE_RATIO or fee_ratio > MAX_IMPLIED_CRYPTO_FEE_RATIO:
+        return None
+    return implied_fee
 
 
 def _is_plausible_offline_fx_rate(
@@ -200,7 +273,7 @@ def match_transfer_pair(tx: Transaction, db: Session) -> Optional[Transaction]:
             if not has_transfer_signal:
                 continue
 
-            fee = float(cand_outflow.fee_amount or cand_inflow.fee_amount or 0.0)
+            fee = float(cand_outflow.fee_amount or 0.0)
             net_out = out_amt - fee if out_amt > fee else out_amt
             if net_out <= 0 or in_amt <= 0:
                 continue
@@ -272,6 +345,23 @@ def match_transfer_pair(tx: Transaction, db: Session) -> Optional[Transaction]:
         if best_match and best_candidate_out and best_candidate_in:
             in_code = best_candidate_in.currency.upper()
             out_code = best_candidate_out.currency.upper()
+            if out_code not in CRYPTO_CURRENCIES and in_code in CRYPTO_CURRENCIES:
+                extracted_fee = _extract_fiat_to_crypto_fee(
+                    db,
+                    outflow=best_candidate_out,
+                    inflow=best_candidate_in,
+                )
+                if extracted_fee is not None:
+                    best_candidate_out.fee_amount = extracted_fee
+                    out_amt = abs(float(best_candidate_out.amount))
+                    in_amt = float(best_candidate_in.amount)
+                    net_out = out_amt - extracted_fee if out_amt > extracted_fee else out_amt
+                    if out_code == "NZD":
+                        best_candidate_outflow_rate = round(net_out / in_amt, 8)
+                    else:
+                        implied_after_fee = in_amt / net_out
+                        precision = 8 if implied_after_fee < 0.01 else 6 if implied_after_fee < 1.0 else 4
+                        best_candidate_outflow_rate = round(implied_after_fee, precision)
             if in_code in CRYPTO_CURRENCIES:
                 market_crypto_nzd = get_exchange_rate(
                     db,
@@ -402,7 +492,7 @@ def repair_crypto_transfers_and_rates(
                 continue
 
             out_amt = abs(float(outflow.amount))
-            fee = float(outflow.fee_amount or inflow.fee_amount or 0.0)
+            fee = float(outflow.fee_amount or 0.0)
             net_out = out_amt - fee if out_amt > fee else out_amt
             in_amt = float(inflow.amount)
             implied_rate = (in_amt / net_out) if (net_out > 0 and in_amt > 0) else 0.0
@@ -439,6 +529,16 @@ def repair_crypto_transfers_and_rates(
                     partner.exchange_rate = round(float(partner_nzd[0]), 8) if partner_nzd else None
                 repaired += 1
             elif out_code == "NZD" and in_code in CRYPTO_CURRENCIES and net_out > 0 and in_amt > 0:
+                extracted_fee = _extract_fiat_to_crypto_fee(
+                    db,
+                    outflow=outflow,
+                    inflow=inflow,
+                    fetcher=fetcher,
+                )
+                if extracted_fee is not None:
+                    outflow.fee_amount = extracted_fee
+                    net_out = out_amt - extracted_fee if out_amt > extracted_fee else out_amt
+                    repaired += 1
                 expected_nzd_per_crypto = round(net_out / in_amt, 8)
                 if abs(float(outflow.exchange_rate or 0.0) - expected_nzd_per_crypto) > 1e-4:
                     outflow.exchange_rate = expected_nzd_per_crypto
