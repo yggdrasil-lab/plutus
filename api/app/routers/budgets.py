@@ -15,12 +15,14 @@ from app.schemas import (
     BudgetRuleRead,
     CategoryBurnEstimateRead,
     CategorySpendingReport,
+    RecurringCommitmentRead,
     SpendingBreakdownResponse,
 )
 from app.services.burn_service import (
     TRANSFER_CATEGORIES,
     calculate_category_average_burn,
     calculate_weekly_burn_summary,
+    list_recurring_commitment_details,
     monthly_to_weekly,
     sync_budgets_from_average_burn,
     to_nzd_amount,
@@ -202,6 +204,7 @@ def get_average_burn_report(
     today = date.today()
     summary = calculate_weekly_burn_summary(db, today, lookback_weeks=lookback_weeks)
     estimates = calculate_category_average_burn(db, today, lookback_weeks=lookback_weeks)
+    commitments = list_recurring_commitment_details(db, today)
     return AverageBurnReportResponse(
         lookback_weeks=lookback_weeks,
         as_of_date=today,
@@ -215,9 +218,12 @@ def get_average_burn_report(
                 recurring_weekly_burn=item.recurring_weekly_burn,
                 average_weekly_burn=item.average_weekly_burn,
                 suggested_monthly_limit=item.suggested_monthly_limit,
+                variable_percentage=item.variable_percentage,
+                total_percentage=item.total_percentage,
             )
             for item in estimates
         ],
+        recurring_commitments=[RecurringCommitmentRead(**vars(c)) for c in commitments],
     )
 
 

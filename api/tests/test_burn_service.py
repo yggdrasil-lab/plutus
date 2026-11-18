@@ -304,6 +304,22 @@ class TestBurnService(unittest.TestCase):
         self.assertAlmostEqual(cats["Food"]["average_weekly_burn"], 32.50, places=2)
         self.assertAlmostEqual(cats["General"]["average_weekly_burn"], 25.00, places=2)
 
+        # Category percentages: variable total = 107.50 (Groceries 46.5%, Food 30.2%, General 23.3%, Housing 0%)
+        self.assertAlmostEqual(cats["Housing"]["variable_percentage"], 0.0, places=1)
+        self.assertAlmostEqual(cats["Groceries"]["variable_percentage"], 46.5, places=1)
+        self.assertAlmostEqual(cats["Food"]["variable_percentage"], 30.2, places=1)
+        self.assertAlmostEqual(cats["General"]["variable_percentage"], 23.3, places=1)
+        self.assertAlmostEqual(cats["Housing"]["total_percentage"], 78.8, places=1)
+
+        # Itemized recurring fixed commitments
+        commitments = avg_body["recurring_commitments"]
+        self.assertEqual(len(commitments), 1)
+        self.assertEqual(commitments[0]["merchant"], "Home rent")
+        self.assertEqual(commitments[0]["category"], "Housing")
+        self.assertEqual(commitments[0]["recurrence"], "weekly")
+        self.assertAlmostEqual(commitments[0]["weekly_nzd"], 400.00, places=2)
+        self.assertAlmostEqual(commitments[0]["percentage_of_recurring"], 100.0, places=1)
+
         # POST /budgets/sync-from-burn?lookback_weeks=4 creates BudgetRule entries
         sync_res = self.client.post("/budgets/sync-from-burn?lookback_weeks=4")
         self.assertEqual(sync_res.status_code, 200)

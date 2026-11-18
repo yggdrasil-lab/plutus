@@ -208,6 +208,22 @@ class CategoryBurnEstimateRead(BaseModel):
     recurring_weekly_burn: float
     average_weekly_burn: float
     suggested_monthly_limit: float
+    variable_percentage: float = 0.0
+    total_percentage: float = 0.0
+
+
+class RecurringCommitmentRead(BaseModel):
+    transaction_id: int
+    merchant: str
+    category: str
+    recurrence: str
+    last_charged_date: date
+    original_amount: float
+    currency: str
+    amount_nzd: float
+    weekly_nzd: float
+    monthly_nzd: float
+    percentage_of_recurring: float
 
 
 class AverageBurnReportResponse(BaseModel):
@@ -217,6 +233,7 @@ class AverageBurnReportResponse(BaseModel):
     recurring_weekly_burn: float
     effective_weekly_burn: float
     categories: list[CategoryBurnEstimateRead] = Field(default_factory=list)
+    recurring_commitments: list[RecurringCommitmentRead] = Field(default_factory=list)
 
 
 # --- Outlook-style Categorization Rule Schemas ---
