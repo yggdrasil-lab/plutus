@@ -25,10 +25,10 @@ from app.services.ingestion_service import (
     sync_provider_feeds,
 )
 
-MEMPOOL_BASE_URL = "https://mempool.space/api"
+MEMPOOL_BASE_URL = "https://blockstream.info/api"
 SATOSHIS_PER_BTC = 100_000_000
-DEFAULT_GAP_LIMIT = 15
-DEFAULT_REQUEST_DELAY_SECONDS = 0.2
+DEFAULT_GAP_LIMIT = 8
+DEFAULT_REQUEST_DELAY_SECONDS = 0.15
 MAX_RATE_LIMIT_RETRIES = 3
 
 _B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -294,7 +294,13 @@ class HttpBitcoinGateway:
         for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
             if self._request_delay > 0:
                 time.sleep(self._request_delay)
-            resp = client.get(url)
+            try:
+                resp = client.get(url)
+            except httpx.TimeoutException as exc:
+                if attempt < MAX_RATE_LIMIT_RETRIES:
+                    time.sleep(1.5 * (2**attempt))
+                    continue
+                raise ConnectorUpstreamError(f"Esplora /address/{address} timed out") from exc
             if resp.status_code == 429 and attempt < MAX_RATE_LIMIT_RETRIES:
                 retry_after = resp.headers.get("Retry-After")
                 wait_seconds = float(retry_after) if retry_after and retry_after.isdigit() else (1.5 * (2**attempt))
@@ -302,10 +308,10 @@ class HttpBitcoinGateway:
                 continue
             if resp.status_code >= 400:
                 raise ConnectorUpstreamError(
-                    f"Mempool.space /address/{address} failed ({resp.status_code}): {resp.text[:200]}"
+                    f"Esplora /address/{address} failed ({resp.status_code}): {resp.text[:200]}"
                 )
             return resp.json()
-        raise ConnectorUpstreamError(f"Mempool.space /address/{address} failed after retries (429)")
+        raise ConnectorUpstreamError(f"Esplora /address/{address} failed after retries (429)")
 
     def _scan_xpub(self, client: httpx.Client, xpub: str) -> tuple[int, int]:
         total_sats = 0
