@@ -334,6 +334,84 @@ class TestBurnService(unittest.TestCase):
         estimates = calculate_category_average_burn(self.db, today, lookback_weeks=4)
         self.assertEqual(estimates[0].category, "Housing")
 
+    def test_annual_budget_category_amortization_without_hardcoding(self):
+        """Any category marked budget_period='annual' spreads 365d spend across 52 weeks."""
+        today = date.today()
+
+        # Configure two different categories as annual budgets (no hardcoded category check)
+        res_travel = self.client.post(
+            "/budgets",
+            json={"category": "Travel", "annual_limit": 2600.0, "budget_period": "annual"},
+        )
+        self.assertEqual(res_travel.status_code, 200)
+        self.assertEqual(res_travel.json()["budget_period"], "annual")
+        self.assertAlmostEqual(res_travel.json()["weekly_limit"], 50.0, places=2)
+        self.assertAlmostEqual(res_travel.json()["annual_limit"], 2600.0, places=2)
+
+        res_edu = self.client.post(
+            "/budgets",
+            json={"category": "Education", "annual_limit": 1040.0, "budget_period": "annual"},
+        )
+        self.assertEqual(res_edu.status_code, 200)
+
+        self.db.add_all(
+            [
+                # Booking today in current week: must amortize to $50/wk, not $2,600/wk
+                Transaction(
+                    transaction_date=today,
+                    account_id=self.acc.id,
+                    amount=-2600.0,
+                    currency="NZD",
+                    merchant="Air New Zealand",
+                    category="Travel",
+                    recurrence=None,
+                    raw_hash="annual-travel-today",
+                ),
+                # Charge 120 days ago (outside 4w & 12w windows, inside 365d window): $520 -> $10/wk
+                Transaction(
+                    transaction_date=today - timedelta(days=120),
+                    account_id=self.acc.id,
+                    amount=-520.0,
+                    currency="NZD",
+                    merchant="Certification Exam",
+                    category="Education",
+                    recurrence=None,
+                    raw_hash="annual-edu-120d",
+                ),
+            ]
+        )
+        self.db.commit()
+
+        summary = calculate_weekly_burn_summary(self.db, today, lookback_weeks=4)
+        self.assertAlmostEqual(summary.variable_weekly_burn, 60.00, places=2)
+        self.assertAlmostEqual(summary.this_week_variable_spend, 60.00, places=2)
+        self.assertAlmostEqual(summary.effective_weekly_burn, 60.00, places=2)
+
+        avg_res = self.client.get("/budgets/average-burn?lookback_weeks=4")
+        self.assertEqual(avg_res.status_code, 200)
+        cats = {c["category"]: c for c in avg_res.json()["categories"]}
+        self.assertEqual(cats["Travel"]["budget_period"], "annual")
+        self.assertAlmostEqual(cats["Travel"]["variable_weekly_burn"], 50.00, places=2)
+        self.assertAlmostEqual(cats["Travel"]["suggested_annual_limit"], 2600.00, places=2)
+        self.assertEqual(cats["Education"]["budget_period"], "annual")
+        self.assertAlmostEqual(cats["Education"]["variable_weekly_burn"], 10.00, places=2)
+        self.assertAlmostEqual(cats["Education"]["suggested_annual_limit"], 520.00, places=2)
+
+        # Breakdown evaluates against annual limit (2600 / 2600 = 100%, not over budget)
+        week_res = self.client.get("/budgets/breakdown?period=week")
+        self.assertEqual(week_res.status_code, 200)
+        w_body = week_res.json()
+        self.assertAlmostEqual(w_body["total_spend"], 60.00, places=2)
+        w_cats = {c["category"]: c for c in w_body["categories"]}
+        self.assertEqual(w_cats["Travel"]["budget_period"], "annual")
+        self.assertAlmostEqual(w_cats["Travel"]["budget_limit"], 2600.00, places=2)
+        self.assertAlmostEqual(w_cats["Travel"]["total_spend"], 2600.00, places=2)
+        self.assertFalse(w_cats["Travel"]["is_over_budget"])
+        self.assertEqual(w_cats["Education"]["budget_period"], "annual")
+        self.assertAlmostEqual(w_cats["Education"]["budget_limit"], 1040.00, places=2)
+        self.assertAlmostEqual(w_cats["Education"]["total_spend"], 520.00, places=2)
+        self.assertFalse(w_cats["Education"]["is_over_budget"])
+
 
 if __name__ == "__main__":
     unittest.main()

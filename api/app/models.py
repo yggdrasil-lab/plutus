@@ -116,6 +116,9 @@ class BudgetRule(Base):
     category: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
     weekly_limit: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
     monthly_limit: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+    budget_period: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="monthly", server_default="monthly"
+    )
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
 
