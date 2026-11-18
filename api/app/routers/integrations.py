@@ -313,8 +313,8 @@ SYNC_HANDLERS: dict[
     "wise": lambda db, days, start_date, end_date, skip_llm: sync_wise(
         db, days=days, start_date=start_date, end_date=end_date, skip_llm=skip_llm
     ),
-    "bitcoin": lambda db, _days, _start_date, _end_date, skip_llm: sync_bitcoin(
-        db, skip_llm=skip_llm
+    "bitcoin": lambda db, _days, start_date, end_date, skip_llm: sync_bitcoin(
+        db, start_date=start_date, end_date=end_date, skip_llm=skip_llm
     ),
 }
 

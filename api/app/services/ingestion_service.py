@@ -246,14 +246,18 @@ def ingest_normalized_transactions(
                 Transaction.notes.isnot(None),
             )
         ).all()
-        if n and n.startswith(("akahu:", "wise:"))
+        if n and n.startswith(("akahu:", "wise:", "btc:"))
     )
 
     created: list[Transaction] = []
     skipped = 0
 
     for item in items:
-        ext_note = item.notes if (item.notes and item.notes.startswith(("akahu:", "wise:"))) else None
+        ext_note = (
+            item.notes
+            if (item.notes and item.notes.startswith(("akahu:", "wise:", "btc:")))
+            else None
+        )
         if ext_note and (ext_note in existing_external_notes or ext_note in seen_external_notes):
             skipped += 1
             continue
