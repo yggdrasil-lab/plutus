@@ -1,10 +1,11 @@
 """Unit tests for the watch-only Bitcoin connector."""
 
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 import sys
 import unittest
 from unittest.mock import MagicMock, patch
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
@@ -12,6 +13,7 @@ from sqlalchemy.pool import StaticPool
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from app.config import settings
 from app.db import Base
 from app.models import Account, AssetSnapshot, ExchangeRate, Transaction
 from app.services.connectors import ConnectorConfigError
@@ -144,9 +146,10 @@ class TestBitcoinConnector(unittest.TestCase):
         self.assertAlmostEqual(feeds[0].account.current_balance, 0.0005, places=8)
 
     def test_sync_bitcoin_creates_account_and_nzd_snapshot(self):
+        auckland_today = datetime.now(ZoneInfo(settings.timezone)).date()
         self.db.add(
             ExchangeRate(
-                rate_date=date.today(),
+                rate_date=auckland_today,
                 from_currency="BTC",
                 to_currency="NZD",
                 rate=150000.0,
@@ -177,9 +180,10 @@ class TestBitcoinConnector(unittest.TestCase):
         self.assertAlmostEqual(float(snap.balance_nzd), 37500.0, places=2)
 
     def test_bitcoin_onchain_transactions_normalized_and_synced_idempotently(self):
+        auckland_today = datetime.now(ZoneInfo(settings.timezone)).date()
         self.db.add(
             ExchangeRate(
-                rate_date=date.today(),
+                rate_date=auckland_today,
                 from_currency="BTC",
                 to_currency="NZD",
                 rate=150000.0,
@@ -217,6 +221,7 @@ class TestBitcoinConnector(unittest.TestCase):
         self.assertEqual(norm[0].category, "Transfers")
         self.assertEqual(norm[0].notes, f"btc:{'b' * 64}")
         self.assertEqual(norm[1].amount, 0.02)
+        self.assertIsNone(norm[1].fee_amount)
         self.assertEqual(norm[1].transaction_date, date(2024, 11, 11))
         self.assertEqual(norm[1].notes, f"btc:{'a' * 64}")
 

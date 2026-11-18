@@ -385,9 +385,11 @@ class TestTransfersAndReceiptLinking(unittest.TestCase):
 
         self.assertEqual(tx_out.linked_transaction_id, in_id)
         self.assertEqual(tx_in.linked_transaction_id, out_id)
-        # NZD -> BTC transfer leg records implied NZD per BTC (5000 / 0.035 = 142857.14285714)
-        # while the BTC leg preserves that day's market BTC -> NZD rate (140000.0).
-        self.assertAlmostEqual(float(tx_out.exchange_rate), 142857.14285714, places=2)
+        # NZD -> BTC extracts implied spread fee (5000 - 0.035 * 140000 = 100.00 NZD),
+        # records net NZD/BTC rate ((5000 - 100) / 0.035 = 140000.0) on outflow,
+        # and preserves that day's market BTC -> NZD rate (140000.0) on the BTC leg.
+        self.assertAlmostEqual(float(tx_out.fee_amount), 100.0, places=2)
+        self.assertAlmostEqual(float(tx_out.exchange_rate), 140000.0, places=2)
         self.assertAlmostEqual(float(tx_in.exchange_rate), 140000.0, places=2)
         self.assertEqual(tx_in.category, "Transfers")
 
@@ -759,7 +761,12 @@ TRANSFER-98765433,05-11-2026,500.00,NZD,Client Payment Invoice 101,Freelance,500
         self.assertIsNone(wise_out.linked_transaction_id)
         self.assertEqual(btc_jun.linked_transaction_id, lp_jun.id)
         self.assertAlmostEqual(float(btc_jun.exchange_rate), 174452.42, places=2)
-        self.assertAlmostEqual(float(lp_jun.exchange_rate), round(5000.0 / 0.02817871, 2), places=1)
+        self.assertAlmostEqual(float(lp_jun.fee_amount), round(5000.0 - (0.02817871 * 174452.42), 2), places=2)
+        self.assertAlmostEqual(
+            float(lp_jun.exchange_rate),
+            round((5000.0 - float(lp_jun.fee_amount)) / 0.02817871, 2),
+            places=1,
+        )
 
         # All 4 back-to-back March purchases paired on exact matching date and keep historical daily BTC/NZD rates
         self.assertEqual(btc_mar11_a.linked_transaction_id, lp_mar11_a.id)
@@ -769,6 +776,75 @@ TRANSFER-98765433,05-11-2026,500.00,NZD,Client Payment Invoice 101,Freelance,500
         self.assertAlmostEqual(float(btc_mar11_a.exchange_rate), 137953.63, places=2)
         self.assertAlmostEqual(float(btc_mar12.exchange_rate), 145155.44, places=2)
         self.assertAlmostEqual(float(btc_mar13.exchange_rate), 145836.65, places=2)
+
+    def test_fiat_to_btc_fee_extraction_guards_volatility_and_stale_rates(self):
+        from unittest.mock import patch
+        from app.services.fx_service import cache_exchange_rate
+        from app.services.transfer_service import repair_crypto_transfers_and_rates
+
+        # Exact-date rates for 2025-03-04 (intraday negative diff), 2025-03-05 (tiny noise), 2025-03-06 (explicit fee)
+        # Note: 2025-03-07 has NO exact rate so it would only hit latest_fallback if allowed.
+        cache_exchange_rate(self.db, rate_date=date(2025, 3, 4), from_currency="BTC", to_currency="NZD", rate=153541.68, source="coinbase")
+        cache_exchange_rate(self.db, rate_date=date(2025, 3, 5), from_currency="BTC", to_currency="NZD", rate=150000.0, source="coinbase")
+        cache_exchange_rate(self.db, rate_date=date(2025, 3, 6), from_currency="BTC", to_currency="NZD", rate=150000.0, source="coinbase")
+        cache_exchange_rate(self.db, rate_date=date(2025, 3, 8), from_currency="BTC", to_currency="NZD", rate=160000.0, source="coinbase")
+
+        # 1. Negative implied fee (-18.39 NZD from intraday BTC move) -> fee_amount stays None
+        lp_neg = Transaction(transaction_date=date(2025, 3, 4), account_id=self.acc_asb.id, amount=-3000.0, currency="NZD", merchant="Lightning Pay", category="Transfers", raw_hash="lp-neg")
+        btc_neg = Transaction(transaction_date=date(2025, 3, 4), account_id=self.acc_btc.id, amount=0.01965842, currency="BTC", merchant="Bitcoin On-Chain Deposit", category="Transfers", raw_hash="btc-neg")
+
+        # 2. Tiny positive noise ($0.20 on $1000 = 0.02% < 0.1%) -> fee_amount stays None
+        lp_noise = Transaction(transaction_date=date(2025, 3, 5), account_id=self.acc_asb.id, amount=-1000.0, currency="NZD", merchant="Lightning Pay", category="Transfers", raw_hash="lp-noise")
+        btc_noise = Transaction(transaction_date=date(2025, 3, 5), account_id=self.acc_btc.id, amount=0.00666533, currency="BTC", merchant="Bitcoin On-Chain Deposit", category="Transfers", raw_hash="btc-noise")
+
+        # 3. Explicit fee already recorded ($12.50) -> preserved, not overwritten by implied spread
+        lp_explicit = Transaction(transaction_date=date(2025, 3, 6), account_id=self.acc_asb.id, amount=-1000.0, currency="NZD", merchant="Lightning Pay", category="Transfers", fee_amount=12.50, raw_hash="lp-exp")
+        btc_explicit = Transaction(transaction_date=date(2025, 3, 6), account_id=self.acc_btc.id, amount=0.00650000, currency="BTC", merchant="Bitcoin On-Chain Deposit", category="Transfers", raw_hash="btc-exp")
+
+        # 4. Stale fallback date (2025-03-07 has no exact rate) -> fee_amount stays None
+        lp_stale = Transaction(transaction_date=date(2025, 3, 7), account_id=self.acc_asb.id, amount=-1000.0, currency="NZD", merchant="Lightning Pay", category="Transfers", raw_hash="lp-stale")
+        btc_stale = Transaction(transaction_date=date(2025, 3, 7), account_id=self.acc_btc.id, amount=0.00650000, currency="BTC", merchant="Bitcoin On-Chain Deposit", category="Transfers", raw_hash="btc-stale")
+
+        # 5. Already-linked pair missing fee_amount (backfilled by repair_crypto_transfers_and_rates)
+        lp_backfill = Transaction(transaction_date=date(2025, 3, 8), account_id=self.acc_asb.id, amount=-5000.0, currency="NZD", merchant="Lightning Pay", category="Transfers", exchange_rate=163934.43, raw_hash="lp-bf")
+        btc_backfill = Transaction(transaction_date=date(2025, 3, 8), account_id=self.acc_btc.id, amount=0.03050000, currency="BTC", merchant="Bitcoin On-Chain Deposit", category="Transfers", exchange_rate=160000.0, raw_hash="btc-bf")
+
+        self.db.add_all([lp_neg, btc_neg, lp_noise, btc_noise, lp_explicit, btc_explicit, lp_stale, btc_stale, lp_backfill, btc_backfill])
+        self.db.commit()
+
+        lp_backfill.linked_transaction_id = btc_backfill.id
+        btc_backfill.linked_transaction_id = lp_backfill.id
+        self.db.commit()
+
+        with (
+            patch("app.services.fx_service.HttpFxRateFetcher._fetch_coinbase", return_value=None),
+            patch("app.services.fx_service.HttpFxRateFetcher._fetch_coingecko", return_value=None),
+        ):
+            reconcile_transfers(self.db)
+            repaired_first = repair_crypto_transfers_and_rates(self.db)
+            repaired_second = repair_crypto_transfers_and_rates(self.db)
+
+        for obj in [lp_neg, btc_neg, lp_noise, btc_noise, lp_explicit, btc_explicit, lp_stale, btc_stale, lp_backfill, btc_backfill]:
+            self.db.refresh(obj)
+
+        self.assertEqual(lp_neg.linked_transaction_id, btc_neg.id)
+        self.assertIsNone(lp_neg.fee_amount)
+        self.assertIsNone(btc_neg.fee_amount)
+
+        self.assertEqual(lp_noise.linked_transaction_id, btc_noise.id)
+        self.assertIsNone(lp_noise.fee_amount)
+
+        self.assertEqual(lp_explicit.linked_transaction_id, btc_explicit.id)
+        self.assertAlmostEqual(float(lp_explicit.fee_amount), 12.50, places=2)
+
+        self.assertEqual(lp_stale.linked_transaction_id, btc_stale.id)
+        self.assertIsNone(lp_stale.fee_amount)
+
+        # Backfilled 5000 - (0.0305 * 160000) = 120.00 NZD and idempotent on second pass
+        self.assertAlmostEqual(float(lp_backfill.fee_amount), 120.00, places=2)
+        self.assertAlmostEqual(float(lp_backfill.exchange_rate), round((5000.0 - 120.0) / 0.0305, 2), places=2)
+        self.assertGreater(repaired_first, 0)
+        self.assertEqual(repaired_second, 0)
 
 
 if __name__ == "__main__":
