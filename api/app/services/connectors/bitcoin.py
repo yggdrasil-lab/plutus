@@ -4,6 +4,7 @@
 # 1. IMPORTS & CONSTANTS
 # ============================================================================
 from dataclasses import dataclass
+from datetime import date, datetime, timezone
 import hashlib
 import hmac
 import re
@@ -21,6 +22,7 @@ from app.services.connectors import ConnectorConfigError, ConnectorUpstreamError
 from app.services.ingestion_service import (
     BankFeedGateway,
     ExternalAccountSpec,
+    NormalizedTx,
     ProviderAccountFeed,
     sync_provider_feeds,
 )
@@ -232,11 +234,84 @@ def build_external_id(source: WatchSource) -> str:
     return f"btc:{digest}"
 
 
+def normalize_bitcoin_transactions(
+    raw_txs: list[dict],
+    wallet_addresses: set[str],
+    *,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+) -> tuple[NormalizedTx, ...]:
+    """Deduplicate Esplora transactions by txid and compute net wallet BTC flows."""
+    unique_by_txid: dict[str, dict] = {}
+    for tx in raw_txs:
+        if not isinstance(tx, dict):
+            continue
+        txid = str(tx.get("txid") or "").strip()
+        if txid and txid not in unique_by_txid:
+            unique_by_txid[txid] = tx
+
+    normalized: list[NormalizedTx] = []
+    for txid, tx in unique_by_txid.items():
+        received_sats = sum(
+            int(vout.get("value", 0))
+            for vout in (tx.get("vout") or [])
+            if (vout.get("scriptpubkey_address") or "") in wallet_addresses
+        )
+        sent_sats = sum(
+            int((vin.get("prevout") or {}).get("value", 0))
+            for vin in (tx.get("vin") or [])
+            if ((vin.get("prevout") or {}).get("scriptpubkey_address") or "") in wallet_addresses
+        )
+        net_sats = received_sats - sent_sats
+        if net_sats == 0:
+            continue
+
+        block_time = (tx.get("status") or {}).get("block_time")
+        tx_date = (
+            datetime.fromtimestamp(int(block_time), tz=timezone.utc).date()
+            if block_time
+            else date.today()
+        )
+        if start_date and tx_date < start_date:
+            continue
+        if end_date and tx_date > end_date:
+            continue
+
+        amount_btc = round(net_sats / SATOSHIS_PER_BTC, 8)
+        fee_sats = int(tx.get("fee", 0) or 0)
+        fee_btc = (
+            round(fee_sats / SATOSHIS_PER_BTC, 8)
+            if (net_sats < 0 and fee_sats > 0)
+            else None
+        )
+        direction = "Deposit" if net_sats > 0 else "Withdrawal"
+        normalized.append(
+            NormalizedTx(
+                transaction_date=tx_date,
+                amount=amount_btc,
+                currency="BTC",
+                merchant=f"Bitcoin On-Chain {direction} ({txid[:12]})",
+                category="Transfers",
+                raw_description=(
+                    f"On-chain BTC {direction.lower()}: {abs(net_sats):,} sats "
+                    f"({abs(amount_btc):.8f} BTC) txid {txid}"
+                ),
+                fee_amount=fee_btc,
+                notes=f"btc:{txid}",
+                tags=("bitcoin", "on-chain"),
+            )
+        )
+
+    normalized.sort(key=lambda item: (item.transaction_date, item.notes or ""), reverse=True)
+    return tuple(normalized)
+
+
 def normalize_bitcoin_feed(
     source: WatchSource,
     total_satoshis: int,
     *,
     addresses_scanned: int,
+    transactions: tuple[NormalizedTx, ...] = (),
 ) -> ProviderAccountFeed:
     """Build an immutable ProviderAccountFeed for a watch-only Bitcoin wallet."""
     btc_balance = round(total_satoshis / SATOSHIS_PER_BTC, 8)
@@ -251,14 +326,14 @@ def normalize_bitcoin_feed(
         current_balance=btc_balance,
         snapshot_notes=f"Watch-only on-chain sync ({total_satoshis:,} sats across {addresses_scanned} addresses)",
     )
-    return ProviderAccountFeed(account=spec, transactions=())
+    return ProviderAccountFeed(account=spec, transactions=transactions)
 
 
 # ============================================================================
 # 3. GATEWAY / ADAPTER (All HTTP I/O)
 # ============================================================================
 class HttpBitcoinGateway:
-    """Read-only HTTP gateway querying mempool.space for locally derived addresses."""
+    """Read-only HTTP gateway querying Esplora for locally derived addresses."""
 
     def __init__(
         self,
@@ -275,22 +350,57 @@ class HttpBitcoinGateway:
         self._request_delay = max(0.0, request_delay)
         self._timeout = timeout
 
-    def fetch_feeds(self, **_kwargs) -> list[ProviderAccountFeed]:
-        """Derive addresses locally and fetch on-chain balances from Mempool.space."""
+    def fetch_feeds(
+        self,
+        *,
+        days: int = 30,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        **_kwargs,
+    ) -> list[ProviderAccountFeed]:
+        """Derive addresses locally and fetch on-chain balances and transactions."""
+        del days
         feeds: list[ProviderAccountFeed] = []
         with httpx.Client(timeout=self._timeout) as client:
             for source in self._sources:
                 if source.kind == "address":
                     stats = self._get_address_stats(client, source.value)
-                    sats, _ = sum_address_satoshis(stats)
-                    feeds.append(normalize_bitcoin_feed(source, sats, addresses_scanned=1))
+                    sats, has_history = sum_address_satoshis(stats)
+                    raw_txs = self._get_address_txs(client, source.value) if has_history else []
+                    txs = normalize_bitcoin_transactions(
+                        raw_txs,
+                        {source.value},
+                        start_date=start_date,
+                        end_date=end_date,
+                    )
+                    feeds.append(
+                        normalize_bitcoin_feed(
+                            source,
+                            sats,
+                            addresses_scanned=1,
+                            transactions=txs,
+                        )
+                    )
                 else:
-                    sats, scanned = self._scan_xpub(client, source.value)
-                    feeds.append(normalize_bitcoin_feed(source, sats, addresses_scanned=scanned))
+                    sats, scanned, active_addresses, raw_txs = self._scan_xpub(client, source.value)
+                    txs = normalize_bitcoin_transactions(
+                        raw_txs,
+                        active_addresses,
+                        start_date=start_date,
+                        end_date=end_date,
+                    )
+                    feeds.append(
+                        normalize_bitcoin_feed(
+                            source,
+                            sats,
+                            addresses_scanned=scanned,
+                            transactions=txs,
+                        )
+                    )
         return feeds
 
-    def _get_address_stats(self, client: httpx.Client, address: str) -> dict:
-        url = f"{self._base_url}/address/{address}"
+    def _get_json(self, client: httpx.Client, path: str):
+        url = f"{self._base_url}{path}"
         for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
             if self._request_delay > 0:
                 time.sleep(self._request_delay)
@@ -300,7 +410,7 @@ class HttpBitcoinGateway:
                 if attempt < MAX_RATE_LIMIT_RETRIES:
                     time.sleep(1.5 * (2**attempt))
                     continue
-                raise ConnectorUpstreamError(f"Esplora /address/{address} timed out") from exc
+                raise ConnectorUpstreamError(f"Esplora {path} timed out") from exc
             if resp.status_code == 429 and attempt < MAX_RATE_LIMIT_RETRIES:
                 retry_after = resp.headers.get("Retry-After")
                 wait_seconds = float(retry_after) if retry_after and retry_after.isdigit() else (1.5 * (2**attempt))
@@ -308,14 +418,41 @@ class HttpBitcoinGateway:
                 continue
             if resp.status_code >= 400:
                 raise ConnectorUpstreamError(
-                    f"Esplora /address/{address} failed ({resp.status_code}): {resp.text[:200]}"
+                    f"Esplora {path} failed ({resp.status_code}): {resp.text[:200]}"
                 )
             return resp.json()
-        raise ConnectorUpstreamError(f"Esplora /address/{address} failed after retries (429)")
+        raise ConnectorUpstreamError(f"Esplora {path} failed after retries (429)")
 
-    def _scan_xpub(self, client: httpx.Client, xpub: str) -> tuple[int, int]:
+    def _get_address_stats(self, client: httpx.Client, address: str) -> dict:
+        data = self._get_json(client, f"/address/{address}")
+        return data if isinstance(data, dict) else {}
+
+    def _get_address_txs(self, client: httpx.Client, address: str) -> list[dict]:
+        data = self._get_json(client, f"/address/{address}/txs")
+        if not isinstance(data, list):
+            return []
+        collected = list(data)
+        confirmed = [tx for tx in data if isinstance(tx, dict) and (tx.get("status") or {}).get("confirmed")]
+        for _ in range(9):
+            if len(confirmed) < 25:
+                break
+            last_txid = confirmed[-1].get("txid")
+            if not last_txid:
+                break
+            page = self._get_json(client, f"/address/{address}/txs/chain/{last_txid}")
+            if not isinstance(page, list) or not page:
+                break
+            collected.extend(page)
+            confirmed = [tx for tx in page if isinstance(tx, dict) and (tx.get("status") or {}).get("confirmed")]
+        return collected
+
+    def _scan_xpub(
+        self, client: httpx.Client, xpub: str
+    ) -> tuple[int, int, set[str], list[dict]]:
         total_sats = 0
         scanned = 0
+        active_addresses: set[str] = set()
+        raw_txs: list[dict] = []
         for chain in (0, 1):
             consecutive_unused = 0
             index = 0
@@ -327,10 +464,12 @@ class HttpBitcoinGateway:
                 scanned += 1
                 if has_history:
                     consecutive_unused = 0
+                    active_addresses.add(addr)
+                    raw_txs.extend(self._get_address_txs(client, addr))
                 else:
                     consecutive_unused += 1
                 index += 1
-        return total_sats, scanned
+        return total_sats, scanned, active_addresses, raw_txs
 
 
 # ============================================================================
@@ -339,10 +478,12 @@ class HttpBitcoinGateway:
 def sync_bitcoin(
     db: Session,
     *,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
     skip_llm: bool = True,
     gateway: Optional[BankFeedGateway] = None,
 ) -> SyncResult:
-    """Sync watch-only Bitcoin wallet balances and NZD AssetSnapshots."""
+    """Sync watch-only Bitcoin wallet balances, transactions, and NZD AssetSnapshots."""
     resolved_gateway = gateway or HttpBitcoinGateway(settings.btc_watch_sources)
-    feeds = resolved_gateway.fetch_feeds()
+    feeds = resolved_gateway.fetch_feeds(start_date=start_date, end_date=end_date)
     return sync_provider_feeds(db, provider="bitcoin", feeds=feeds, skip_llm=skip_llm)

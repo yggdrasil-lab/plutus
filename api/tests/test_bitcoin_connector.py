@@ -6,19 +6,20 @@ import sys
 import unittest
 from unittest.mock import MagicMock, patch
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.db import Base
-from app.models import Account, AssetSnapshot, ExchangeRate
+from app.models import Account, AssetSnapshot, ExchangeRate, Transaction
 from app.services.connectors import ConnectorConfigError
 from app.services.connectors.bitcoin import (
     HttpBitcoinGateway,
     derive_address_from_xpub,
     normalize_bitcoin_feed,
+    normalize_bitcoin_transactions,
     parse_watch_sources,
     sum_address_satoshis,
     sync_bitcoin,
@@ -126,12 +127,15 @@ class TestBitcoinConnector(unittest.TestCase):
             "chain_stats": {"funded_txo_sum": 50_000, "spent_txo_sum": 0, "tx_count": 1},
             "mempool_stats": {"funded_txo_sum": 0, "spent_txo_sum": 0, "tx_count": 0},
         }
+        resp_txs = MagicMock()
+        resp_txs.status_code = 200
+        resp_txs.json.return_value = []
         gateway = HttpBitcoinGateway(
             "Cold:bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu",
             request_delay=0.0,
         )
         with (
-            patch("httpx.Client.get", side_effect=[resp_429, resp_ok]),
+            patch("httpx.Client.get", side_effect=[resp_429, resp_ok, resp_txs]),
             patch("app.services.connectors.bitcoin.time.sleep") as mock_sleep,
         ):
             feeds = gateway.fetch_feeds()
@@ -165,10 +169,99 @@ class TestBitcoinConnector(unittest.TestCase):
         self.assertEqual(acc.account_type, "crypto")
         self.assertEqual(acc.tier, "growth")
         self.assertEqual(acc.currency, "BTC")
+        self.assertIsNotNone(acc.last_synced_at)
 
         snap = self.db.query(AssetSnapshot).filter(AssetSnapshot.account_id == acc.id).one()
         self.assertAlmostEqual(float(snap.balance), 0.25, places=8)
         self.assertAlmostEqual(float(snap.balance_nzd), 37500.0, places=2)
+
+    def test_bitcoin_onchain_transactions_normalized_and_synced_idempotently(self):
+        self.db.add(
+            ExchangeRate(
+                rate_date=date.today(),
+                from_currency="BTC",
+                to_currency="NZD",
+                rate=150000.0,
+                source="coingecko",
+            )
+        )
+        self.db.commit()
+
+        addr0 = derive_address_from_xpub(BIP84_TEST_ZPUB, 0, 0)
+        change0 = derive_address_from_xpub(BIP84_TEST_ZPUB, 1, 0)
+
+        deposit_tx = {
+            "txid": "a" * 64,
+            "fee": 400,
+            "status": {"confirmed": True, "block_time": 1731240000},  # 2024-11-10 UTC
+            "vin": [{"prevout": {"scriptpubkey_address": "bc1qexternal", "value": 2_000_400}}],
+            "vout": [{"scriptpubkey_address": addr0, "value": 2_000_000}],
+        }
+        spend_with_change_tx = {
+            "txid": "b" * 64,
+            "fee": 500,
+            "status": {"confirmed": True, "block_time": 1742040000},  # 2025-03-15 UTC
+            "vin": [{"prevout": {"scriptpubkey_address": addr0, "value": 2_000_000}}],
+            "vout": [
+                {"scriptpubkey_address": "bc1qmerchant", "value": 500_000},
+                {"scriptpubkey_address": change0, "value": 1_499_500},
+            ],
+        }
+
+        norm = normalize_bitcoin_transactions([deposit_tx, spend_with_change_tx, deposit_tx], {addr0, change0})
+        self.assertEqual(len(norm), 2)
+        self.assertEqual(norm[0].amount, -0.005005)
+        self.assertEqual(norm[0].fee_amount, 0.000005)
+        self.assertEqual(norm[0].category, "Transfers")
+        self.assertEqual(norm[0].notes, f"btc:{'b' * 64}")
+        self.assertEqual(norm[1].amount, 0.02)
+        self.assertEqual(norm[1].notes, f"btc:{'a' * 64}")
+
+        def fake_get(url):
+            resp = MagicMock()
+            resp.status_code = 200
+            if url.endswith(f"/address/{addr0}"):
+                resp.json.return_value = {
+                    "chain_stats": {"funded_txo_sum": 2_000_000, "spent_txo_sum": 2_000_000, "tx_count": 2},
+                    "mempool_stats": {"funded_txo_sum": 0, "spent_txo_sum": 0, "tx_count": 0},
+                }
+            elif url.endswith(f"/address/{addr0}/txs"):
+                resp.json.return_value = [deposit_tx, spend_with_change_tx]
+            elif url.endswith(f"/address/{change0}"):
+                resp.json.return_value = {
+                    "chain_stats": {"funded_txo_sum": 1_499_500, "spent_txo_sum": 0, "tx_count": 1},
+                    "mempool_stats": {"funded_txo_sum": 0, "spent_txo_sum": 0, "tx_count": 0},
+                }
+            elif url.endswith(f"/address/{change0}/txs"):
+                resp.json.return_value = [spend_with_change_tx]
+            else:
+                resp.json.return_value = {
+                    "chain_stats": {"funded_txo_sum": 0, "spent_txo_sum": 0, "tx_count": 0},
+                    "mempool_stats": {"funded_txo_sum": 0, "spent_txo_sum": 0, "tx_count": 0},
+                }
+            return resp
+
+        gateway = HttpBitcoinGateway(f"BitBox02:{BIP84_TEST_ZPUB}", gap_limit=1, request_delay=0.0)
+        with (
+            patch("httpx.Client.get", side_effect=lambda url, **_kw: fake_get(url)),
+            patch("app.services.fx_service.HttpFxRateFetcher._fetch_coingecko", return_value=None) as mock_cg,
+        ):
+            res1 = sync_bitcoin(self.db, gateway=gateway)
+            res2 = sync_bitcoin(self.db, gateway=gateway)
+
+        mock_cg.assert_not_called()
+        self.assertEqual(res1.transactions_created, 2)
+        self.assertEqual(res1.transactions_skipped, 0)
+        self.assertAlmostEqual(res1.accounts[0].balance, 0.014995, places=8)
+        self.assertEqual(res2.transactions_created, 0)
+        self.assertEqual(res2.transactions_skipped, 2)
+
+        txs = self.db.scalars(select(Transaction).order_by(Transaction.transaction_date.asc())).all()
+        self.assertEqual(len(txs), 2)
+        self.assertAlmostEqual(float(txs[0].amount), 0.02, places=8)
+        self.assertAlmostEqual(float(txs[1].amount), -0.005005, places=8)
+        self.assertEqual(txs[0].category, "Transfers")
+        self.assertAlmostEqual(float(txs[0].exchange_rate), 150000.0, places=2)
 
 
 if __name__ == "__main__":

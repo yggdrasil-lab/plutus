@@ -48,6 +48,7 @@ jobs:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_CHANNEL_WEALTH_ID: ${{ vars.DISCORD_CHANNEL_WEALTH_ID }}
           DISCORD_USER_ID: ${{ vars.DISCORD_USER_ID }}
+          PLUTUS_SYNC_INTERVAL_HOURS: ${{ vars.PLUTUS_SYNC_INTERVAL_HOURS || '6' }}
         run: |
           MISSING=""
           [ -z "$DOMAIN_NAME" ] && MISSING="$MISSING DOMAIN_NAME"
@@ -57,6 +58,7 @@ jobs:
           [ -z "$DISCORD_BOT_TOKEN" ] && MISSING="$MISSING DISCORD_BOT_TOKEN"
           [ -z "$DISCORD_CHANNEL_WEALTH_ID" ] && MISSING="$MISSING DISCORD_CHANNEL_WEALTH_ID"
           [ -z "$DISCORD_USER_ID" ] && MISSING="$MISSING DISCORD_USER_ID"
+          [ -z "$PLUTUS_SYNC_INTERVAL_HOURS" ] && MISSING="$MISSING PLUTUS_SYNC_INTERVAL_HOURS"
           if [ -n "$MISSING" ]; then
             echo "::error::Deployment halted: missing required configuration:$MISSING" >&2
             exit 1
@@ -77,6 +79,7 @@ jobs:
           PLUTUS_AKAHU_USER_TOKEN: ${{ secrets.AKAHU_USER_TOKEN }}
           PLUTUS_WISE_API_TOKEN: ${{ secrets.WISE_API_TOKEN }}
           PLUTUS_BTC_WATCH_SOURCES: ${{ secrets.PLUTUS_BTC_WATCH_SOURCES }}
+          PLUTUS_SYNC_INTERVAL_HOURS: ${{ vars.PLUTUS_SYNC_INTERVAL_HOURS || '6' }}
           IMAGE_TAG: plutus
         run: |
           curl -fsSL https://raw.githubusercontent.com/yggdrasil-lab/yggdrasil-os/main/deploy/deploy.sh -o /tmp/deploy.sh

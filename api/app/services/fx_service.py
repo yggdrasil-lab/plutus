@@ -59,6 +59,8 @@ class HttpFxRateFetcher:
         dst = to_currency.upper()
 
         if src in CRYPTO_COINGECKO_IDS:
+            if (date.today() - rate_date).days > 365:
+                return None
             return self._fetch_coingecko(rate_date=rate_date, coin_id=CRYPTO_COINGECKO_IDS[src], to_currency=dst)
 
         if self._wise_api_token:
@@ -126,7 +128,7 @@ class HttpFxRateFetcher:
                         val = (resp.json().get(coin_id) or {}).get(target_lower)
                         if val is not None and float(val) > 0:
                             return float(val), "coingecko"
-                else:
+                elif (date.today() - rate_date).days <= 365:
                     resp = client.get(
                         f"{COINGECKO_BASE_URL}/coins/{coin_id}/history",
                         params={"date": rate_date.strftime("%d-%m-%Y"), "localization": "false"},
