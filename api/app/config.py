@@ -1,6 +1,8 @@
 """Configuration management for Plutus API."""
 
-from pydantic import AliasChoices, Field
+from pathlib import Path
+
+from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -9,6 +11,7 @@ class Settings(BaseSettings):
 
     database_url: str = "postgresql+psycopg://plutus:plutus@localhost:5432/plutus"
     mcp_token: str = ""
+    mcp_token_file: str = ""
     webhook_secret: str = ""
     environment: str = "development"
     timezone: str = "Pacific/Auckland"
@@ -29,6 +32,10 @@ class Settings(BaseSettings):
     wise_api_token: str = Field(
         default="",
         validation_alias=AliasChoices("PLUTUS_WISE_API_TOKEN", "WISE_API_TOKEN"),
+    )
+    btc_watch_sources: str = Field(
+        default="",
+        validation_alias=AliasChoices("PLUTUS_BTC_WATCH_SOURCES", "PLUTUS_BTC_XPUB", "BTC_WATCH_SOURCES"),
     )
     sync_interval_hours: int = 6
     discord_bot_token: str | None = Field(
@@ -52,6 +59,15 @@ class Settings(BaseSettings):
         env_prefix="PLUTUS_",
         case_sensitive=False,
     )
+
+    @model_validator(mode="after")
+    def _load_secret_files(self) -> "Settings":
+        """Load Docker Swarm secret files when *_FILE paths are configured."""
+        if not self.mcp_token and self.mcp_token_file:
+            secret_path = Path(self.mcp_token_file)
+            if secret_path.is_file():
+                self.mcp_token = secret_path.read_text(encoding="utf-8").strip()
+        return self
 
 
 settings = Settings()
