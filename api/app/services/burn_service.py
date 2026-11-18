@@ -54,6 +54,25 @@ class CategoryBurnEstimate:
     recurring_weekly_burn: float
     average_weekly_burn: float
     suggested_monthly_limit: float
+    variable_percentage: float = 0.0
+    total_percentage: float = 0.0
+
+
+@dataclass(frozen=True)
+class RecurringCommitmentItem:
+    """Itemized active recurring commitment normalized to weekly and monthly NZD cost."""
+
+    transaction_id: int
+    merchant: str
+    category: str
+    recurrence: str
+    last_charged_date: date
+    original_amount: float
+    currency: str
+    amount_nzd: float
+    weekly_nzd: float
+    monthly_nzd: float
+    percentage_of_recurring: float
 
 
 def weekly_to_monthly(weekly_amount: float) -> float:
@@ -289,23 +308,61 @@ def calculate_category_average_burn(
         canonical_names.setdefault(key, cat_name)
         recurring_totals[key] = recurring_totals.get(key, 0.0) + weekly_nzd
 
-    estimates: list[CategoryBurnEstimate] = []
+    raw_rows: list[tuple[str, float, float, float]] = []
     for key, display_name in canonical_names.items():
         var_wk = round(variable_totals.get(key, 0.0) / float(lookback_weeks), 2)
         rec_wk = round(recurring_totals.get(key, 0.0), 2)
         avg_wk = round(var_wk + rec_wk, 2)
-        estimates.append(
-            CategoryBurnEstimate(
-                category=display_name,
-                variable_weekly_burn=var_wk,
-                recurring_weekly_burn=rec_wk,
-                average_weekly_burn=avg_wk,
-                suggested_monthly_limit=weekly_to_monthly(avg_wk),
-            )
+        raw_rows.append((display_name, var_wk, rec_wk, avg_wk))
+
+    total_var_wk = sum(item[1] for item in raw_rows)
+    total_avg_wk = sum(item[3] for item in raw_rows)
+
+    estimates = [
+        CategoryBurnEstimate(
+            category=display_name,
+            variable_weekly_burn=var_wk,
+            recurring_weekly_burn=rec_wk,
+            average_weekly_burn=avg_wk,
+            suggested_monthly_limit=weekly_to_monthly(avg_wk),
+            variable_percentage=round(var_wk / total_var_wk * 100.0, 1) if total_var_wk > 0 else 0.0,
+            total_percentage=round(avg_wk / total_avg_wk * 100.0, 1) if total_avg_wk > 0 else 0.0,
         )
+        for display_name, var_wk, rec_wk, avg_wk in raw_rows
+    ]
 
     estimates.sort(key=lambda item: (-item.average_weekly_burn, item.category))
     return estimates
+
+
+def list_recurring_commitment_details(
+    db: Session,
+    as_of: date,
+) -> list[RecurringCommitmentItem]:
+    """Return itemized active fixed recurring commitments with NZD weekly/monthly shares."""
+    raw_commitments = get_active_recurring_commitments(db, as_of)
+    total_rec_wk = sum(weekly_nzd for _, weekly_nzd in raw_commitments)
+
+    items = [
+        RecurringCommitmentItem(
+            transaction_id=tx.id,
+            merchant=(tx.merchant or "").strip() or "Unnamed commitment",
+            category=(tx.category or "General").strip() or "General",
+            recurrence=(tx.recurrence or "").strip().lower(),
+            last_charged_date=tx.transaction_date,
+            original_amount=round(abs(float(tx.amount)), 2),
+            currency=(tx.currency or "NZD").strip().upper(),
+            amount_nzd=round(to_nzd_amount(tx.amount, tx.currency, tx.exchange_rate), 2),
+            weekly_nzd=round(weekly_nzd, 2),
+            monthly_nzd=weekly_to_monthly(weekly_nzd),
+            percentage_of_recurring=(
+                round(weekly_nzd / total_rec_wk * 100.0, 1) if total_rec_wk > 0 else 0.0
+            ),
+        )
+        for tx, weekly_nzd in raw_commitments
+    ]
+    items.sort(key=lambda item: (-item.weekly_nzd, item.merchant.lower()))
+    return items
 
 
 def sync_budgets_from_average_burn(
