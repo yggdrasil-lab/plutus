@@ -6,6 +6,7 @@ from typing import Optional, Protocol
 
 import httpx
 from sqlalchemy import desc, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -174,7 +175,24 @@ def cache_exchange_rate(
         source=source[:30],
     )
     db.add(row)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        existing = db.scalar(
+            select(ExchangeRate).where(
+                ExchangeRate.rate_date == rate_date,
+                ExchangeRate.from_currency == src,
+                ExchangeRate.to_currency == dst,
+            )
+        )
+        if existing is None:
+            raise
+        existing.rate = rate
+        existing.source = source[:30]
+        db.commit()
+        db.refresh(existing)
+        return existing
     db.refresh(row)
     return row
 
