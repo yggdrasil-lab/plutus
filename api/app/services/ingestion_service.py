@@ -215,6 +215,8 @@ def ingest_normalized_transactions(
 ) -> tuple[int, int, list[Transaction]]:
     """Deduplicate, categorize, persist, and reconcile normalized transactions."""
     if not items:
+        account.last_synced_at = datetime.now(timezone.utc)
+        db.commit()
         return 0, 0, []
 
     active_rules = db.scalars(

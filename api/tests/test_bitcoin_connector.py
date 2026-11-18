@@ -169,6 +169,7 @@ class TestBitcoinConnector(unittest.TestCase):
         self.assertEqual(acc.account_type, "crypto")
         self.assertEqual(acc.tier, "growth")
         self.assertEqual(acc.currency, "BTC")
+        self.assertIsNotNone(acc.last_synced_at)
 
         snap = self.db.query(AssetSnapshot).filter(AssetSnapshot.account_id == acc.id).one()
         self.assertAlmostEqual(float(snap.balance), 0.25, places=8)
