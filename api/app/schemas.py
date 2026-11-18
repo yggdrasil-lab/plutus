@@ -237,6 +237,30 @@ class SpendingBreakdownResponse(BaseModel):
     over_budget_count: int = 0
 
 
+class TagCategoryBreakdownItem(BaseModel):
+    category: str
+    total_spend: float
+    transaction_count: int
+    percentage: float
+
+
+class TagSpendingSummaryItem(BaseModel):
+    tag: str
+    total_spend: float
+    transaction_count: int
+    first_date: date
+    last_date: date
+    categories: list[TagCategoryBreakdownItem] = Field(default_factory=list)
+
+
+class TagSpendingSummaryResponse(BaseModel):
+    period: str
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    total_tagged_spend: float
+    tags: list[TagSpendingSummaryItem] = Field(default_factory=list)
+
+
 class CategoryBurnEstimateRead(BaseModel):
     category: str
     variable_weekly_burn: float

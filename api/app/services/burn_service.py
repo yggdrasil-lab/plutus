@@ -301,6 +301,27 @@ def calculate_annual_category_spend_map(
     return totals
 
 
+def calculate_annual_category_count_map(
+    db: Session,
+    as_of: date,
+    categories: set[str],
+) -> dict[str, int]:
+    """Count trailing 365-day non-recurring expense rows per lowercase category for annual budgets."""
+    if not categories:
+        return {}
+    rows = _fetch_specific_category_expense_rows(
+        db,
+        as_of - timedelta(days=DAYS_PER_YEAR),
+        as_of,
+        categories,
+    )
+    counts: dict[str, int] = {}
+    for raw_cat, _, _, _ in rows:
+        key = (raw_cat or "General").strip().lower() or "general"
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
 def _sum_variable_spend_nzd(
     db: Session,
     start_date: date,
