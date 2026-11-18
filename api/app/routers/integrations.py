@@ -68,8 +68,12 @@ def verify_integration_token(
 
     valid_tokens = [t for t in (settings.mcp_token, settings.webhook_secret) if t]
     if not valid_tokens:
-        # Development mode without configured tokens
-        return True
+        if settings.environment == "development":
+            return True
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Integration token not configured",
+        )
 
     candidate = None
     if authorization and authorization.lower().startswith("bearer "):

@@ -15,7 +15,7 @@ services:
     labels:
       - "com.docker.compose.project=${STACK_NAME}"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U plutus -d plutus"]
+      test: [ "CMD-SHELL", "pg_isready -U plutus -d plutus" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -89,6 +89,12 @@ services:
         - "traefik.http.routers.plutus-integrations.entrypoints=websecure"
         - "traefik.http.routers.plutus-integrations.tls=true"
         - "traefik.http.routers.plutus-integrations.tls.certresolver=cloudflare"
+        - "traefik.http.routers.plutus-integrations.middlewares=plutus-strip-authentik"
+        - "traefik.http.middlewares.plutus-strip-authentik.headers.customrequestheaders.X-authentik-username="
+        - "traefik.http.middlewares.plutus-strip-authentik.headers.customrequestheaders.X-authentik-email="
+        - "traefik.http.middlewares.plutus-strip-authentik.headers.customrequestheaders.X-authentik-groups="
+        - "traefik.http.middlewares.plutus-strip-authentik.headers.customrequestheaders.X-authentik-name="
+        - "traefik.http.middlewares.plutus-strip-authentik.headers.customrequestheaders.X-authentik-uid="
         - "traefik.http.routers.plutus-integrations.service=plutus-api"
         # Machine-to-machine MCP endpoint for Hermes Agent and Antigravity
         - "traefik.http.routers.plutus-mcp.rule=Host(`plutus.${DOMAIN_NAME}`) && PathPrefix(`/mcp`)"
