@@ -442,8 +442,8 @@ class ReceiptItemBase(BaseModel):
     product_id: Optional[int] = None
     brand: Optional[str] = Field(default=None, max_length=100)
     quantity: float = Field(default=1.0, ge=0.01)
-    unit_price: float = Field(..., ge=0.0)
-    total_price: float = Field(..., ge=0.0)
+    unit_price: float = Field(...)
+    total_price: float = Field(...)
     category: str = Field(default="General", max_length=50)
     domain: Optional[str] = Field(default=None, max_length=50)
     product_type: Optional[str] = Field(default=None, max_length=50)

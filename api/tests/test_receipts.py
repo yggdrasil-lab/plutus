@@ -331,3 +331,33 @@ class TestReceiptsRouter(unittest.TestCase):
         del_res = self.client.delete(f"/receipts/{data['id']}")
         self.assertEqual(del_res.status_code, 204)
         self.assertEqual(self.client.get(f"/receipts/{data['id']}/image").status_code, 404)
+
+    def test_receipt_allows_negative_discount_line_items(self):
+        res = self.client.post(
+            "/receipts",
+            json={
+                "receipt_date": "2026-11-17",
+                "merchant": "Costco Wholesale",
+                "total_amount": 27.99,
+                "items": [
+                    {
+                        "item_name": "Coca Cola Zero 36P",
+                        "quantity": 1.0,
+                        "unit_price": 34.99,
+                        "total_price": 34.99,
+                    },
+                    {
+                        "item_name": "TPD Coca Cola No S",
+                        "quantity": 1.0,
+                        "unit_price": -7.00,
+                        "total_price": -7.00,
+                    },
+                ],
+            },
+        )
+        self.assertEqual(res.status_code, 201)
+        data = res.json()
+        self.assertEqual(len(data["items"]), 2)
+        self.assertEqual(data["items"][1]["total_price"], -7.0)
+        list_res = self.client.get("/receipts")
+        self.assertEqual(list_res.status_code, 200)
