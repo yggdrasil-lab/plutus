@@ -497,6 +497,10 @@ class ReceiptRead(ReceiptBase):
     id: int
     transaction_id: Optional[int] = None
     image_path: Optional[str] = None
+    image_mime_type: Optional[str] = None
+    image_filename: Optional[str] = None
+    has_image: bool = False
+    is_processed: bool = False
     raw_text: Optional[str] = None
     items: list[ReceiptItemRead] = []
     created_at: datetime
