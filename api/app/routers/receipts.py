@@ -16,6 +16,7 @@ from app.schemas import (
     ReceiptRead,
 )
 from app.services.receipt_service import (
+    apply_receipt_discounts_with_jev,
     classify_line_item,
     compress_receipt_image,
     compute_product_statistics,
@@ -128,8 +129,10 @@ def _apply_parsed_receipt_fields(receipt: Receipt, parsed: dict[str, Any], db: S
     receipt.items.clear()
     db.flush()
 
-    for it in parsed.get("items", []):
+    resolved_items = apply_receipt_discounts_with_jev(parsed.get("items", []))
+    for it in resolved_items:
         item_name = str(it.get("item_name") or "Item").strip()
+        total_price = float(it.get("total_price", 0.0) or 0.0)
         cat, dom, ptype, vol = classify_line_item(item_name)
         it_cat = it.get("category") or cat
         it_dom = it.get("domain") or dom
@@ -137,29 +140,33 @@ def _apply_parsed_receipt_fields(receipt: Receipt, parsed: dict[str, Any], db: S
         it_vol = it.get("volume_ml") or vol
         it_tags = it.get("tags") or extract_tags_for_line_item(item_name, it_dom, it_ptype)
 
-        prod = get_or_create_product(
-            db=db,
-            item_name=item_name,
-            brand=it.get("brand"),
-            category=it_cat,
-            domain=it_dom,
-            tags=it_tags,
-            volume_ml=it_vol,
-        )
+        prod_id: Optional[int] = None
+        if total_price >= 0:
+            prod = get_or_create_product(
+                db=db,
+                item_name=item_name,
+                brand=it.get("brand"),
+                category=it_cat,
+                domain=it_dom,
+                tags=it_tags,
+                volume_ml=it_vol,
+            )
+            prod_id = prod.id
 
         r_item = ReceiptItem(
             receipt_id=receipt.id,
-            product_id=prod.id,
+            product_id=prod_id,
             item_name=item_name,
             brand=it.get("brand"),
             quantity=float(it.get("quantity", 1.0) or 1.0),
             unit_price=float(it.get("unit_price", 0.0) or 0.0),
-            total_price=float(it.get("total_price", 0.0) or 0.0),
+            total_price=total_price,
             category=it_cat,
             domain=it_dom,
             product_type=it_ptype,
             tags=json.dumps(it_tags),
             volume_ml=it_vol,
+            notes=it.get("notes"),
         )
         db.add(r_item)
 
