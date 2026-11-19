@@ -361,3 +361,62 @@ class TestReceiptsRouter(unittest.TestCase):
         self.assertEqual(data["items"][1]["total_price"], -7.0)
         list_res = self.client.get("/receipts")
         self.assertEqual(list_res.status_code, 200)
+
+    def test_upload_folds_discount_into_target_item_via_jev(self):
+        raw_png = self._make_test_png_bytes(400, 400)
+        mock_parsed = {
+            "merchant": "Costco Wholesale",
+            "receipt_date": "2026-11-17",
+            "total_amount": 42.98,
+            "items": [
+                {
+                    "item_name": "Lamingtons 16 Pack",
+                    "quantity": 1.0,
+                    "unit_price": 14.99,
+                    "total_price": 14.99,
+                },
+                {
+                    "item_name": "Coca Cola Zero 36P",
+                    "quantity": 1.0,
+                    "unit_price": 34.99,
+                    "total_price": 34.99,
+                },
+                {
+                    "item_name": "TPD Coca Cola No S",
+                    "quantity": 1.0,
+                    "unit_price": -7.00,
+                    "total_price": -7.00,
+                },
+            ],
+        }
+
+        with (
+            patch("app.routers.receipts.parse_receipt_with_llm", return_value=mock_parsed),
+            patch("app.services.receipt_service.call_jev", return_value=('{"target_index": "1"}', 0.05)),
+        ):
+            res = self.client.post(
+                "/receipts/upload",
+                files={"file": ("costco.png", raw_png, "image/png")},
+            )
+
+        self.assertEqual(res.status_code, 201)
+        data = res.json()
+        self.assertEqual(len(data["items"]), 2)
+        coke = next(it for it in data["items"] if "Coca Cola" in it["item_name"])
+        self.assertEqual(coke["total_price"], 27.99)
+        self.assertEqual(coke["unit_price"], 27.99)
+        self.assertIn("TPD Coca Cola No S", coke["notes"])
+
+    def test_apply_receipt_discounts_heuristic_fallback_when_jev_offline(self):
+        from app.services.receipt_service import apply_receipt_discounts_with_jev
+
+        items = [
+            {"item_name": "CP Wonton Noodle", "quantity": 1.0, "unit_price": 29.99, "total_price": 29.99},
+            {"item_name": "Coca Cola Zero 36P", "quantity": 1.0, "unit_price": 34.99, "total_price": 34.99},
+            {"item_name": "TPD Coca Cola No S", "quantity": 1.0, "unit_price": -7.00, "total_price": -7.00},
+        ]
+        with patch("app.services.receipt_service.call_jev", return_value=(None, 0.0)):
+            resolved = apply_receipt_discounts_with_jev(items)
+
+        self.assertEqual(len(resolved), 2)
+        self.assertEqual(resolved[1]["total_price"], 27.99)

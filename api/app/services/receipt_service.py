@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.models import Product, Receipt, ReceiptItem, Transaction
 from app.schemas import PricePoint, ProductRead, ProductStatisticItem, ProductStatisticsResponse
+from app.services.jev_client import call_jev
 
 logger = logging.getLogger(__name__)
 
@@ -496,6 +497,113 @@ def parse_receipt_with_llm(
     if not raw_text.strip():
         return None
     return parse_receipt_text_with_llm(raw_text)
+
+
+def _match_discount_target_heuristic(
+    discount_name: str,
+    positive_items: list[dict[str, Any]],
+) -> Optional[int]:
+    """Fallback token-overlap matcher when Jev is unavailable."""
+    stop = {"tpd", "discount", "off", "save", "savings", "promo", "coupon", "instant"}
+    d_tokens = {
+        tok
+        for tok in "".join(c if c.isalnum() else " " for c in discount_name.lower()).split()
+        if len(tok) >= 3 and tok not in stop
+    }
+    if not d_tokens:
+        return None
+
+    best_idx: Optional[int] = None
+    best_score = 0
+    for idx, item in enumerate(positive_items):
+        i_name = str(item.get("item_name", "")).lower()
+        i_tokens = {
+            tok
+            for tok in "".join(c if c.isalnum() else " " for c in i_name).split()
+            if len(tok) >= 3
+        }
+        overlap = len(d_tokens & i_tokens)
+        if overlap > best_score:
+            best_score = overlap
+            best_idx = idx
+    return best_idx if best_score > 0 else None
+
+
+def _match_discount_target_jev(
+    discount: dict[str, Any],
+    positive_items: list[dict[str, Any]],
+) -> Optional[int]:
+    """Use Jev System One to attribute a negative receipt discount line to its target item."""
+    choices = {str(i): str(it.get("item_name", "")) for i, it in enumerate(positive_items)}
+    choices["none"] = "General basket discount or no matching item"
+    schema = {
+        "questions": {
+            "target_index": {
+                "type": "choice",
+                "criteria": choices,
+            }
+        }
+    }
+    system_prompt = f"Match the receipt discount line to the purchased item it discounts:\n```json\n{json.dumps(schema)}\n```"
+    candidates_desc = ", ".join(
+        f"[{i}] {it.get('item_name')} (${float(it.get('total_price', 0.0)):.2f})"
+        for i, it in enumerate(positive_items)
+    )
+    user_content = (
+        f"Discount: {discount.get('item_name')} ({float(discount.get('total_price', 0.0)):.2f})\n"
+        f"Items: {candidates_desc}"
+    )
+
+    try:
+        content, _ = call_jev(system_prompt, user_content, response_format={"type": "json_object"})
+        if content:
+            parsed = json.loads(content)
+            raw_idx = str(parsed.get("target_index", "none")).strip()
+            if raw_idx != "none" and raw_idx.isdigit():
+                idx = int(raw_idx)
+                if 0 <= idx < len(positive_items):
+                    return idx
+            if raw_idx == "none":
+                return None
+    except Exception as exc:
+        logger.warning("Jev discount attribution failed (%s); using heuristic", exc)
+
+    return _match_discount_target_heuristic(str(discount.get("item_name", "")), positive_items)
+
+
+def apply_receipt_discounts_with_jev(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Fold negative discount/savings lines into their matching purchased line items via Jev."""
+    positive_items: list[dict[str, Any]] = []
+    discount_items: list[dict[str, Any]] = []
+
+    for raw in items:
+        copy = dict(raw)
+        if float(copy.get("total_price", 0.0) or 0.0) < 0:
+            discount_items.append(copy)
+        else:
+            positive_items.append(copy)
+
+    if not discount_items or not positive_items:
+        return items
+
+    unmatched_discounts: list[dict[str, Any]] = []
+    for disc in discount_items:
+        disc_total = float(disc.get("total_price", 0.0) or 0.0)
+        target_idx = _match_discount_target_jev(disc, positive_items)
+        if target_idx is not None:
+            target = positive_items[target_idx]
+            new_total = round(float(target.get("total_price", 0.0) or 0.0) + disc_total, 2)
+            if new_total >= 0:
+                qty = float(target.get("quantity", 1.0) or 1.0)
+                target["total_price"] = new_total
+                target["unit_price"] = round(new_total / qty, 2)
+                disc_note = f"Includes {disc_total:.2f} discount ({disc.get('item_name', 'Discount')})"
+                existing_note = str(target.get("notes") or "").strip()
+                target["notes"] = f"{existing_note}; {disc_note}" if existing_note else disc_note
+                continue
+        unmatched_discounts.append(disc)
+
+    return positive_items + unmatched_discounts
 
 
 def match_receipt_to_transaction(receipt: Receipt, db: Session) -> Optional[Transaction]:
