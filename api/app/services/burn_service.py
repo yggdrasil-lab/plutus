@@ -8,9 +8,10 @@ from datetime import date, timedelta
 from typing import Optional
 
 from sqlalchemy import desc, func, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
-from app.models import Account, AssetSnapshot, BudgetRule, Transaction
+from app.models import Account, AssetSnapshot, BudgetRule, Receipt, Transaction
+from app.services.category_taxonomy import get_parent_category
 from app.services.fx_service import FxRateFetcher, get_exchange_rate, to_nzd_amount
 from app.services.recurrence_service import get_active_recurring_commitments
 
@@ -59,6 +60,7 @@ class CategoryBurnEstimate:
     budget_period: str = "monthly"
     variable_percentage: float = 0.0
     total_percentage: float = 0.0
+    parent_category: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -226,58 +228,81 @@ def get_annual_budget_categories(db: Session) -> set[str]:
     return {cat for cat, period in get_active_budget_periods(db).items() if period == "annual"}
 
 
-def _fetch_variable_expense_rows(
+def expand_expense_transaction_by_receipt(tx: Transaction) -> list[tuple[str, float]]:
+    """Split a matched expense transaction into itemized receipt category buckets in NZD.
+
+    If no linked receipt items exist, returns the parent transaction's single
+    (category, nzd_amount) tuple. Totals are scaled and rounded so sum(buckets) == tx_nzd.
+    """
+    tx_cat = (tx.category or "General").strip() or "General"
+    tx_nzd = round(to_nzd_amount(abs(float(tx.amount)), tx.currency, tx.exchange_rate), 2)
+    receipt = getattr(tx, "receipt", None)
+    items = getattr(receipt, "items", None) if receipt is not None else None
+    if not items:
+        return [(tx_cat, tx_nzd)]
+
+    grouped: dict[str, float] = {}
+    canonical: dict[str, str] = {}
+    for it in items:
+        raw_cat = (it.category or tx_cat).strip() or tx_cat
+        key = raw_cat.lower()
+        canonical.setdefault(key, raw_cat)
+        grouped[key] = grouped.get(key, 0.0) + float(it.total_price)
+
+    positive_buckets = [(key, amt) for key, amt in grouped.items() if amt > 0]
+    items_sum = sum(amt for _, amt in positive_buckets)
+    if items_sum <= 0 or not positive_buckets:
+        return [(tx_cat, tx_nzd)]
+
+    scale = tx_nzd / items_sum
+    result: list[tuple[str, float]] = [
+        (canonical[key], round(amt * scale, 2)) for key, amt in positive_buckets
+    ]
+    delta = round(tx_nzd - sum(val for _, val in result), 2)
+    if delta != 0.0 and result:
+        max_idx = max(range(len(result)), key=lambda i: result[i][1])
+        cat_label, max_val = result[max_idx]
+        result[max_idx] = (cat_label, round(max_val + delta, 2))
+    return result
+
+
+def _fetch_expanded_variable_expenses(
     db: Session,
     start_date: date,
     end_date: date,
     *,
+    include_categories: set[str] | None = None,
     exclude_categories: set[str] | tuple[str, ...] = (),
-):
-    """Query non-recurring, non-transfer expense rows in [start_date, end_date]."""
-    excluded = tuple(
-        {c.lower() for c in TRANSFER_CATEGORIES}
-        | {c.strip().lower() for c in exclude_categories if c and c.strip()}
-    )
-    return db.execute(
-        select(
-            Transaction.category,
-            Transaction.amount,
-            Transaction.currency,
-            Transaction.exchange_rate,
-        ).where(
+) -> list[tuple[str, float]]:
+    """Query non-recurring, non-transfer expenses and expand matched receipts by item category."""
+    excluded_tx = tuple({c.lower() for c in TRANSFER_CATEGORIES})
+    txs = db.scalars(
+        select(Transaction)
+        .options(joinedload(Transaction.receipt).joinedload(Receipt.items))
+        .where(
             Transaction.transaction_date >= start_date,
             Transaction.transaction_date <= end_date,
             Transaction.amount < 0,
             Transaction.recurrence.is_(None),
-            func.lower(Transaction.category).not_in(excluded),
+            func.lower(Transaction.category).not_in(excluded_tx),
         )
-    ).all()
+    ).unique().all()
 
+    inc_lower = {c.strip().lower() for c in include_categories if c and c.strip()} if include_categories is not None else None
+    exc_lower = {c.lower() for c in TRANSFER_CATEGORIES} | {
+        c.strip().lower() for c in exclude_categories if c and c.strip()
+    }
 
-def _fetch_specific_category_expense_rows(
-    db: Session,
-    start_date: date,
-    end_date: date,
-    categories: set[str],
-):
-    """Query non-recurring expense rows matching any category in categories (lowercase)."""
-    normalized = tuple(sorted({c.strip().lower() for c in categories if c and c.strip()}))
-    if not normalized:
-        return []
-    return db.execute(
-        select(
-            Transaction.category,
-            Transaction.amount,
-            Transaction.currency,
-            Transaction.exchange_rate,
-        ).where(
-            Transaction.transaction_date >= start_date,
-            Transaction.transaction_date <= end_date,
-            Transaction.amount < 0,
-            Transaction.recurrence.is_(None),
-            func.lower(Transaction.category).in_(normalized),
-        )
-    ).all()
+    expanded: list[tuple[str, float]] = []
+    for tx in txs:
+        for cat_name, amt_nzd in expand_expense_transaction_by_receipt(tx):
+            key = cat_name.lower()
+            if key in exc_lower:
+                continue
+            if inc_lower is not None and key not in inc_lower:
+                continue
+            expanded.append((cat_name, amt_nzd))
+    return expanded
 
 
 def calculate_annual_category_spend_map(
@@ -288,16 +313,16 @@ def calculate_annual_category_spend_map(
     """Sum trailing 365-day NZD spend per lowercase category for annual-budget categories."""
     if not categories:
         return {}
-    rows = _fetch_specific_category_expense_rows(
+    rows = _fetch_expanded_variable_expenses(
         db,
         as_of - timedelta(days=DAYS_PER_YEAR),
         as_of,
-        categories,
+        include_categories=categories,
     )
     totals: dict[str, float] = {}
-    for raw_cat, amt, cur, fx in rows:
-        key = (raw_cat or "General").strip().lower() or "general"
-        totals[key] = totals.get(key, 0.0) + to_nzd_amount(amt, cur, fx)
+    for cat_name, amt_nzd in rows:
+        key = cat_name.lower()
+        totals[key] = totals.get(key, 0.0) + amt_nzd
     return totals
 
 
@@ -309,15 +334,15 @@ def calculate_annual_category_count_map(
     """Count trailing 365-day non-recurring expense rows per lowercase category for annual budgets."""
     if not categories:
         return {}
-    rows = _fetch_specific_category_expense_rows(
+    rows = _fetch_expanded_variable_expenses(
         db,
         as_of - timedelta(days=DAYS_PER_YEAR),
         as_of,
-        categories,
+        include_categories=categories,
     )
     counts: dict[str, int] = {}
-    for raw_cat, _, _, _ in rows:
-        key = (raw_cat or "General").strip().lower() or "general"
+    for cat_name, _ in rows:
+        key = cat_name.lower()
         counts[key] = counts.get(key, 0) + 1
     return counts
 
@@ -330,10 +355,10 @@ def _sum_variable_spend_nzd(
     exclude_categories: set[str] | tuple[str, ...] = (),
 ) -> float:
     """Sum NZD-normalized variable expenses in [start_date, end_date]."""
-    rows = _fetch_variable_expense_rows(
+    rows = _fetch_expanded_variable_expenses(
         db, start_date, end_date, exclude_categories=exclude_categories
     )
-    return sum(to_nzd_amount(amt, cur, fx) for _, amt, cur, fx in rows)
+    return sum(amt_nzd for _, amt_nzd in rows)
 
 
 def _get_active_weekly_budget(db: Session) -> float:
@@ -417,27 +442,25 @@ def calculate_category_average_burn(
     annual_cats = {k for k, period in rule_periods.items() if period == "annual"}
 
     lookback_start = as_of - timedelta(days=lookback_weeks * 7)
-    variable_rows = _fetch_variable_expense_rows(
+    variable_rows = _fetch_expanded_variable_expenses(
         db, lookback_start, as_of, exclude_categories=annual_cats
     )
 
     canonical_names: dict[str, str] = {}
     variable_totals: dict[str, float] = {}
-    for raw_cat, amt, cur, fx in variable_rows:
-        cat_name = (raw_cat or "General").strip() or "General"
+    for cat_name, amt_nzd in variable_rows:
         key = cat_name.lower()
         canonical_names.setdefault(key, cat_name)
-        variable_totals[key] = variable_totals.get(key, 0.0) + to_nzd_amount(amt, cur, fx)
+        variable_totals[key] = variable_totals.get(key, 0.0) + amt_nzd
 
-    annual_rows = _fetch_specific_category_expense_rows(
-        db, as_of - timedelta(days=DAYS_PER_YEAR), as_of, annual_cats
+    annual_rows = _fetch_expanded_variable_expenses(
+        db, as_of - timedelta(days=DAYS_PER_YEAR), as_of, include_categories=annual_cats
     )
     annual_totals: dict[str, float] = {}
-    for raw_cat, amt, cur, fx in annual_rows:
-        cat_name = (raw_cat or "General").strip() or "General"
+    for cat_name, amt_nzd in annual_rows:
         key = cat_name.lower()
         canonical_names.setdefault(key, cat_name)
-        annual_totals[key] = annual_totals.get(key, 0.0) + to_nzd_amount(amt, cur, fx)
+        annual_totals[key] = annual_totals.get(key, 0.0) + amt_nzd
 
     recurring_totals: dict[str, float] = {}
     for rec_tx, weekly_nzd in get_active_recurring_commitments(db, as_of):
@@ -462,6 +485,7 @@ def calculate_category_average_burn(
     estimates = [
         CategoryBurnEstimate(
             category=display_name,
+            parent_category=get_parent_category(display_name),
             variable_weekly_burn=var_wk,
             recurring_weekly_burn=rec_wk,
             average_weekly_burn=avg_wk,

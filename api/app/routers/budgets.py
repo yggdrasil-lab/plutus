@@ -5,10 +5,10 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.db import get_db
-from app.models import BudgetRule, Transaction
+from app.models import BudgetRule, Receipt, Transaction
 from app.schemas import (
     AverageBurnReportResponse,
     BudgetRuleCreate,
@@ -27,6 +27,7 @@ from app.services.burn_service import (
     calculate_annual_category_spend_map,
     calculate_category_average_burn,
     calculate_weekly_burn_summary,
+    expand_expense_transaction_by_receipt,
     list_recurring_commitment_details,
     monthly_to_weekly,
     sync_budgets_from_average_burn,
@@ -34,6 +35,7 @@ from app.services.burn_service import (
     weekly_to_annual,
     weekly_to_monthly,
 )
+from app.services.category_taxonomy import get_parent_category, get_root_category
 from app.services.period_service import resolve_period_dates
 from app.services.recurrence_service import get_active_recurring_commitments
 
@@ -94,6 +96,7 @@ def _build_category_report(
     rule: Optional[BudgetRule],
     period: Optional[str],
     *,
+    parent_category: Optional[str] = None,
     annual_cat_spend: Optional[float] = None,
     annual_cat_count: Optional[int] = None,
 ) -> CategorySpendingReport:
@@ -134,6 +137,7 @@ def _build_category_report(
 
     return CategorySpendingReport(
         category=category,
+        parent_category=parent_category,
         total_spend=display_spend,
         transaction_count=display_count,
         percentage=pct,
@@ -265,6 +269,7 @@ def get_average_burn_report(
         categories=[
             CategoryBurnEstimateRead(
                 category=item.category,
+                parent_category=item.parent_category,
                 variable_weekly_burn=item.variable_weekly_burn,
                 recurring_weekly_burn=item.recurring_weekly_burn,
                 average_weekly_burn=item.average_weekly_burn,
@@ -297,9 +302,16 @@ def get_spending_breakdown(
     ),
     start_date: Optional[date] = Query(default=None),
     end_date: Optional[date] = Query(default=None),
+    group_by: str = Query(
+        default="leaf",
+        description="'leaf' for granular subclasses or 'base' for base-class inheritance rollup",
+    ),
     db: Session = Depends(get_db),
 ):
     """Retrieve detailed category spending breakdown, budget utilization, and overspending warnings."""
+    if group_by not in ("leaf", "base"):
+        raise HTTPException(status_code=400, detail="group_by must be 'leaf' or 'base'")
+    rollup_base = group_by == "base"
     today = date.today()
     effective_period = None if (start_date is not None or end_date is not None) else period
     start_date, end_date = resolve_period_dates(effective_period, start_date, end_date, today=today)
@@ -319,12 +331,12 @@ def get_spending_breakdown(
     is_weekly_period = period in ("week", "last_week")
     is_monthly_period = period in ("month", "last_month")
 
-    stmt = select(Transaction)
+    stmt = select(Transaction).options(joinedload(Transaction.receipt).joinedload(Receipt.items))
     if start_date:
         stmt = stmt.where(Transaction.transaction_date >= start_date)
     if end_date:
         stmt = stmt.where(Transaction.transaction_date <= end_date)
-    txs = db.scalars(stmt).all()
+    txs = db.scalars(stmt).unique().all()
 
     total_spend = 0.0
     total_income = 0.0
@@ -344,14 +356,18 @@ def get_spending_breakdown(
 
         if amt < 0:
             rec = (tx.recurrence or "").strip().lower()
-            if is_weekly_period and (rec or cat_lower in annual_cats):
+            if is_weekly_period and rec:
                 continue
-            if is_monthly_period and (
-                rec in ("annual", "quarterly", "one-off") or cat_lower in annual_cats
-            ):
+            if is_monthly_period and rec in ("annual", "quarterly", "one-off"):
                 continue
-            total_spend += amt_nzd
-            _accumulate_category(category_spend_map, cat, amt_nzd)
+
+            for item_cat, item_nzd in expand_expense_transaction_by_receipt(tx):
+                effective_cat = get_root_category(item_cat) if rollup_base else item_cat
+                item_cat_lower = effective_cat.lower()
+                if (is_weekly_period or is_monthly_period) and item_cat_lower in annual_cats:
+                    continue
+                total_spend += item_nzd
+                _accumulate_category(category_spend_map, effective_cat, item_nzd)
         elif amt > 0:
             total_income += amt_nzd
 
@@ -361,6 +377,8 @@ def get_spending_breakdown(
             if is_monthly_period and rec not in ("annual", "quarterly"):
                 continue
             cat = rec_tx.category or "General"
+            if rollup_base:
+                cat = get_root_category(cat)
             amortized_nzd = weekly_to_monthly(weekly_nzd) if is_monthly_period else weekly_nzd
             total_spend += amortized_nzd
             _accumulate_category(category_spend_map, cat, amortized_nzd)
@@ -389,6 +407,7 @@ def get_spending_breakdown(
         reports.append(
             _build_category_report(
                 category=cat,
+                parent_category=None if rollup_base else get_parent_category(cat),
                 cat_spend=cat_spend,
                 count=data_dict["count"],
                 total_spend=total_spend,
@@ -405,6 +424,7 @@ def get_spending_breakdown(
             reports.append(
                 _build_category_report(
                     category=rule.category,
+                    parent_category=None if rollup_base else get_parent_category(rule.category),
                     cat_spend=0.0,
                     count=0,
                     total_spend=total_spend,

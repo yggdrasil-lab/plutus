@@ -65,9 +65,9 @@ class TestReceiptsRouter(unittest.TestCase):
         Base.metadata.drop_all(bind=engine)
 
     def test_classify_line_item_heuristics(self):
-        # 1. Skincare (Area 02-Skin)
+        # 1. Personal Care / Skincare (Area 02-Skin)
         cat, dom, ptype, vol = classify_line_item("Geek & Gorgeous C-Glow 15% Vitamin C 30ml")
-        self.assertEqual(cat, "Skincare")
+        self.assertEqual(cat, "Personal Care")
         self.assertEqual(dom, "02-skin")
         self.assertEqual(ptype, "vitamin_c_serum")
         self.assertEqual(vol, "30ml")
@@ -79,11 +79,11 @@ class TestReceiptsRouter(unittest.TestCase):
         self.assertEqual(ptype, "protein_powder")
         self.assertEqual(vol, "1kg")
 
-        # 3. Hardware (Area 20-Home)
+        # 3. Hardware / Tech (Area 20-Home)
         cat, dom, ptype, vol = classify_line_item("Anker USB-C Fast Charger Adapter")
-        self.assertEqual(cat, "Household")
+        self.assertEqual(cat, "Tech")
         self.assertEqual(dom, "20-home")
-        self.assertEqual(ptype, "appliance")
+        self.assertEqual(ptype, "tech")
 
     def test_create_receipt_and_auto_match(self):
         # Seed an existing credit card transaction
@@ -423,3 +423,123 @@ class TestReceiptsRouter(unittest.TestCase):
         self.assertEqual(resolved[1]["unit_price"], 34.99)
         self.assertEqual(resolved[1]["discount_amount"], 7.0)
         self.assertEqual(resolved[1]["total_price"], 27.99)
+
+    def test_matched_receipt_splits_transaction_categories_in_breakdown_and_burn(self):
+        today = date.today()
+        tx = Transaction(
+            transaction_date=today,
+            account_id=self.acc.id,
+            amount=-154.93,
+            currency="NZD",
+            merchant="Costco Wholesale",
+            category="General",
+            raw_hash="hash_costco_split",
+        )
+        self.db.add(tx)
+        self.db.commit()
+        self.db.refresh(tx)
+
+        res = self.client.post(
+            "/receipts",
+            json={
+                "receipt_date": today.isoformat(),
+                "merchant": "Costco Wholesale",
+                "total_amount": 154.93,
+                "items": [
+                    {
+                        "item_name": "CP Wonton Noodle",
+                        "quantity": 1.0,
+                        "unit_price": 29.99,
+                        "total_price": 29.99,
+                        "category": "Groceries",
+                    },
+                    {
+                        "item_name": "Lamingtons 16 Pack",
+                        "quantity": 1.0,
+                        "unit_price": 14.99,
+                        "total_price": 14.99,
+                        "category": "Groceries",
+                    },
+                    {
+                        "item_name": "Coca Cola Zero 36P",
+                        "quantity": 1.0,
+                        "unit_price": 34.99,
+                        "discount_amount": 7.0,
+                        "total_price": 27.99,
+                        "category": "Groceries",
+                    },
+                    {
+                        "item_name": "Body Glove Slide",
+                        "quantity": 1.0,
+                        "unit_price": 26.99,
+                        "total_price": 26.99,
+                        "category": "Clothing",
+                    },
+                    {
+                        "item_name": "Copper & Oak Pant",
+                        "quantity": 1.0,
+                        "unit_price": 37.98,
+                        "total_price": 37.98,
+                        "category": "Clothing",
+                    },
+                    {
+                        "item_name": "Puma Mens Liner 6P",
+                        "quantity": 1.0,
+                        "unit_price": 16.99,
+                        "total_price": 16.99,
+                        "category": "Clothing",
+                    },
+                ],
+            },
+        )
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(res.json()["status"], "matched")
+
+        breakdown = self.client.get("/budgets/breakdown?period=month")
+        self.assertEqual(breakdown.status_code, 200)
+        b_data = breakdown.json()
+        self.assertEqual(b_data["total_spend"], 154.93)
+        cats = {c["category"]: c["total_spend"] for c in b_data["categories"]}
+        self.assertEqual(cats.get("Groceries"), 72.97)
+        self.assertEqual(cats.get("Clothing"), 81.96)
+        self.assertNotIn("General", cats)
+
+        burn = self.client.get("/budgets/average-burn?lookback_weeks=4")
+        self.assertEqual(burn.status_code, 200)
+        burn_cats = {c["category"]: c["variable_weekly_burn"] for c in burn.json()["categories"]}
+        self.assertAlmostEqual(burn_cats["Groceries"], round(72.97 / 4.0, 2))
+        self.assertAlmostEqual(burn_cats["Clothing"], round(81.96 / 4.0, 2))
+        self.assertNotIn("General", burn_cats)
+
+        g_txs = self.client.get("/transactions?category=Groceries&period=month")
+        self.assertEqual(g_txs.status_code, 200)
+        self.assertEqual(len(g_txs.json()), 1)
+        self.assertEqual(g_txs.json()[0]["amount"], -72.97)
+        self.assertTrue(g_txs.json()[0]["is_receipt_split"])
+
+        c_txs = self.client.get("/transactions?category=Clothing&period=month")
+        self.assertEqual(c_txs.status_code, 200)
+        self.assertEqual(len(c_txs.json()), 1)
+        self.assertEqual(c_txs.json()[0]["amount"], -81.96)
+        self.assertTrue(c_txs.json()[0]["is_receipt_split"])
+
+        all_txs = self.client.get("/transactions?period=month")
+        self.assertEqual(all_txs.status_code, 200)
+        self.assertEqual(all_txs.json()[0]["amount"], -154.93)
+        self.assertFalse(all_txs.json()[0]["is_receipt_split"])
+
+        # OOP category inheritance: leaf reports expose parent_category, group_by=base rolls up
+        leaf_parents = {c["category"]: c["parent_category"] for c in b_data["categories"]}
+        self.assertEqual(leaf_parents.get("Groceries"), "Food")
+        self.assertEqual(leaf_parents.get("Clothing"), "Shopping")
+
+        base_breakdown = self.client.get("/budgets/breakdown?period=month&group_by=base")
+        self.assertEqual(base_breakdown.status_code, 200)
+        base_cats = {c["category"]: c["total_spend"] for c in base_breakdown.json()["categories"]}
+        self.assertEqual(base_cats.get("Food"), 72.97)
+        self.assertEqual(base_cats.get("Shopping"), 81.96)
+
+        base_txs = self.client.get("/transactions?category=Shopping&period=month&include_subclasses=true")
+        self.assertEqual(base_txs.status_code, 200)
+        self.assertEqual(len(base_txs.json()), 1)
+        self.assertEqual(base_txs.json()[0]["amount"], -81.96)

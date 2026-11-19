@@ -38,10 +38,16 @@ class StatementParseResult:
 # Common New Zealand expense categorizer patterns
 CATEGORIZATION_RULES: list[tuple[re.Pattern, str]] = [
     (re.compile(r"pak\s*n\s*save|countdown|woolworths|new\s*world|four\s*square|supermarket", re.I), "Groceries"),
+    (re.compile(r"lexus|keightley\s*motors|aa\s*battery|novus\s*(?:autoglass|westgate)|mechanic|tyre|wof\b|panelbeater", re.I), "Vehicle"),
     (re.compile(r"bp\b|z\s*energy|caltex|mobil\b|at\s*hop|auckland\s*transport|uber\b|parking|fuel", re.I), "Transport"),
     (re.compile(r"cafe|coffee|flat\s*white|mcdonald|burger|kfc|pizza|bakery|restaurant|sushi|subway|domino", re.I), "Food"),
     (re.compile(r"spark\b|one\s*nz|vodafone|2degrees|skinny\b|mercury|contact\s*energy|electric\s*kiwi|watercare|google\s*one|icloud|apple\s*bill|aws|digitalocean", re.I), "Utilities"),
+    (re.compile(r"barber|haircut|salon|sephora|mecca|skincare|grooming|botique|boutique", re.I), "Personal Care"),
     (re.compile(r"gym\b|fitness|physio|pharmacy|chemist|doctor|health|cityfitness|southern\s*cross", re.I), "Health"),
+    (re.compile(r"barkers|calvin\s*klein|hallenstein|cotton\s*on|uniqlo|nike\b|adidas", re.I), "Clothing"),
+    (re.compile(r"pb\s*tech|pb\s*technologies|insta360|jb\s*hi-?fi|noel\s*leeming|apple\s*store", re.I), "Tech"),
+    (re.compile(r"bunnings|mitre\s*10|briscoes|ikea", re.I), "Household"),
+    (re.compile(r"amazon|temu\b|kmart|the\s*warehouse", re.I), "Shopping"),
     (re.compile(r"steam\b|playstation|nintendo|netflix|spotify|cinema|event\s*cinemas|hoyts|disney|movie", re.I), "Leisure"),
     (re.compile(r"salary|wages|payroll|nzx\b|dividend|interest|ird\b|tax\s*refund|invoice|freelance|consulting|client\s*payment", re.I), "Income"),
     (re.compile(r"insurance|aa\s*insurance|iag\b|ami\b|state\s*insurance", re.I), "Insurance"),

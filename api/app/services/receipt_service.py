@@ -42,7 +42,7 @@ Respond STRICTLY with valid JSON following this exact schema:
       "quantity": 1.0,
       "unit_price": 0.00,
       "total_price": 0.00,
-      "category": "Skincare | Supplements | Groceries | Household | General",
+      "category": "Groceries | Food | Personal Care | Supplements | Clothing | Tech | Household | Health | Transport | Vehicle | Leisure | Shopping | General",
       "domain": "02-skin | 01-health | 20-home | general",
       "product_type": "serum | cleanser | sunscreen | protein | creatine | null",
       "volume_ml": "e.g. 30ml, 1kg, 60 caps or null"
@@ -59,10 +59,10 @@ def classify_line_item(item_name: str) -> tuple[str, Optional[str], Optional[str
     """
     name = item_name.lower()
 
-    # 1. Skincare (Area 02-Skin)
-    if any(k in name for k in ["serum", "vitamin c", "retinol", "cleanser", "moisturizer", "spf", "sunscreen", "hyaluronic", "niacinamide", "toner", "exfoliant", "adapalene"]):
+    # 1. Personal Care / Skincare (Area 02-Skin)
+    if any(k in name for k in ["serum", "vitamin c", "retinol", "cleanser", "moisturizer", "spf", "sunscreen", "hyaluronic", "niacinamide", "toner", "exfoliant", "adapalene", "haircut", "barber", "shampoo", "conditioner", "deodorant", "fragrance"]):
         domain = "02-skin"
-        category = "Skincare"
+        category = "Personal Care"
         if "vitamin c" in name or "ascorbic" in name:
             p_type = "vitamin_c_serum"
         elif "retinol" in name or "retinoid" in name:
@@ -104,11 +104,17 @@ def classify_line_item(item_name: str) -> tuple[str, Optional[str], Optional[str
         return category, domain, p_type, volume
 
     # 3. Home & Tech (Area 20-Home)
-    if any(k in name for k in ["cable", "charger", "adapter", "bulb", "filter", "vacuum", "pan", "appliance"]):
+    if any(k in name for k in ["cable", "charger", "adapter", "usb", "ssd", "camera", "mouse", "keyboard", "monitor"]):
+        return "Tech", "20-home", "tech", None
+    if any(k in name for k in ["bulb", "filter", "vacuum", "pan", "appliance", "detergent", "towel"]):
         return "Household", "20-home", "appliance", None
 
-    # 4. Groceries
-    if any(k in name for k in ["milk", "bread", "eggs", "apple", "banana", "chicken", "beef", "rice", "coffee", "oats"]):
+    # 4. Clothing & Footwear
+    if any(k in name for k in ["pant", "shirt", "hoodie", "liner", "sock", "slide", "shoe", "jacket", "short", "jeans", "sneaker"]):
+        return "Clothing", "general", "clothing", None
+
+    # 5. Groceries
+    if any(k in name for k in ["milk", "bread", "eggs", "apple", "banana", "chicken", "beef", "rice", "coffee", "oats", "noodle", "lamington", "coca cola", "cola"]):
         return "Groceries", "general", "grocery", None
 
     return "General", "general", None, None

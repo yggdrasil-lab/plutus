@@ -151,6 +151,7 @@ class TransactionRead(TransactionBase):
     account_name: Optional[str] = None
     raw_hash: str
     has_receipt: bool = False
+    is_receipt_split: bool = False
     created_at: datetime
 
     class Config:
@@ -213,6 +214,7 @@ class BudgetRuleRead(BudgetRuleBase):
 
 class CategorySpendingReport(BaseModel):
     category: str
+    parent_category: Optional[str] = None
     total_spend: float
     transaction_count: int
     percentage: float
@@ -263,6 +265,7 @@ class TagSpendingSummaryResponse(BaseModel):
 
 class CategoryBurnEstimateRead(BaseModel):
     category: str
+    parent_category: Optional[str] = None
     variable_weekly_burn: float
     recurring_weekly_burn: float
     average_weekly_burn: float

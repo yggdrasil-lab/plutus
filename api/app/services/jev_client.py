@@ -60,17 +60,25 @@ TRANSACTION_GATES_SCHEMA = {
             "type": "choice",
             "criteria": {
                 "Groceries": "Supermarkets, food stores, weekly pantry shopping (e.g. Pak n Save, Woolworths, Countdown, New World).",
-                "Transport": "Fuel, petrol, transit, parking, rideshare (e.g. BP, Z Energy, Mobil, Caltex, Auckland Transport, AT Hop, Uber).",
+                "Transport": "Fuel, petrol, public transit, parking, tolls, rideshare (e.g. BP, Z Energy, Mobil, Caltex, Auckland Transport, AT Hop, Uber).",
+                "Vehicle": "Car dealers, mechanics, servicing, repairs, tyres, batteries, auto glass, WOF (e.g. Lexus, Keightley Motors, AA Battery, Novus).",
                 "Food": "Dining out, cafes, takeaways, coffee, restaurants, fast food (e.g. McDonalds, cafes, sushi).",
                 "Utilities": "Electricity, mobile, internet, water, cloud or telco bills (e.g. Spark, 2degrees, Mercury, Watercare).",
-                "Health": "Medical, dental, pharmacy, gym, fitness, physio (e.g. chemist, doctor, gym memberships).",
+                "Health": "Medical, dental, pharmacy, gym, fitness, physio (e.g. doctor, dentist, physio, gym memberships).",
+                "Personal Care": "Skincare, cosmetics, haircuts, barber, salon, grooming, fragrance (e.g. Mecca, Sephora, barber, boutique salon).",
+                "Supplements": "Protein powder, creatine, vitamins, minerals, electrolytes, nutritional supplements.",
+                "Clothing": "Apparel, shoes, footwear, underwear, socks, fashion accessories (e.g. Barkers, Calvin Klein, Nike).",
+                "Tech": "Electronics, computers, cameras, gadgets, software, hardware (e.g. PB Tech, Insta360, Apple Store).",
+                "Household": "Home supplies, appliances, cleaning, cookware, lighting, hardware (e.g. Bunnings, Briscoes, Mitre 10).",
+                "Shopping": "Online marketplaces, department stores, general retail (e.g. Amazon, Temu, Kmart).",
                 "Leisure": "Entertainment, games, streaming, recreation (e.g. Steam, Netflix, Spotify, cinemas).",
-                "Housing": "Rent, mortgage, home insurance, council rates, hardware, maintenance.",
+                "Housing": "Rent, mortgage, home insurance, council rates, property maintenance.",
+                "Family": "Family support, allowances, gifts, personal remittances to relatives.",
                 "Transfers": "Money moving between own bank accounts, cards, or platforms (e.g. Wise, TransferWise, ASB to ANZ, Sharesies, InvestNow, savings transfers, internal bank transfers).",
                 "Insurance": "Insurance premiums (e.g. AA Insurance, Southern Cross, State, AMI).",
                 "Travel": "Airlines, flights, hotels, overseas accommodations (e.g. Air New Zealand, Qantas, Jetstar).",
                 "Income": "Salary, wages, consulting, dividends, interest earnings.",
-                "General": "Uncategorized retail, miscellaneous supplies, general expenditure.",
+                "General": "Miscellaneous uncategorized expenditure that does not fit any specific category.",
             },
         },
         "is_anomaly": {
@@ -168,9 +176,10 @@ def classify_transaction_jev_with_tags(
             parsed = json.loads(content)
             cat = parsed.get("category", "General")
             valid_cats = {
-                "Groceries", "Transport", "Food", "Utilities",
-                "Health", "Leisure", "Housing", "Income", "Transfers",
-                "Insurance", "Travel", "General"
+                "Groceries", "Transport", "Vehicle", "Food", "Utilities",
+                "Health", "Personal Care", "Supplements", "Clothing", "Tech",
+                "Household", "Shopping", "Leisure", "Housing", "Family",
+                "Income", "Transfers", "Insurance", "Travel", "General",
             }
             resolved_cat = cat if cat in valid_cats else "General"
             raw_anomaly = parsed.get("is_anomaly", "false")
