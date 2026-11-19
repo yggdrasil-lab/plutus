@@ -27,11 +27,11 @@ class TestStatementParser(unittest.TestCase):
         """Verify common New Zealand merchants map to expected categories."""
         self.assertEqual(auto_categorize("PAK N SAVE ALBANY"), "Groceries")
         self.assertEqual(auto_categorize("Countdown Auckland"), "Groceries")
-        self.assertEqual(auto_categorize("BP Connect Dairy Flat"), "Transport")
-        self.assertEqual(auto_categorize("AT HOP AUTOLOAD"), "Transport")
-        self.assertEqual(auto_categorize("Columbus Coffee"), "Food")
-        self.assertEqual(auto_categorize("McDonald's Britomart"), "Food")
-        self.assertEqual(auto_categorize("Spark New Zealand"), "Utilities")
+        self.assertEqual(auto_categorize("BP Connect Dairy Flat"), "Fuel")
+        self.assertEqual(auto_categorize("AT HOP AUTOLOAD"), "Transit")
+        self.assertEqual(auto_categorize("Columbus Coffee"), "Dining")
+        self.assertEqual(auto_categorize("McDonald's Britomart"), "Dining")
+        self.assertEqual(auto_categorize("Spark New Zealand"), "Bills & Telco")
         self.assertEqual(auto_categorize("Random Corner Dairy"), "General")
 
     def test_generate_transaction_hash(self):
@@ -57,8 +57,8 @@ class TestStatementParser(unittest.TestCase):
         self.assertEqual(result.start_date, date(2026, 11, 1))
         self.assertEqual(result.end_date, date(2026, 11, 3))
         self.assertEqual(result.transactions[0].category, "Groceries")
-        self.assertEqual(result.transactions[1].category, "Transport")
-        self.assertEqual(result.transactions[2].category, "Food")
+        self.assertEqual(result.transactions[1].category, "Fuel")
+        self.assertEqual(result.transactions[2].category, "Dining")
 
     def test_parse_csv_statement_with_balance(self):
         """Parse standard CSV statement lines with running balance column."""

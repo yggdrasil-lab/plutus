@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.models import CategorizationRule, Product, Receipt, ReceiptItem, Transaction
 from app.schemas import PricePoint, ProductRead, ProductStatisticItem, ProductStatisticsResponse
+from app.services.category_taxonomy import get_canonical_category_names
 from app.services.jev_client import call_jev, classify_transaction_jev_with_tags
 from app.services.rules_engine import match_receipt_item_rule, normalize_tags, parse_rule_tags
 
@@ -29,29 +30,33 @@ try:
 except ImportError:
     pass
 
-RECEIPT_PARSING_PROMPT = """You are a specialized receipt parsing engine.
+_RECEIPT_CATEGORY_OPTIONS = " | ".join(
+    get_canonical_category_names(include_system_non_expense=False)
+)
+
+RECEIPT_PARSING_PROMPT = f"""You are a specialized receipt parsing engine.
 Extract the merchant name, receipt date (YYYY-MM-DD), total amount, tax amount (if any), and itemized line items from this receipt.
 
 Respond STRICTLY with valid JSON following this exact schema:
-{
+{{
   "merchant": "Merchant Name",
   "receipt_date": "YYYY-MM-DD",
   "total_amount": 0.00,
   "tax_amount": 0.00,
   "items": [
-    {
+    {{
       "item_name": "Product Name",
       "brand": "Brand or null",
       "quantity": 1.0,
       "unit_price": 0.00,
       "total_price": 0.00,
-      "category": "Groceries | Food | Personal Care | Supplements | Clothing | Tech | Household | Health | Transport | Vehicle | Leisure | Shopping | General",
+      "category": "{_RECEIPT_CATEGORY_OPTIONS}",
       "domain": "02-skin | 01-health | 20-home | general",
       "product_type": "serum | cleanser | sunscreen | protein | creatine | null",
       "volume_ml": "e.g. 30ml, 1kg, 60 caps or null"
-    }
+    }}
   ]
-}"""
+}}"""
 
 
 def classify_line_item(item_name: str) -> tuple[str, Optional[str], Optional[str], Optional[str]]:
@@ -106,17 +111,21 @@ def classify_line_item(item_name: str) -> tuple[str, Optional[str], Optional[str
                 break
         return category, domain, p_type, volume
 
-    # 3. Home & Tech (Area 20-Home)
-    if any(k in name for k in ["cable", "charger", "adapter", "usb", "ssd", "camera", "mouse", "keyboard", "monitor"]):
-        return "Tech", "20-home", "tech", None
-    if any(k in name for k in ["bulb", "filter", "vacuum", "pan", "appliance", "detergent", "towel"]):
-        return "Household", "20-home", "appliance", None
-
-    # 4. Clothing & Footwear
+    # 3. Clothing & Footwear (checked before Household so "pant" never collides with cookware "pan")
     if any(k in name for k in ["pant", "shirt", "hoodie", "liner", "sock", "slide", "shoe", "jacket", "short", "jeans", "sneaker"]):
         return "Clothing", "general", "clothing", None
 
-    # 5. Groceries
+    # 4. Home & Tech (Area 20-Home)
+    if any(k in name for k in ["cable", "charger", "adapter", "usb", "ssd", "camera", "mouse", "keyboard", "monitor"]):
+        return "Tech", "20-home", "tech", None
+    if any(k in name for k in ["bulb", "filter", "vacuum", "appliance", "detergent", "towel"]) or re.search(
+        r"\b(?:pan|pans|frypan|saucepan)\b", name
+    ):
+        return "Household", "20-home", "appliance", None
+
+    # 5. Alcohol & Groceries
+    if re.search(r"\b(?:wine|beer|whisky|whiskey|vodka|gin|cider|champagne|liquor)\b", name):
+        return "Alcohol", "general", "alcohol", None
     if any(k in name for k in ["milk", "bread", "eggs", "apple", "banana", "chicken", "beef", "rice", "coffee", "oats", "noodle", "lamington", "coca cola", "cola"]):
         return "Groceries", "general", "grocery", None
 

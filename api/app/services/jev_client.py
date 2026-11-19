@@ -59,25 +59,38 @@ TRANSACTION_GATES_SCHEMA = {
         "category": {
             "type": "choice",
             "criteria": {
-                "Groceries": "Supermarkets, food stores, weekly pantry shopping (e.g. Pak n Save, Woolworths, Countdown, New World).",
-                "Transport": "Fuel, petrol, public transit, parking, tolls, rideshare (e.g. BP, Z Energy, Mobil, Caltex, Auckland Transport, AT Hop, Uber).",
-                "Vehicle": "Car dealers, mechanics, servicing, repairs, tyres, batteries, auto glass, WOF (e.g. Lexus, Keightley Motors, AA Battery, Novus).",
-                "Food": "Dining out, cafes, takeaways, coffee, restaurants, fast food (e.g. McDonalds, cafes, sushi).",
-                "Utilities": "Electricity, mobile, internet, water, cloud or telco bills (e.g. Spark, 2degrees, Mercury, Watercare).",
-                "Health": "Medical, dental, pharmacy, gym, fitness, physio (e.g. doctor, dentist, physio, gym memberships).",
-                "Personal Care": "Skincare, cosmetics, haircuts, barber, salon, grooming, fragrance (e.g. Mecca, Sephora, barber, boutique salon).",
+                "Food": "General food spending when dining vs groceries vs alcohol cannot be distinguished.",
+                "Dining": "Dining out, cafes, takeaways, coffee, restaurants, fast food, vending (e.g. McDonalds, cafes, sushi).",
+                "Groceries": "Supermarkets, food stores, weekly pantry shopping (e.g. Pak n Save, Woolworths, Countdown, New World, Costco).",
+                "Alcohol": "Bottle shops, liquor stores, wineries, beer/wine/spirits purchases (e.g. Super Liquor, Liquorland).",
+                "Housing": "General housing costs when rent vs household supplies cannot be distinguished.",
+                "Rent": "Recurring residential rent or board payments.",
+                "Household": "Home supplies, appliances, furniture, cleaning, cookware, lighting, hardware (e.g. Bunnings, Briscoes, Mitre 10, IKEA).",
+                "Transport": "General transport when fuel vs transit vs vehicle maintenance cannot be distinguished.",
+                "Fuel": "Petrol, diesel, EV charging at service stations (e.g. BP fuel, Z Energy, Mobil, Caltex).",
+                "Transit": "Public transport, AT Hop, ferries, buses, rideshare, Uber, parking, tolls.",
+                "Vehicle": "Car dealers, mechanics, servicing, WOF, rego, tyres, batteries, auto glass, car rentals, traffic fines (e.g. Lexus, Keightley Motors, VTNZ, NZTA).",
+                "Health": "General health expenses when fitness vs medical vs personal care cannot be distinguished.",
+                "Fitness": "Gyms, swimming pools, sports clubs, badminton, workout memberships (e.g. CityFitness, Tepid Baths, NZBA).",
+                "Medical": "Doctors, dentists, clinics, physio, pharmacies, prescriptions (e.g. Chemist Warehouse, Bargain Chemist, Dental).",
+                "Personal Care": "Skincare, cosmetics, haircuts, barber, salon, grooming, fragrance (e.g. Sharing Shed, Mecca, Sephora).",
                 "Supplements": "Protein powder, creatine, vitamins, minerals, electrolytes, nutritional supplements.",
-                "Clothing": "Apparel, shoes, footwear, underwear, socks, fashion accessories (e.g. Barkers, Calvin Klein, Nike).",
-                "Tech": "Electronics, computers, cameras, gadgets, software, hardware (e.g. PB Tech, Insta360, Apple Store).",
-                "Household": "Home supplies, appliances, cleaning, cookware, lighting, hardware (e.g. Bunnings, Briscoes, Mitre 10).",
-                "Shopping": "Online marketplaces, department stores, general retail (e.g. Amazon, Temu, Kmart).",
-                "Leisure": "Entertainment, games, streaming, recreation (e.g. Steam, Netflix, Spotify, cinemas).",
-                "Housing": "Rent, mortgage, home insurance, council rates, property maintenance.",
+                "Shopping": "Online marketplaces, department stores, general retail (e.g. Amazon, Temu, Kmart, AliExpress).",
+                "Clothing": "Apparel, shoes, footwear, underwear, socks, fashion accessories (e.g. Barkers, Calvin Klein, Uniqlo, Nike).",
+                "Tech": "Electronics, computers, cameras, gadgets, hardware (e.g. PB Tech, Insta360, NuPhy, Apple Store).",
+                "Utilities": "General utilities when telco vs software/AI cannot be distinguished.",
+                "Bills & Telco": "Electricity, mobile, internet, broadband, water, gas bills (e.g. Skinny, Simba, Spark, 2degrees, Mercury, Watercare).",
+                "Software & AI": "Cloud storage, AI subscriptions, SaaS, VPNs, domains (e.g. Google One, iCloud, OpenAI, DeepSeek, Cloudflare).",
+                "Insurance": "Insurance premiums and claims (e.g. AA Insurance, Aioi Nissay Dowa, Southern Cross, AIA).",
+                "Leisure": "Entertainment, streaming, bars, movies, recreation, attractions (e.g. Netflix, Spotify, cinemas).",
+                "Gaming": "Video games and gaming platforms (e.g. Steam, PlayStation, Nintendo).",
+                "Travel": "Airlines, flights, hotels, overseas accommodations, travel visas (e.g. Air NZ, Singapore Airlines, Jetstar).",
                 "Family": "Family support, allowances, gifts, personal remittances to relatives.",
-                "Transfers": "Money moving between own bank accounts, cards, or platforms (e.g. Wise, TransferWise, ASB to ANZ, Sharesies, InvestNow, savings transfers, internal bank transfers).",
-                "Insurance": "Insurance premiums (e.g. AA Insurance, Southern Cross, State, AMI).",
-                "Travel": "Airlines, flights, hotels, overseas accommodations (e.g. Air New Zealand, Qantas, Jetstar).",
-                "Income": "Salary, wages, consulting, dividends, interest earnings.",
+                "Finance": "General financial administration.",
+                "Fees & Admin": "Bank fees, credit card annual fees, service charges, immigration/government fees.",
+                "Debt & Loans": "Loan repayments and credit line installment plans.",
+                "Transfers": "Money moving between own bank accounts, cards, or platforms (e.g. Wise, TransferWise, ASB to ANZ, Sharesies, InvestNow, internal bank transfers).",
+                "Income": "Salary, wages, consulting, dividends, interest earnings, cashback rewards.",
                 "General": "Miscellaneous uncategorized expenditure that does not fit any specific category.",
             },
         },
@@ -91,6 +104,10 @@ TRANSACTION_GATES_SCHEMA = {
         },
     }
 }
+
+VALID_JEV_CATEGORIES: frozenset[str] = frozenset(
+    TRANSACTION_GATES_SCHEMA["questions"]["category"]["criteria"].keys()
+)
 
 
 def call_jev(
@@ -160,6 +177,7 @@ def classify_transaction_jev_with_tags(
     amount: float,
     notes: str | None = None,
     existing_tags: list[str] | tuple[str, ...] | None = None,
+    extra_categories: list[str] | tuple[str, ...] | None = None,
 ) -> Tuple[str, bool, list[str]]:
     """Evaluates category, anomaly status, and granular tags for a transaction or receipt item via Jev."""
     if not merchant or not merchant.strip():
@@ -174,18 +192,16 @@ def classify_transaction_jev_with_tags(
         clean_existing = [str(t).strip().lower().lstrip("#") for t in existing_tags if str(t).strip()][:60]
         if clean_existing:
             user_content += f", Existing tags: {', '.join(clean_existing)}"
+    clean_extra = [str(c).strip() for c in (extra_categories or ()) if str(c).strip()]
+    if clean_extra:
+        user_content += f", Additional custom categories: {', '.join(clean_extra)}"
 
+    valid_cats = set(VALID_JEV_CATEGORIES) | set(clean_extra)
     try:
         content, _ = call_jev(system_prompt, user_content, response_format={"type": "json_object"})
         if content:
             parsed = json.loads(content)
             cat = parsed.get("category", "General")
-            valid_cats = {
-                "Groceries", "Transport", "Vehicle", "Food", "Utilities",
-                "Health", "Personal Care", "Supplements", "Clothing", "Tech",
-                "Household", "Shopping", "Leisure", "Housing", "Family",
-                "Income", "Transfers", "Insurance", "Travel", "General",
-            }
             resolved_cat = cat if cat in valid_cats else "General"
             raw_anomaly = parsed.get("is_anomaly", "false")
             is_anomaly = raw_anomaly in (True, "true", "True", 1)

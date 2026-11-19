@@ -108,6 +108,42 @@ class Transaction(Base):
     )
 
 
+class Category(Base):
+    """Hierarchical spending category with optional 52-week annual amortization."""
+
+    __tablename__ = "categories"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    name: Mapped[str] = mapped_column(String(50), unique=True, nullable=False, index=True)
+    parent_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("categories.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    is_system: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
+    )
+    amortize_period: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    sort_order: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=100, server_default="100"
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+    parent: Mapped[Optional["Category"]] = relationship(
+        "Category",
+        remote_side="Category.id",
+        back_populates="children",
+    )
+    children: Mapped[list["Category"]] = relationship(
+        "Category",
+        back_populates="parent",
+    )
+
+
 class BudgetRule(Base):
     """Spending targets per category."""
 
