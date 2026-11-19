@@ -263,6 +263,320 @@ class TestBudgetsRouter(unittest.TestCase):
         self.assertEqual(res_last_week.status_code, 200)
         self.assertIn("total_spend", res_last_week.json())
 
+    def test_monthly_amortized_reconciliation_off_month(self):
+        today = date.today()
+        first_this_month = date(today.year, today.month, 1)
+        sgd_acc = Account(
+            name="DBS Multiplier",
+            account_type="savings",
+            tier="cash",
+            institution="DBS Bank",
+            currency="SGD",
+        )
+        self.db.add(sgd_acc)
+        self.db.commit()
+        self.db.refresh(sgd_acc)
+
+        self.db.add_all(
+            [
+                Transaction(
+                    transaction_date=today,
+                    account_id=self.acc.id,
+                    amount=-1.99,
+                    currency="NZD",
+                    merchant="iCloud",
+                    category="Utilities",
+                    recurrence="monthly",
+                    raw_hash="util-icloud-curr",
+                ),
+                Transaction(
+                    transaction_date=first_this_month,
+                    account_id=self.acc.id,
+                    amount=-8.00,
+                    currency="NZD",
+                    merchant="SKINNY MOBIL",
+                    category="Utilities",
+                    recurrence="monthly",
+                    raw_hash="util-skinny-curr",
+                ),
+                Transaction(
+                    transaction_date=first_this_month - timedelta(days=45),
+                    account_id=self.acc.id,
+                    amount=-279.99,
+                    currency="NZD",
+                    merchant="Google One",
+                    category="Utilities",
+                    recurrence="annual",
+                    raw_hash="util-google-one-annual",
+                ),
+                Transaction(
+                    transaction_date=first_this_month - timedelta(days=35),
+                    account_id=sgd_acc.id,
+                    amount=-120.00,
+                    currency="SGD",
+                    exchange_rate=1.3694,
+                    merchant="ANNUAL FEE",
+                    category="Utilities",
+                    recurrence="annual",
+                    raw_hash="util-annual-fee-sgd",
+                ),
+            ]
+        )
+        self.db.commit()
+
+        b_res = self.client.get("/budgets/breakdown?period=month")
+        self.assertEqual(b_res.status_code, 200)
+        utilities = next(c for c in b_res.json()["categories"] if c["category"] == "Utilities")
+        self.assertAlmostEqual(utilities["total_spend"], 46.99, places=2)
+        self.assertEqual(utilities["transaction_count"], 4)
+        self.assertEqual(utilities["actual_transaction_count"], 2)
+        self.assertEqual(utilities["amortized_count"], 2)
+
+        # Default transactions endpoint stays strictly dated within current month
+        default_txs = self.client.get("/transactions?category=Utilities&period=month")
+        self.assertEqual(default_txs.status_code, 200)
+        self.assertEqual(len(default_txs.json()), 2)
+
+        # Reconciled inspection includes both dated transactions and amortized annual commitments
+        reconciled_res = self.client.get(
+            "/transactions?category=Utilities&period=month&include_amortized=true"
+        )
+        self.assertEqual(reconciled_res.status_code, 200)
+        items = reconciled_res.json()
+        self.assertEqual(len(items), 4)
+
+        actual = [tx for tx in items if not tx["is_amortized_commitment"]]
+        amortized = [tx for tx in items if tx["is_amortized_commitment"]]
+        self.assertEqual(len(actual), 2)
+        self.assertEqual(len(amortized), 2)
+        self.assertTrue(all(tx["amortized_cadence"] == "month" for tx in amortized))
+        self.assertTrue(all(not tx["excluded_from_period_budget"] for tx in items))
+
+        reconciled_total = sum(abs(tx["amount"]) for tx in actual) + sum(
+            tx["amortized_period_amount_nzd"] for tx in amortized
+        )
+        self.assertAlmostEqual(reconciled_total, utilities["total_spend"], places=2)
+
+    def test_monthly_amortized_deduplicates_in_month_annual_charge(self):
+        today = date.today()
+        first_this_month = date(today.year, today.month, 1)
+
+        self.db.add_all(
+            [
+                Transaction(
+                    transaction_date=today,
+                    account_id=self.acc.id,
+                    amount=-81.25,
+                    currency="NZD",
+                    merchant="Southern Cross",
+                    category="Insurance",
+                    recurrence="fortnightly",
+                    raw_hash="ins-sc-1",
+                ),
+                Transaction(
+                    transaction_date=first_this_month,
+                    account_id=self.acc.id,
+                    amount=-81.25,
+                    currency="NZD",
+                    merchant="Southern Cross",
+                    category="Insurance",
+                    recurrence="fortnightly",
+                    raw_hash="ins-sc-2",
+                ),
+                Transaction(
+                    transaction_date=first_this_month,
+                    account_id=self.acc.id,
+                    amount=-1786.72,
+                    currency="NZD",
+                    merchant="Aioi Nissay Dowa Insurance",
+                    category="Insurance",
+                    recurrence="annual",
+                    raw_hash="ins-aioi-annual",
+                ),
+            ]
+        )
+        self.db.commit()
+
+        b_res = self.client.get("/budgets/breakdown?period=month")
+        self.assertEqual(b_res.status_code, 200)
+        insurance = next(c for c in b_res.json()["categories"] if c["category"] == "Insurance")
+        self.assertAlmostEqual(insurance["total_spend"], 311.39, places=2)
+        self.assertEqual(insurance["transaction_count"], 3)
+        self.assertEqual(insurance["actual_transaction_count"], 2)
+        self.assertEqual(insurance["amortized_count"], 1)
+
+        tx_res = self.client.get(
+            "/transactions?category=Insurance&period=month&include_amortized=true"
+        )
+        self.assertEqual(tx_res.status_code, 200)
+        items = tx_res.json()
+        self.assertEqual(len(items), 3)
+        self.assertEqual(len({tx["id"] for tx in items}), 3)
+
+        aioi_rows = [tx for tx in items if tx["merchant"] == "Aioi Nissay Dowa Insurance"]
+        self.assertEqual(len(aioi_rows), 1)
+        self.assertTrue(aioi_rows[0]["is_amortized_commitment"])
+        self.assertAlmostEqual(aioi_rows[0]["amortized_period_amount_nzd"], 148.89, places=2)
+        self.assertEqual(aioi_rows[0]["amortized_cadence"], "month")
+
+    def test_weekly_amortized_reconciliation(self):
+        today = date.today()
+        self.db.add_all(
+            [
+                Transaction(
+                    transaction_date=today,
+                    account_id=self.acc.id,
+                    amount=-25.00,
+                    currency="NZD",
+                    merchant="Cafe Lunch",
+                    category="Food",
+                    recurrence=None,
+                    raw_hash="wk-food-var",
+                ),
+                Transaction(
+                    transaction_date=today - timedelta(days=10),
+                    account_id=self.acc.id,
+                    amount=-104.00,
+                    currency="NZD",
+                    merchant="Meal Prep Box",
+                    category="Food",
+                    recurrence="monthly",
+                    raw_hash="wk-food-monthly",
+                ),
+            ]
+        )
+        self.db.commit()
+
+        b_res = self.client.get("/budgets/breakdown?period=week")
+        self.assertEqual(b_res.status_code, 200)
+        food = next(c for c in b_res.json()["categories"] if c["category"] == "Food")
+        self.assertAlmostEqual(food["total_spend"], 49.00, places=2)
+        self.assertEqual(food["transaction_count"], 2)
+        self.assertEqual(food["actual_transaction_count"], 1)
+        self.assertEqual(food["amortized_count"], 1)
+
+        tx_res = self.client.get("/transactions?category=Food&period=week&include_amortized=true")
+        self.assertEqual(tx_res.status_code, 200)
+        items = tx_res.json()
+        self.assertEqual(len(items), 2)
+        amortized = [tx for tx in items if tx["is_amortized_commitment"]]
+        self.assertEqual(len(amortized), 1)
+        self.assertEqual(amortized[0]["amortized_cadence"], "week")
+        self.assertAlmostEqual(amortized[0]["amortized_period_amount_nzd"], 24.00, places=2)
+
+    def test_excluded_one_off_and_positive_refund_flagged(self):
+        today = date.today()
+        self.db.add_all(
+            [
+                Transaction(
+                    transaction_date=today,
+                    account_id=self.acc.id,
+                    amount=-50.00,
+                    currency="NZD",
+                    merchant="USB Cable",
+                    category="Tech",
+                    recurrence=None,
+                    raw_hash="tech-var",
+                ),
+                Transaction(
+                    transaction_date=today,
+                    account_id=self.acc.id,
+                    amount=-1200.00,
+                    currency="NZD",
+                    merchant="Workstation Monitor",
+                    category="Tech",
+                    recurrence="one-off",
+                    raw_hash="tech-oneoff",
+                ),
+                Transaction(
+                    transaction_date=today,
+                    account_id=self.acc.id,
+                    amount=15.00,
+                    currency="NZD",
+                    merchant="Cable Refund",
+                    category="Tech",
+                    recurrence=None,
+                    raw_hash="tech-refund",
+                ),
+            ]
+        )
+        self.db.commit()
+
+        b_res = self.client.get("/budgets/breakdown?period=month")
+        self.assertEqual(b_res.status_code, 200)
+        tech = next(c for c in b_res.json()["categories"] if c["category"] == "Tech")
+        self.assertAlmostEqual(tech["total_spend"], 50.00, places=2)
+        self.assertEqual(tech["transaction_count"], 1)
+        self.assertEqual(tech["actual_transaction_count"], 1)
+        self.assertEqual(tech["amortized_count"], 0)
+
+        tx_res = self.client.get("/transactions?category=Tech&period=month&include_amortized=true")
+        self.assertEqual(tx_res.status_code, 200)
+        by_merchant = {tx["merchant"]: tx for tx in tx_res.json()}
+        self.assertEqual(len(by_merchant), 3)
+        self.assertFalse(by_merchant["USB Cable"]["excluded_from_period_budget"])
+        self.assertTrue(by_merchant["Workstation Monitor"]["excluded_from_period_budget"])
+        self.assertTrue(by_merchant["Cable Refund"]["excluded_from_period_budget"])
+
+    def test_base_class_amortized_rollup_and_custom_range(self):
+        today = date.today()
+        first_this_month = date(today.year, today.month, 1)
+        self.db.add_all(
+            [
+                Transaction(
+                    transaction_date=today,
+                    account_id=self.acc.id,
+                    amount=-20.00,
+                    currency="NZD",
+                    merchant="AT Hop",
+                    category="Transport",
+                    recurrence=None,
+                    raw_hash="tr-hop",
+                ),
+                Transaction(
+                    transaction_date=first_this_month - timedelta(days=40),
+                    account_id=self.acc.id,
+                    amount=-520.00,
+                    currency="NZD",
+                    merchant="AA Registration",
+                    category="Vehicle",
+                    recurrence="annual",
+                    raw_hash="tr-veh-annual",
+                ),
+            ]
+        )
+        self.db.commit()
+
+        b_res = self.client.get("/budgets/breakdown?period=month&group_by=base")
+        self.assertEqual(b_res.status_code, 200)
+        transport = next(c for c in b_res.json()["categories"] if c["category"] == "Transport")
+        self.assertAlmostEqual(transport["total_spend"], 63.33, places=2)
+        self.assertEqual(transport["transaction_count"], 2)
+        self.assertEqual(transport["actual_transaction_count"], 1)
+        self.assertEqual(transport["amortized_count"], 1)
+
+        tx_res = self.client.get(
+            "/transactions?category=Transport&period=month&include_subclasses=true&include_amortized=true"
+        )
+        self.assertEqual(tx_res.status_code, 200)
+        items = tx_res.json()
+        self.assertEqual(len(items), 2)
+        amortized = [tx for tx in items if tx["is_amortized_commitment"]]
+        self.assertEqual(len(amortized), 1)
+        self.assertEqual(amortized[0]["merchant"], "AA Registration")
+        self.assertAlmostEqual(amortized[0]["amortized_period_amount_nzd"], 43.33, places=2)
+
+        custom_res = self.client.get(
+            f"/budgets/breakdown?start_date={first_this_month.isoformat()}&end_date={today.isoformat()}&group_by=base"
+        )
+        self.assertEqual(custom_res.status_code, 200)
+        custom_transport = next(
+            c for c in custom_res.json()["categories"] if c["category"] == "Transport"
+        )
+        self.assertAlmostEqual(custom_transport["total_spend"], 20.00, places=2)
+        self.assertEqual(custom_transport["transaction_count"], 1)
+        self.assertEqual(custom_transport["amortized_count"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -37,7 +37,11 @@ from app.services.burn_service import (
 )
 from app.services.category_taxonomy import get_parent_category, get_root_category
 from app.services.period_service import resolve_period_dates
-from app.services.recurrence_service import get_active_recurring_commitments
+from app.services.recurrence_service import (
+    get_active_recurring_commitments,
+    get_period_amortized_recurrences,
+    is_recurrence_excluded_from_period,
+)
 
 router = APIRouter(prefix="/budgets", tags=["Budgets & Spending Awareness"])
 
@@ -79,12 +83,23 @@ def _accumulate_category(
     amount_nzd: float,
     *,
     is_transfer: bool = False,
+    is_amortized: bool = False,
 ) -> None:
     """Add an NZD amount and transaction count to a category accumulator."""
     if category not in category_map:
-        category_map[category] = {"spend": 0.0, "count": 0, "is_transfer": is_transfer}
+        category_map[category] = {
+            "spend": 0.0,
+            "count": 0,
+            "actual_count": 0,
+            "amortized_count": 0,
+            "is_transfer": is_transfer,
+        }
     category_map[category]["spend"] += amount_nzd
     category_map[category]["count"] += 1
+    if is_amortized:
+        category_map[category]["amortized_count"] += 1
+    else:
+        category_map[category]["actual_count"] += 1
 
 
 def _build_category_report(
@@ -99,6 +114,8 @@ def _build_category_report(
     parent_category: Optional[str] = None,
     annual_cat_spend: Optional[float] = None,
     annual_cat_count: Optional[int] = None,
+    actual_count: int = 0,
+    amortized_count: int = 0,
 ) -> CategorySpendingReport:
     """Build one CategorySpendingReport with budget utilization and warning level."""
     rule_period = (rule.budget_period or "monthly").strip().lower() if rule else "monthly"
@@ -113,6 +130,8 @@ def _build_category_report(
         if (is_annual_rule and annual_cat_count is not None)
         else count
     )
+    display_actual_count = display_count if is_annual_rule else actual_count
+    display_amortized_count = 0 if is_annual_rule else amortized_count
 
     pct = round((cat_spend / total_spend * 100), 1) if (total_spend > 0 and not is_tx_transfer) else 0.0
     budget_limit: Optional[float] = None
@@ -140,6 +159,8 @@ def _build_category_report(
         parent_category=parent_category,
         total_spend=display_spend,
         transaction_count=display_count,
+        actual_transaction_count=display_actual_count,
+        amortized_count=display_amortized_count,
         percentage=pct,
         budget_limit=budget_limit,
         percent_used=percent_used,
@@ -328,8 +349,9 @@ def get_spending_breakdown(
     }
     annual_spend_map = calculate_annual_category_spend_map(db, ref_date, annual_cats)
     annual_count_map = calculate_annual_category_count_map(db, ref_date, annual_cats)
-    is_weekly_period = period in ("week", "last_week")
-    is_monthly_period = period in ("month", "last_month")
+    is_weekly_period = effective_period in ("week", "last_week")
+    is_monthly_period = effective_period in ("month", "last_month")
+    amortized_recurrences = get_period_amortized_recurrences(effective_period)
 
     stmt = select(Transaction).options(joinedload(Transaction.receipt).joinedload(Receipt.items))
     if start_date:
@@ -355,10 +377,7 @@ def get_spending_breakdown(
             continue
 
         if amt < 0:
-            rec = (tx.recurrence or "").strip().lower()
-            if is_weekly_period and rec:
-                continue
-            if is_monthly_period and rec in ("annual", "quarterly", "one-off"):
+            if is_recurrence_excluded_from_period(effective_period, tx.recurrence):
                 continue
 
             for item_cat, item_nzd in expand_expense_transaction_by_receipt(tx):
@@ -371,17 +390,17 @@ def get_spending_breakdown(
         elif amt > 0:
             total_income += amt_nzd
 
-    if is_weekly_period or is_monthly_period:
+    if amortized_recurrences:
         for rec_tx, weekly_nzd in get_active_recurring_commitments(db, ref_date):
             rec = (rec_tx.recurrence or "").strip().lower()
-            if is_monthly_period and rec not in ("annual", "quarterly"):
+            if rec not in amortized_recurrences:
                 continue
             cat = rec_tx.category or "General"
             if rollup_base:
                 cat = get_root_category(cat)
             amortized_nzd = weekly_to_monthly(weekly_nzd) if is_monthly_period else weekly_nzd
             total_spend += amortized_nzd
-            _accumulate_category(category_spend_map, cat, amortized_nzd)
+            _accumulate_category(category_spend_map, cat, amortized_nzd, is_amortized=True)
         divisor = MONTHS_PER_YEAR if is_monthly_period else WEEKS_PER_YEAR
         for cat_lower in annual_cats:
             annual_total_nzd = annual_spend_map.get(cat_lower, 0.0)
@@ -416,6 +435,8 @@ def get_spending_breakdown(
                 period=period,
                 annual_cat_spend=annual_spend_map.get(cat_lower),
                 annual_cat_count=annual_count_map.get(cat_lower, 0),
+                actual_count=data_dict["actual_count"],
+                amortized_count=data_dict["amortized_count"],
             )
         )
 
@@ -433,6 +454,8 @@ def get_spending_breakdown(
                     period=period,
                     annual_cat_spend=annual_spend_map.get(cat_lower, 0.0),
                     annual_cat_count=annual_count_map.get(cat_lower, 0),
+                    actual_count=0,
+                    amortized_count=0,
                 )
             )
 

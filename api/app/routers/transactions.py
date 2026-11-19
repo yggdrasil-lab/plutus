@@ -22,10 +22,16 @@ from app.services.burn_service import (
     TRANSFER_CATEGORIES,
     expand_expense_lines_by_receipt,
     to_nzd_amount,
+    weekly_to_monthly,
 )
 from app.services.category_taxonomy import get_root_category
 from app.services.period_service import resolve_period_dates
 from app.services.receipt_service import reconcile_unlinked_receipts
+from app.services.recurrence_service import (
+    get_active_recurring_commitments,
+    get_period_amortized_recurrences,
+    is_recurrence_excluded_from_period,
+)
 from app.services.rules_engine import normalize_tags, parse_rule_tags
 from app.services.statement_parser import generate_transaction_hash
 from app.services.transfer_service import reconcile_transfers
@@ -120,12 +126,70 @@ def _matches_receipt_transaction_filter(
     )
 
 
+def _collect_amortized_commitments(
+    db: Session,
+    *,
+    ref_date: date,
+    effective_period: Optional[str],
+    target_cat: str,
+    include_subclasses: bool,
+    account_id: Optional[int],
+    amortized_recurrences: frozenset[str],
+) -> list[TransactionRead]:
+    """Build TransactionRead entries for active recurring commitments amortized into a period."""
+    is_monthly = effective_period in ("month", "last_month")
+    cadence = "month" if is_monthly else "week"
+    amortized_results: list[TransactionRead] = []
+
+    for rec_tx, weekly_nzd in get_active_recurring_commitments(db, ref_date, eager_load=True):
+        if account_id is not None and rec_tx.account_id != account_id:
+            continue
+        rec = (rec_tx.recurrence or "").strip().lower()
+        if rec not in amortized_recurrences:
+            continue
+        rec_cat = rec_tx.category or "General"
+        effective_rec_lower = (
+            get_root_category(rec_cat).lower()
+            if include_subclasses
+            else rec_cat.strip().lower()
+        )
+        if effective_rec_lower != target_cat:
+            continue
+
+        rec_tx.account_name = rec_tx.account.name if rec_tx.account else None
+        rec_tx.has_receipt = bool(rec_tx.receipt)
+        rec_tx.receipt_id = rec_tx.receipt.id if rec_tx.receipt else None
+        amortized_nzd = weekly_to_monthly(weekly_nzd) if is_monthly else weekly_nzd
+        amortized_results.append(
+            TransactionRead.model_validate(rec_tx).model_copy(
+                update={
+                    "is_amortized_commitment": True,
+                    "amortized_period_amount_nzd": amortized_nzd,
+                    "amortized_cadence": cadence,
+                }
+            )
+        )
+
+    amortized_results.sort(
+        key=lambda item: (
+            -float(item.amortized_period_amount_nzd or 0.0),
+            -item.transaction_date.toordinal(),
+            -item.id,
+        )
+    )
+    return amortized_results
+
+
 @router.get("", response_model=list[TransactionRead])
 def list_transactions(
     start_date: Optional[date] = Query(default=None),
     end_date: Optional[date] = Query(default=None),
     category: Optional[str] = Query(default=None),
     include_subclasses: bool = Query(default=False, description="Match child categories inheriting from category"),
+    include_amortized: bool = Query(
+        default=False,
+        description="Include active amortized recurring commitments and flag period-excluded items when inspecting a named weekly/monthly category",
+    ),
     tag: Optional[str] = Query(default=None),
     period: Optional[str] = Query(
         default=None,
@@ -136,7 +200,10 @@ def list_transactions(
     db: Session = Depends(get_db),
 ):
     """List transactions with optional date range, period, account_id, category, and tag filters."""
-    start_date, end_date = resolve_period_dates(period, start_date, end_date)
+    effective_period = None if (start_date is not None or end_date is not None) else period
+    start_date, end_date = resolve_period_dates(effective_period, start_date, end_date)
+    ref_date = end_date or date.today()
+    amortized_recurrences = get_period_amortized_recurrences(effective_period)
 
     stmt = select(Transaction).options(
         joinedload(Transaction.account),
@@ -154,23 +221,56 @@ def list_transactions(
     target_tag = tag.strip().lower().lstrip("#").replace(" ", "-") if tag else None
 
     if target_cat or target_tag:
+        should_include_amortized = bool(
+            include_amortized
+            and target_cat
+            and target_cat not in TRANSFER_CATEGORIES
+            and not target_tag
+            and amortized_recurrences
+        )
+        amortized_results = (
+            _collect_amortized_commitments(
+                db,
+                ref_date=ref_date,
+                effective_period=effective_period,
+                target_cat=target_cat,
+                include_subclasses=include_subclasses,
+                account_id=account_id,
+                amortized_recurrences=amortized_recurrences,
+            )
+            if should_include_amortized
+            else []
+        )
+        amortized_tx_ids = {item.id for item in amortized_results}
+        max_actual = max(0, limit - len(amortized_results)) if should_include_amortized else limit
+
         rows = db.scalars(ordered_stmt).unique().all()
         results: list[TransactionRead] = []
-        for tx in rows:
-            tx.account_name = tx.account.name if tx.account else None
-            tx.has_receipt = bool(tx.receipt)
-            tx.receipt_id = tx.receipt.id if tx.receipt else None
-            dto = _matches_receipt_transaction_filter(
-                tx,
-                category=category,
-                target_cat=target_cat,
-                target_tag=target_tag,
-                include_subclasses=include_subclasses,
-            )
-            if dto is not None:
-                results.append(dto)
-                if len(results) >= limit:
-                    break
+        if max_actual > 0:
+            for tx in rows:
+                if tx.id in amortized_tx_ids:
+                    continue
+                tx.account_name = tx.account.name if tx.account else None
+                tx.has_receipt = bool(tx.receipt)
+                tx.receipt_id = tx.receipt.id if tx.receipt else None
+                dto = _matches_receipt_transaction_filter(
+                    tx,
+                    category=category,
+                    target_cat=target_cat,
+                    target_tag=target_tag,
+                    include_subclasses=include_subclasses,
+                )
+                if dto is not None:
+                    if should_include_amortized and (
+                        float(tx.amount) >= 0
+                        or is_recurrence_excluded_from_period(effective_period, tx.recurrence)
+                    ):
+                        dto = dto.model_copy(update={"excluded_from_period_budget": True})
+                    results.append(dto)
+                    if len(results) >= max_actual:
+                        break
+        if should_include_amortized:
+            return results[:max_actual] + amortized_results[:limit]
         return results
 
     txs = db.scalars(ordered_stmt.limit(limit)).unique().all()
