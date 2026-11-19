@@ -143,7 +143,7 @@ def extract_tags_for_line_item(
 
     if domain:
         clean_dom = domain.replace("02-", "").replace("01-", "").replace("20-", "").strip().lower()
-        if clean_dom:
+        if clean_dom and clean_dom != "general":
             tags.add(clean_dom)
 
     if product_type:
@@ -180,9 +180,6 @@ def extract_tags_for_line_item(
     for kw, tag in keyword_map:
         if kw in name:
             tags.add(tag)
-
-    if not tags:
-        tags.add("general")
 
     return sorted(list(tags))
 

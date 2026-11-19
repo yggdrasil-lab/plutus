@@ -30,12 +30,19 @@ def test_alembic_upgrade_head_creates_loans_and_commits(tmp_path: Path, monkeypa
         seeded_categories = conn.execute(
             "SELECT c.name, p.name, c.is_system FROM categories c LEFT JOIN categories p ON p.id = c.parent_id"
         ).fetchall()
+        rule_columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(categorization_rules)").fetchall()
+        }
 
     assert "loans" in tables
     assert "transactions" in tables
     assert "categories" in tables
+    assert "min_amount" in rule_columns
+    assert "max_amount" in rule_columns
+    assert "direction" in rule_columns
     assert version is not None
-    assert version[0] == "0014_categories_table"
+    assert version[0] == "0015_rule_amount_bounds"
 
     parent_by_name = {name: parent for name, parent, _ in seeded_categories}
     assert parent_by_name.get("Dining") == "Food"

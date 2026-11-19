@@ -54,15 +54,30 @@ def matches_rule(rule: CategorizationRule, raw_description: str, amount: float) 
     if not desc_matches:
         return False
 
-    # 2. Amount condition (optional)
+    tx_val = float(amount)
+    tx_amt = abs(tx_val)
+
+    # 2. Amount conditions (optional)
     if rule.amount_equals is not None:
         target_amt = abs(float(rule.amount_equals))
-        tx_amt = abs(float(amount))
         if abs(tx_amt - target_amt) > 0.01:
             return False
 
-    # 3. Income rules only match inflows (positive amounts)
-    if (rule.target_category or "").strip().lower() == "income" and float(amount) <= 0:
+    if rule.min_amount is not None and tx_amt < float(rule.min_amount):
+        return False
+
+    if rule.max_amount is not None and tx_amt > float(rule.max_amount):
+        return False
+
+    # 3. Direction condition (optional)
+    rule_dir = (rule.direction or "").strip().lower()
+    if rule_dir == "outflow" and tx_val >= 0:
+        return False
+    if rule_dir == "inflow" and tx_val <= 0:
+        return False
+
+    # 4. Income rules only match inflows (positive amounts)
+    if (rule.target_category or "").strip().lower() == "income" and tx_val <= 0:
         return False
 
     return True

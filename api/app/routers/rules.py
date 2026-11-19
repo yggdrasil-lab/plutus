@@ -46,6 +46,9 @@ def create_rule(
         description_pattern=payload.description_pattern.strip(),
         match_type=payload.match_type.strip(),
         amount_equals=amt,
+        min_amount=float(payload.min_amount) if payload.min_amount is not None else None,
+        max_amount=float(payload.max_amount) if payload.max_amount is not None else None,
+        direction=payload.direction,
         target_category=payload.target_category.strip(),
         target_tags=json.dumps(normalize_tags(payload.target_tags)),
         target_recurrence=payload.target_recurrence,
@@ -87,6 +90,22 @@ def update_rule(
     if not rule:
         raise HTTPException(status_code=404, detail="Categorization rule not found")
 
+    next_min = (
+        (float(payload.min_amount) if payload.min_amount is not None else None)
+        if "min_amount" in payload.model_fields_set
+        else (float(rule.min_amount) if rule.min_amount is not None else None)
+    )
+    next_max = (
+        (float(payload.max_amount) if payload.max_amount is not None else None)
+        if "max_amount" in payload.model_fields_set
+        else (float(rule.max_amount) if rule.max_amount is not None else None)
+    )
+    if next_min is not None and next_max is not None and next_min > next_max:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="min_amount must be less than or equal to max_amount.",
+        )
+
     if "name" in payload.model_fields_set and payload.name is not None:
         rule.name = payload.name.strip()
     if "description_pattern" in payload.model_fields_set and payload.description_pattern is not None:
@@ -99,6 +118,12 @@ def update_rule(
             if (payload.amount_equals is not None and float(payload.amount_equals) > 0)
             else None
         )
+    if "min_amount" in payload.model_fields_set:
+        rule.min_amount = next_min
+    if "max_amount" in payload.model_fields_set:
+        rule.max_amount = next_max
+    if "direction" in payload.model_fields_set:
+        rule.direction = payload.direction
     if "target_category" in payload.model_fields_set and payload.target_category is not None:
         rule.target_category = payload.target_category.strip()
     if "target_tags" in payload.model_fields_set and payload.target_tags is not None:

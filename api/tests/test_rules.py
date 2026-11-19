@@ -296,6 +296,210 @@ class TestCategorizationRules(unittest.TestCase):
         self.assertEqual(t_dest.category, "Transfers")
         self.assertEqual(t_dest.merchant, "Advice Funds Transfer")
 
+    def test_rule_amount_bounds_and_direction_matching(self):
+        rule_fuel = CategorizationRule(
+            id=1,
+            name="BPme Fuel",
+            description_pattern="bpme",
+            match_type="contains",
+            min_amount=30.0,
+            max_amount=None,
+            direction="outflow",
+            target_category="Fuel",
+            priority=5,
+            is_active=True,
+        )
+        rule_dining = CategorizationRule(
+            id=2,
+            name="BPme Coffee & Snacks",
+            description_pattern="bpme",
+            match_type="contains",
+            min_amount=None,
+            max_amount=29.99,
+            direction="outflow",
+            target_category="Dining",
+            priority=6,
+            is_active=True,
+        )
+        rule_refund = CategorizationRule(
+            id=3,
+            name="BPme Fuel Refund",
+            description_pattern="bpme",
+            match_type="contains",
+            min_amount=None,
+            max_amount=None,
+            direction="inflow",
+            target_category="Fuel",
+            rename_merchant="BP Fuel Refund",
+            priority=7,
+            is_active=True,
+        )
+        rules = [rule_fuel, rule_dining, rule_refund]
+
+        self.assertEqual(evaluate_rules("BPME ALBANY", -12.50, rules), ("Dining", None, 2))
+        self.assertEqual(evaluate_rules("BPME ALBANY", -29.99, rules), ("Dining", None, 2))
+        self.assertEqual(evaluate_rules("BPME ALBANY", -30.00, rules), ("Fuel", None, 1))
+        self.assertEqual(evaluate_rules("BPME ALBANY", -85.40, rules), ("Fuel", None, 1))
+        self.assertEqual(
+            evaluate_rules("BPME ALBANY", 45.00, rules),
+            ("Fuel", "BP Fuel Refund", 3),
+        )
+        # Zero-amount auth rows match neither outflow (< 0) nor inflow (> 0)
+        self.assertEqual(evaluate_rules("BPME ALBANY", 0.0, rules), (None, None, None))
+
+        bounded_rule = CategorizationRule(
+            name="Mid Range",
+            description_pattern="coffee",
+            match_type="contains",
+            min_amount=10.0,
+            max_amount=20.0,
+            direction="outflow",
+            target_category="Dining",
+            is_active=True,
+        )
+        self.assertFalse(matches_rule(bounded_rule, "COFFEE", -9.99))
+        self.assertTrue(matches_rule(bounded_rule, "COFFEE", -10.00))
+        self.assertTrue(matches_rule(bounded_rule, "COFFEE", -20.00))
+        self.assertFalse(matches_rule(bounded_rule, "COFFEE", -20.01))
+        self.assertFalse(matches_rule(bounded_rule, "COFFEE", 15.00))
+
+    def test_rules_api_amount_bounds_direction_crud_and_validation(self):
+        today = date.today()
+        tx_snack = Transaction(
+            transaction_date=today,
+            account_id=self.acc.id,
+            amount=-14.50,
+            merchant="BPME",
+            raw_description="BPME ALBANY",
+            category="General",
+            raw_hash="bpme-snack-1",
+        )
+        tx_fuel = Transaction(
+            transaction_date=today,
+            account_id=self.acc.id,
+            amount=-68.00,
+            merchant="BPME",
+            raw_description="BPME ALBANY",
+            category="General",
+            raw_hash="bpme-fuel-1",
+        )
+        tx_refund = Transaction(
+            transaction_date=today,
+            account_id=self.acc.id,
+            amount=45.00,
+            merchant="BPME",
+            raw_description="BPME ALBANY REFUND",
+            category="General",
+            raw_hash="bpme-refund-1",
+        )
+        self.db.add_all([tx_snack, tx_fuel, tx_refund])
+        self.db.commit()
+
+        res_fuel = self.client.post(
+            "/rules",
+            json={
+                "name": "BPme Fuel",
+                "description_pattern": "BPME",
+                "match_type": "contains",
+                "min_amount": 30.0,
+                "direction": "outflow",
+                "target_category": "Fuel",
+                "priority": 5,
+                "apply_retroactively": True,
+            },
+        )
+        self.assertEqual(res_fuel.status_code, 201)
+        fuel_body = res_fuel.json()
+        self.assertEqual(fuel_body["min_amount"], 30.0)
+        self.assertIsNone(fuel_body["max_amount"])
+        self.assertEqual(fuel_body["direction"], "outflow")
+
+        self.db.expire_all()
+        self.assertEqual(self.db.get(Transaction, tx_fuel.id).category, "Fuel")
+        self.assertEqual(self.db.get(Transaction, tx_snack.id).category, "General")
+        self.assertEqual(self.db.get(Transaction, tx_refund.id).category, "General")
+
+        res_dining = self.client.post(
+            "/rules",
+            json={
+                "name": "BPme Coffee",
+                "description_pattern": "BPME",
+                "match_type": "contains",
+                "max_amount": 29.99,
+                "direction": "outflow",
+                "target_category": "Dining",
+                "priority": 6,
+                "apply_retroactively": True,
+            },
+        )
+        self.assertEqual(res_dining.status_code, 201)
+        self.db.expire_all()
+        self.assertEqual(self.db.get(Transaction, tx_snack.id).category, "Dining")
+        self.assertEqual(self.db.get(Transaction, tx_refund.id).category, "General")
+
+        res_refund = self.client.post(
+            "/rules",
+            json={
+                "name": "BPme Refund",
+                "description_pattern": "BPME",
+                "match_type": "contains",
+                "min_amount": 10.0,
+                "max_amount": 200.0,
+                "direction": "inflow",
+                "target_category": "Fuel",
+                "rename_merchant": "BP Fuel Refund",
+                "priority": 7,
+                "apply_retroactively": True,
+            },
+        )
+        self.assertEqual(res_refund.status_code, 201)
+        refund_id = res_refund.json()["id"]
+        self.db.expire_all()
+        self.assertEqual(self.db.get(Transaction, tx_refund.id).category, "Fuel")
+        self.assertEqual(self.db.get(Transaction, tx_refund.id).merchant, "BP Fuel Refund")
+
+        # Validation errors: unsupported direction or inverted bounds
+        bad_dir = self.client.post(
+            "/rules",
+            json={
+                "name": "Bad Direction",
+                "description_pattern": "TEST",
+                "direction": "debit",
+                "target_category": "General",
+            },
+        )
+        self.assertEqual(bad_dir.status_code, 422)
+
+        bad_bounds = self.client.post(
+            "/rules",
+            json={
+                "name": "Bad Bounds",
+                "description_pattern": "TEST",
+                "min_amount": 50.0,
+                "max_amount": 20.0,
+                "target_category": "General",
+            },
+        )
+        self.assertEqual(bad_bounds.status_code, 422)
+
+        # Partial PUT setting min_amount above existing max_amount fails cleanly
+        bad_partial = self.client.put(
+            f"/rules/{refund_id}",
+            json={"min_amount": 250.0},
+        )
+        self.assertEqual(bad_partial.status_code, 422)
+
+        # PUT updates min_amount and clears max_amount and direction to None
+        ok_clear = self.client.put(
+            f"/rules/{refund_id}",
+            json={"min_amount": 15.0, "max_amount": None, "direction": None},
+        )
+        self.assertEqual(ok_clear.status_code, 200)
+        cleared = ok_clear.json()
+        self.assertEqual(cleared["min_amount"], 15.0)
+        self.assertIsNone(cleared["max_amount"])
+        self.assertIsNone(cleared["direction"])
+
 
 if __name__ == "__main__":
     unittest.main()
