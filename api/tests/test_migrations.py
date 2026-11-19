@@ -27,8 +27,19 @@ def test_alembic_upgrade_head_creates_loans_and_commits(tmp_path: Path, monkeypa
             ).fetchall()
         }
         version = conn.execute("SELECT version_num FROM alembic_version").fetchone()
+        seeded_categories = conn.execute(
+            "SELECT c.name, p.name, c.is_system FROM categories c LEFT JOIN categories p ON p.id = c.parent_id"
+        ).fetchall()
 
     assert "loans" in tables
     assert "transactions" in tables
+    assert "categories" in tables
     assert version is not None
-    assert version[0] == "0013_receipt_item_discount"
+    assert version[0] == "0014_categories_table"
+
+    parent_by_name = {name: parent for name, parent, _ in seeded_categories}
+    assert parent_by_name.get("Dining") == "Food"
+    assert parent_by_name.get("Groceries") == "Food"
+    assert parent_by_name.get("Alcohol") == "Food"
+    assert parent_by_name.get("Fees & Admin") == "Finance"
+    assert parent_by_name.get("Debt & Loans") == "Finance"

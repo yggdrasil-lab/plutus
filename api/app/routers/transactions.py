@@ -24,7 +24,7 @@ from app.services.burn_service import (
     to_nzd_amount,
     weekly_to_monthly,
 )
-from app.services.category_taxonomy import get_root_category
+from app.services.category_taxonomy import get_category_parent_map, get_root_category
 from app.services.period_service import resolve_period_dates
 from app.services.receipt_service import reconcile_unlinked_receipts
 from app.services.recurrence_service import (
@@ -46,6 +46,7 @@ def _matches_receipt_transaction_filter(
     target_cat: Optional[str],
     target_tag: Optional[str],
     include_subclasses: bool,
+    parent_map: Optional[dict[str, str]] = None,
 ) -> Optional[TransactionRead]:
     """Filter a transaction by category and/or tag, expanding matched receipt items.
 
@@ -65,7 +66,7 @@ def _matches_receipt_transaction_filter(
             return None
         if target_cat:
             effective_lower = (
-                get_root_category(tx.category or "General").lower()
+                get_root_category(tx.category or "General", parent_map).lower()
                 if include_subclasses
                 else tx_cat_lower
             )
@@ -81,7 +82,7 @@ def _matches_receipt_transaction_filter(
         and (
             not target_cat
             or (
-                get_root_category(line.category).lower()
+                get_root_category(line.category, parent_map).lower()
                 if include_subclasses
                 else line.category.lower()
             )
@@ -135,6 +136,7 @@ def _collect_amortized_commitments(
     include_subclasses: bool,
     account_id: Optional[int],
     amortized_recurrences: frozenset[str],
+    parent_map: Optional[dict[str, str]] = None,
 ) -> list[TransactionRead]:
     """Build TransactionRead entries for active recurring commitments amortized into a period."""
     is_monthly = effective_period in ("month", "last_month")
@@ -149,7 +151,7 @@ def _collect_amortized_commitments(
             continue
         rec_cat = rec_tx.category or "General"
         effective_rec_lower = (
-            get_root_category(rec_cat).lower()
+            get_root_category(rec_cat, parent_map).lower()
             if include_subclasses
             else rec_cat.strip().lower()
         )
@@ -221,6 +223,7 @@ def list_transactions(
     target_tag = tag.strip().lower().lstrip("#").replace(" ", "-") if tag else None
 
     if target_cat or target_tag:
+        parent_map = get_category_parent_map(db) if include_subclasses else None
         should_include_amortized = bool(
             include_amortized
             and target_cat
@@ -237,6 +240,7 @@ def list_transactions(
                 include_subclasses=include_subclasses,
                 account_id=account_id,
                 amortized_recurrences=amortized_recurrences,
+                parent_map=parent_map,
             )
             if should_include_amortized
             else []
@@ -259,6 +263,7 @@ def list_transactions(
                     target_cat=target_cat,
                     target_tag=target_tag,
                     include_subclasses=include_subclasses,
+                    parent_map=parent_map,
                 )
                 if dto is not None:
                     if should_include_amortized and (

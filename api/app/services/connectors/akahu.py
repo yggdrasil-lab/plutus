@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.schemas import SyncResult
+from app.services.category_taxonomy import DEFAULT_CATEGORY_NAMES, get_canonical_category_names
 from app.services.connectors import ConnectorConfigError, ConnectorUpstreamError
 from app.services.ingestion_service import (
     BankFeedGateway,
@@ -35,49 +36,34 @@ AKAHU_TYPE_MAP: dict[str, tuple[str, str]] = {
     "SAVINGS": ("savings", "cash"),
 }
 
-CANONICAL_CATEGORIES: frozenset[str] = frozenset(
-    {
-        "Groceries",
-        "Food",
-        "Transport",
-        "Vehicle",
-        "Utilities",
-        "Health",
-        "Personal Care",
-        "Supplements",
-        "Clothing",
-        "Tech",
-        "Household",
-        "Shopping",
-        "Leisure",
-        "Insurance",
-        "Travel",
-        "Housing",
-        "Family",
-        "Transfers",
-        "Income",
-        "General",
-    }
-)
+CANONICAL_CATEGORIES: frozenset[str] = frozenset(DEFAULT_CATEGORY_NAMES)
 
 AKAHU_CATEGORY_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
     (("hair", "salon", "barber", "beauty", "cosmetic", "skincare", "groom"), "Personal Care"),
     (("supplement", "nutrition", "protein"), "Supplements"),
-    (("gym", "fitness", "health", "medical", "pharmac", "chemist", "dent", "doctor", "physio", "optom", "clinic", "hospital"), "Health"),
+    (("gym", "fitness", "aquatic", "swim", "pilates", "yoga", "badminton", "sport"), "Fitness"),
+    (("health", "medical", "pharmac", "chemist", "dent", "doctor", "physio", "optom", "clinic", "hospital"), "Medical"),
     (("supermarket", "grocer"), "Groceries"),
-    (("cafe", "restaurant", "dining", "takeaway", "fast food", "bakery", "bar", "pub", "food"), "Food"),
+    (("liquor", "wine", "beer", "alcohol", "bottle shop"), "Alcohol"),
+    (("cafe", "restaurant", "dining", "takeaway", "fast food", "bakery", "bar", "pub", "food"), "Dining"),
     (("mechanic", "automotive", "vehicle", "car service", "tyre", "dealer"), "Vehicle"),
-    (("transport", "fuel", "petrol", "parking", "taxi", "rideshare", "uber", "transit", "toll"), "Transport"),
-    (("utilit", "electric", "power", "gas", "water", "internet", "broadband", "mobile", "phone", "telco"), "Utilities"),
+    (("fuel", "petrol", "service station"), "Fuel"),
+    (("transport", "parking", "taxi", "rideshare", "uber", "transit", "toll"), "Transit"),
+    (("internet", "broadband", "mobile", "phone", "telco", "electric", "power", "gas", "water", "utilit"), "Bills & Telco"),
+    (("software", "cloud", "saas", "ai "), "Software & AI"),
     (("clothing", "apparel", "fashion", "footwear", "shoes"), "Clothing"),
-    (("electronic", "computer", "tech", "software"), "Tech"),
+    (("electronic", "computer", "tech"), "Tech"),
     (("hardware", "home", "appliance", "furniture"), "Household"),
     (("shopping", "retail", "department store"), "Shopping"),
-    (("entertainment", "leisure", "recreation", "gaming", "streaming", "sport", "hobby", "cinema", "movie"), "Leisure"),
+    (("gaming", "video game"), "Gaming"),
+    (("entertainment", "leisure", "recreation", "streaming", "hobby", "cinema", "movie"), "Leisure"),
     (("insurance",), "Insurance"),
     (("travel", "airline", "flight", "hotel", "accommodation"), "Travel"),
-    (("housing", "rent", "mortgage", "rates"), "Housing"),
+    (("rent",), "Rent"),
+    (("housing", "mortgage", "rates"), "Housing"),
     (("family", "gift"), "Family"),
+    (("loan", "debt", "installment", "instalment"), "Debt & Loans"),
+    (("fee", "bank charge", "government", "immigration"), "Fees & Admin"),
     (("transfer", "credit card payment"), "Transfers"),
     (("income", "salary", "wage", "interest", "dividend", "refund"), "Income"),
 )
@@ -155,11 +141,19 @@ def normalize_existing_legacy_categories(db: Session) -> int:
     import json
     from app.models import Transaction
 
-    rows = (
+    canonical_names = set(get_canonical_category_names(db)) or set(CANONICAL_CATEGORIES)
+    canonical_lower = {name.lower() for name in canonical_names}
+
+    candidates = (
         db.query(Transaction)
-        .filter(Transaction.category.notin_(CANONICAL_CATEGORIES))
+        .filter(Transaction.category.notin_(canonical_names))
         .all()
     )
+    rows = [
+        tx
+        for tx in candidates
+        if (tx.category or "").strip().lower() not in canonical_lower
+    ]
     if not rows:
         return 0
 

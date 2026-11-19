@@ -10,8 +10,8 @@ from typing import Optional
 from sqlalchemy import desc, func, or_, select
 from sqlalchemy.orm import Session, joinedload
 
-from app.models import Account, AssetSnapshot, BudgetRule, Receipt, Transaction
-from app.services.category_taxonomy import get_parent_category
+from app.models import Account, AssetSnapshot, BudgetRule, Category, Receipt, Transaction
+from app.services.category_taxonomy import get_category_parent_map, get_parent_category
 from app.services.fx_service import FxRateFetcher, get_exchange_rate, to_nzd_amount
 from app.services.recurrence_service import get_active_recurring_commitments
 from app.services.rules_engine import normalize_tags, parse_rule_tags
@@ -25,8 +25,11 @@ MIN_SIGNIFICANT_WEEKLY_BURN = 1.0
 DEFAULT_CATEGORIES = [
     "Groceries",
     "Dining",
-    "Transport",
-    "Subscriptions",
+    "Alcohol",
+    "Fuel",
+    "Transit",
+    "Bills & Telco",
+    "Software & AI",
     "Housing",
     "General",
 ]
@@ -140,7 +143,23 @@ def resolve_tier_labels(db: Session) -> dict[str, str]:
 
 
 def get_active_categories(db: Session) -> list[str]:
-    """Return sorted active budget categories, falling back to distinct ledger or defaults."""
+    """Return sorted active expense categories from Category table, BudgetRules, ledger, or defaults."""
+    category_rows = list(
+        db.scalars(
+            select(Category.name)
+            .where(Category.is_active == True, Category.is_system == False)
+            .order_by(Category.name)
+        ).all()
+    )
+    if category_rows:
+        filtered = [
+            name
+            for name in category_rows
+            if name and name.strip().lower() not in (*TRANSFER_CATEGORIES, "income")
+        ]
+        if filtered:
+            return filtered
+
     active_categories = list(
         db.scalars(
             select(BudgetRule.category)
@@ -213,15 +232,33 @@ def repair_transaction_fx_rates(
 # 5. WEEKLY BURN & AVERAGE-BURN BUDGET ENGINE
 # ============================================================================
 def get_active_budget_periods(db: Session) -> dict[str, str]:
-    """Return lowercase category -> configured budget_period ('weekly', 'monthly', 'annual')."""
+    """Return lowercase category -> configured period ('weekly', 'monthly', 'annual').
+
+    Merges active BudgetRule periods with category-level 52-week annual
+    amortization settings so any category marked `amortize_period='annual'`
+    spreads over 52 weeks even without an explicit BudgetRule.
+    """
+    periods: dict[str, str] = {}
     rows = db.execute(
         select(BudgetRule.category, BudgetRule.budget_period).where(BudgetRule.is_active == True)
     ).all()
-    return {
-        cat.strip().lower(): (period or "monthly").strip().lower()
-        for cat, period in rows
-        if cat and cat.strip()
-    }
+    for cat, period in rows:
+        if cat and cat.strip():
+            periods[cat.strip().lower()] = (period or "monthly").strip().lower()
+
+    cat_rows = db.execute(
+        select(Category.name, Category.amortize_period).where(
+            Category.is_active == True,
+            Category.amortize_period.is_not(None),
+        )
+    ).all()
+    for cat_name, amortize_period in cat_rows:
+        if not cat_name or not cat_name.strip():
+            continue
+        if (amortize_period or "").strip().lower() == "annual":
+            periods[cat_name.strip().lower()] = "annual"
+
+    return periods
 
 
 def get_annual_budget_categories(db: Session) -> set[str]:
@@ -512,11 +549,12 @@ def calculate_category_average_burn(
 
     total_var_wk = sum(item[2] for item in raw_rows)
     total_avg_wk = sum(item[4] for item in raw_rows)
+    parent_map = get_category_parent_map(db)
 
     estimates = [
         CategoryBurnEstimate(
             category=display_name,
-            parent_category=get_parent_category(display_name),
+            parent_category=get_parent_category(display_name, parent_map),
             variable_weekly_burn=var_wk,
             recurring_weekly_burn=rec_wk,
             average_weekly_burn=avg_wk,
@@ -589,6 +627,7 @@ def sync_budgets_from_average_burn(
                     category=est.category,
                     weekly_limit=est.average_weekly_burn,
                     monthly_limit=est.suggested_monthly_limit,
+                    budget_period=est.budget_period or "monthly",
                     is_active=True,
                 )
             )

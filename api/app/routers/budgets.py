@@ -8,7 +8,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, joinedload
 
 from app.db import get_db
-from app.models import BudgetRule, Receipt, Transaction
+from app.models import BudgetRule, Category, Receipt, Transaction
 from app.schemas import (
     AverageBurnReportResponse,
     BudgetRuleCreate,
@@ -35,7 +35,12 @@ from app.services.burn_service import (
     weekly_to_annual,
     weekly_to_monthly,
 )
-from app.services.category_taxonomy import get_parent_category, get_root_category
+from app.services.category_taxonomy import (
+    get_category_parent_map,
+    get_descendant_category_names,
+    get_parent_category,
+    get_root_category,
+)
 from app.services.period_service import resolve_period_dates
 from app.services.recurrence_service import (
     get_active_recurring_commitments,
@@ -116,10 +121,13 @@ def _build_category_report(
     annual_cat_count: Optional[int] = None,
     actual_count: int = 0,
     amortized_count: int = 0,
+    is_annual_category: bool = False,
 ) -> CategorySpendingReport:
     """Build one CategorySpendingReport with budget utilization and warning level."""
     rule_period = (rule.budget_period or "monthly").strip().lower() if rule else "monthly"
-    is_annual_rule = bool(rule and not is_tx_transfer and rule_period == "annual")
+    is_annual_rule = bool(
+        not is_tx_transfer and (is_annual_category or (rule is not None and rule_period == "annual"))
+    )
     display_spend = (
         round(annual_cat_spend, 2)
         if (is_annual_rule and annual_cat_spend is not None)
@@ -154,6 +162,8 @@ def _build_category_report(
             elif percent_used >= 80.0:
                 warning = "warning"
 
+    resolved_period = "annual" if is_annual_rule else (rule_period if (rule and not is_tx_transfer) else "monthly")
+
     return CategorySpendingReport(
         category=category,
         parent_category=parent_category,
@@ -167,7 +177,7 @@ def _build_category_report(
         is_over_budget=is_over,
         warning_level=warning,
         is_transfer=is_tx_transfer,
-        budget_period=rule_period if (rule and not is_tx_transfer) else "monthly",
+        budget_period=resolved_period,
         annual_limit=annual_limit_val,
     )
 
@@ -198,6 +208,7 @@ def upsert_budget_rule(
         payload.weekly_limit, payload.monthly_limit, payload.annual_limit
     )
     existing = db.scalar(select(BudgetRule).where(func.lower(BudgetRule.category) == cat.lower()))
+    cat_row = db.scalar(select(Category).where(func.lower(Category.name) == cat.lower()))
     if payload.budget_period is not None:
         resolved_period = payload.budget_period
     elif existing is not None:
@@ -208,8 +219,13 @@ def upsert_budget_rule(
         and payload.monthly_limit is None
     ):
         resolved_period = "annual"
+    elif cat_row is not None and (cat_row.amortize_period or "").strip().lower() == "annual":
+        resolved_period = "annual"
     else:
         resolved_period = "monthly"
+
+    if cat_row is not None and not cat_row.is_system:
+        cat_row.amortize_period = "annual" if resolved_period == "annual" else None
 
     if existing:
         existing.weekly_limit = weekly
@@ -315,6 +331,47 @@ def sync_budgets_from_burn(
     return sync_budgets_from_average_burn(db, date.today(), lookback_weeks=lookback_weeks)
 
 
+def _rollup_budget_rules_to_base(
+    raw_budget_rules: dict[str, BudgetRule],
+    parent_map: dict[str, str],
+    canonical_name_map: dict[str, str],
+    annual_base_roots: set[str],
+) -> dict[str, BudgetRule]:
+    """Aggregate child and root BudgetRules under each base class for group_by=base."""
+    grouped_rules: dict[str, list[BudgetRule]] = {}
+    grouped_names: dict[str, str] = {}
+    for rule in raw_budget_rules.values():
+        root_name = get_root_category(rule.category, parent_map)
+        root_lower = root_name.lower()
+        grouped_names[root_lower] = canonical_name_map.get(root_lower, root_name)
+        grouped_rules.setdefault(root_lower, []).append(rule)
+
+    rolled: dict[str, BudgetRule] = {}
+    for root_lower, rules_list in grouped_rules.items():
+        root_rule = next(
+            (r for r in rules_list if r.category.strip().lower() == root_lower),
+            None,
+        )
+        sum_weekly = round(sum(float(r.weekly_limit) for r in rules_list), 2)
+        sum_monthly = round(sum(float(r.monthly_limit) for r in rules_list), 2)
+        if root_lower in annual_base_roots:
+            resolved_rule_period = "annual"
+        elif root_rule is not None:
+            resolved_rule_period = (root_rule.budget_period or "monthly").strip().lower()
+        else:
+            child_periods = {(r.budget_period or "monthly").strip().lower() for r in rules_list}
+            resolved_rule_period = next(iter(child_periods)) if len(child_periods) == 1 else "monthly"
+
+        rolled[root_lower] = BudgetRule(
+            category=grouped_names[root_lower],
+            weekly_limit=sum_weekly,
+            monthly_limit=sum_monthly,
+            budget_period=resolved_rule_period,
+            is_active=True,
+        )
+    return rolled
+
+
 @router.get("/breakdown", response_model=SpendingBreakdownResponse)
 def get_spending_breakdown(
     period: Optional[str] = Query(
@@ -338,17 +395,69 @@ def get_spending_breakdown(
     start_date, end_date = resolve_period_dates(effective_period, start_date, end_date, today=today)
     ref_date = end_date or today
 
-    budget_rules = {
+    parent_map = get_category_parent_map(db)
+    raw_budget_rules = {
         r.category.lower(): r
         for r in db.scalars(select(BudgetRule).where(BudgetRule.is_active == True)).all()
     }
     annual_cats = {
         cat_lower
-        for cat_lower, rule in budget_rules.items()
+        for cat_lower, rule in raw_budget_rules.items()
         if (rule.budget_period or "monthly").strip().lower() == "annual"
     }
-    annual_spend_map = calculate_annual_category_spend_map(db, ref_date, annual_cats)
-    annual_count_map = calculate_annual_category_count_map(db, ref_date, annual_cats)
+    canonical_name_map: dict[str, str] = {
+        r.category.strip().lower(): r.category.strip()
+        for r in raw_budget_rules.values()
+        if r.category and r.category.strip()
+    }
+    for db_cat in db.scalars(select(Category)).all():
+        if not db_cat.name or not db_cat.name.strip():
+            continue
+        cat_lower = db_cat.name.strip().lower()
+        canonical_name_map.setdefault(cat_lower, db_cat.name.strip())
+        if db_cat.is_active and (db_cat.amortize_period or "").strip().lower() == "annual":
+            annual_cats.add(cat_lower)
+    for child_name, parent_name in parent_map.items():
+        canonical_name_map.setdefault(child_name.lower(), child_name)
+        canonical_name_map.setdefault(parent_name.lower(), parent_name)
+
+    annual_base_roots = {
+        c
+        for c in annual_cats
+        if get_parent_category(canonical_name_map.get(c, c), parent_map) is None
+    }
+    fetch_annual_cats = set(annual_cats)
+    if rollup_base:
+        for root_lower in annual_base_roots:
+            fetch_annual_cats.update(get_descendant_category_names(root_lower, parent_map))
+
+    raw_annual_spend = calculate_annual_category_spend_map(db, ref_date, fetch_annual_cats)
+    raw_annual_count = calculate_annual_category_count_map(db, ref_date, fetch_annual_cats)
+    if rollup_base:
+        annual_spend_map: dict[str, float] = {}
+        annual_count_map: dict[str, int] = {}
+        for raw_cat_lower, spend_val in raw_annual_spend.items():
+            root_lower = get_root_category(
+                canonical_name_map.get(raw_cat_lower, raw_cat_lower), parent_map
+            ).lower()
+            target_key = root_lower if root_lower in annual_base_roots else raw_cat_lower
+            annual_spend_map[target_key] = annual_spend_map.get(target_key, 0.0) + spend_val
+        for raw_cat_lower, cnt_val in raw_annual_count.items():
+            root_lower = get_root_category(
+                canonical_name_map.get(raw_cat_lower, raw_cat_lower), parent_map
+            ).lower()
+            target_key = root_lower if root_lower in annual_base_roots else raw_cat_lower
+            annual_count_map[target_key] = annual_count_map.get(target_key, 0) + cnt_val
+        effective_budget_rules = _rollup_budget_rules_to_base(
+            raw_budget_rules, parent_map, canonical_name_map, annual_base_roots
+        )
+        effective_annual_set = annual_base_roots
+    else:
+        annual_spend_map = raw_annual_spend
+        annual_count_map = raw_annual_count
+        effective_budget_rules = raw_budget_rules
+        effective_annual_set = annual_cats
+
     is_weekly_period = effective_period in ("week", "last_week")
     is_monthly_period = effective_period in ("month", "last_month")
     amortized_recurrences = get_period_amortized_recurrences(effective_period)
@@ -381,9 +490,13 @@ def get_spending_breakdown(
                 continue
 
             for item_cat, item_nzd in expand_expense_transaction_by_receipt(tx):
-                effective_cat = get_root_category(item_cat) if rollup_base else item_cat
-                item_cat_lower = effective_cat.lower()
-                if (is_weekly_period or is_monthly_period) and item_cat_lower in annual_cats:
+                effective_cat = get_root_category(item_cat, parent_map) if rollup_base else item_cat
+                raw_lower = item_cat.lower()
+                effective_lower = effective_cat.lower()
+                if (is_weekly_period or is_monthly_period) and (
+                    raw_lower in annual_cats
+                    or (rollup_base and effective_lower in annual_base_roots)
+                ):
                     continue
                 total_spend += item_nzd
                 _accumulate_category(category_spend_map, effective_cat, item_nzd)
@@ -397,18 +510,34 @@ def get_spending_breakdown(
                 continue
             cat = rec_tx.category or "General"
             if rollup_base:
-                cat = get_root_category(cat)
+                cat = get_root_category(cat, parent_map)
             amortized_nzd = weekly_to_monthly(weekly_nzd) if is_monthly_period else weekly_nzd
             total_spend += amortized_nzd
             _accumulate_category(category_spend_map, cat, amortized_nzd, is_amortized=True)
         divisor = MONTHS_PER_YEAR if is_monthly_period else WEEKS_PER_YEAR
-        for cat_lower in annual_cats:
+        if rollup_base:
+            annual_keys_to_emit = sorted(
+                annual_base_roots
+                | {
+                    c
+                    for c in annual_cats
+                    if get_root_category(canonical_name_map.get(c, c), parent_map).lower()
+                    not in annual_base_roots
+                }
+            )
+        else:
+            annual_keys_to_emit = sorted(annual_cats)
+
+        for cat_lower in annual_keys_to_emit:
             annual_total_nzd = annual_spend_map.get(cat_lower, 0.0)
             if annual_total_nzd > 0:
-                rule = budget_rules[cat_lower]
+                raw_display = canonical_name_map.get(cat_lower, cat_lower.title())
+                target_display = (
+                    get_root_category(raw_display, parent_map) if rollup_base else raw_display
+                )
                 period_equiv = round(annual_total_nzd / divisor, 2)
                 total_spend += period_equiv
-                _accumulate_category(category_spend_map, rule.category, period_equiv)
+                _accumulate_category(category_spend_map, target_display, period_equiv)
 
     total_spend = round(total_spend, 2)
     total_income = round(total_income, 2)
@@ -426,26 +555,29 @@ def get_spending_breakdown(
         reports.append(
             _build_category_report(
                 category=cat,
-                parent_category=None if rollup_base else get_parent_category(cat),
+                parent_category=None if rollup_base else get_parent_category(cat, parent_map),
                 cat_spend=cat_spend,
                 count=data_dict["count"],
                 total_spend=total_spend,
                 is_tx_transfer=is_tx_transfer,
-                rule=budget_rules.get(cat_lower),
+                rule=effective_budget_rules.get(cat_lower),
                 period=period,
                 annual_cat_spend=annual_spend_map.get(cat_lower),
                 annual_cat_count=annual_count_map.get(cat_lower, 0),
                 actual_count=data_dict["actual_count"],
                 amortized_count=data_dict["amortized_count"],
+                is_annual_category=(cat_lower in effective_annual_set and not is_tx_transfer),
             )
         )
 
-    for cat_lower, rule in budget_rules.items():
+    for cat_lower, rule in effective_budget_rules.items():
         if cat_lower not in processed_lower_cats:
             reports.append(
                 _build_category_report(
                     category=rule.category,
-                    parent_category=None if rollup_base else get_parent_category(rule.category),
+                    parent_category=(
+                        None if rollup_base else get_parent_category(rule.category, parent_map)
+                    ),
                     cat_spend=0.0,
                     count=0,
                     total_spend=total_spend,
@@ -456,6 +588,7 @@ def get_spending_breakdown(
                     annual_cat_count=annual_count_map.get(cat_lower, 0),
                     actual_count=0,
                     amortized_count=0,
+                    is_annual_category=(cat_lower in effective_annual_set),
                 )
             )
 

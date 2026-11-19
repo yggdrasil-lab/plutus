@@ -61,7 +61,7 @@ class TestTransactionTagsAndAkahuCategories(unittest.TestCase):
         cat, tags = normalize_akahu_category(
             "Gyms, fitness, aquatic facilities, yoga, pilates", "Les Mills", "LES MILLS NZ"
         )
-        self.assertEqual(cat, "Health")
+        self.assertEqual(cat, "Fitness")
         self.assertEqual(tags, ("gym", "subscription"))
 
         feeds = normalize_akahu_feeds(
@@ -86,7 +86,7 @@ class TestTransactionTagsAndAkahuCategories(unittest.TestCase):
                 }
             ],
         )
-        self.assertEqual(feeds[0].transactions[0].category, "Health")
+        self.assertEqual(feeds[0].transactions[0].category, "Fitness")
         self.assertEqual(feeds[0].transactions[0].tags, ("gym", "subscription"))
 
     def test_akahu_utc_timestamp_converts_to_auckland_local_date(self):
