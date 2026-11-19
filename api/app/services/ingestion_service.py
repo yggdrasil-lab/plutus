@@ -19,9 +19,15 @@ from app.config import settings
 from app.models import Account, AssetSnapshot, CategorizationRule, Transaction
 from app.schemas import SyncAccountSummary, SyncResult
 from app.services.fx_service import get_exchange_rate
-from app.services.jev_client import classify_transaction_jev_with_tags
+from app.services.jev_client import classify_transaction_jev_with_tags, get_extra_jev_categories
 from app.services.receipt_service import reconcile_unlinked_receipts
-from app.services.rules_engine import evaluate_rules, normalize_tags, parse_rule_tags
+from app.services.rules_engine import (
+    collect_existing_tags,
+    evaluate_rules,
+    normalize_tags,
+    parse_rule_tags,
+    strip_redundant_tags,
+)
 from app.services.statement_parser import auto_categorize, generate_transaction_hash
 from app.services.transfer_service import reconcile_transfers
 
@@ -167,6 +173,8 @@ def _resolve_category_and_merchant(
     active_rules: list[CategorizationRule],
     *,
     skip_llm: bool = False,
+    existing_tags: list[str] | tuple[str, ...] | None = None,
+    extra_categories: list[str] | tuple[str, ...] | None = None,
 ) -> tuple[str, str, list[str], Optional[str]]:
     """Resolve final (merchant, category, extra_tags, recurrence) using rules, upstream category, and Jev."""
     desc = item.raw_description or item.merchant
@@ -189,17 +197,27 @@ def _resolve_category_and_merchant(
         resolved_cat = auto_categorize(merchant_name)
         return merchant_name, resolved_cat, [], None
     else:
-        jev_cat, _, jev_tags = classify_transaction_jev_with_tags(merchant_name, item.amount, item.notes)
+        jev_cat, _, jev_tags = classify_transaction_jev_with_tags(
+            merchant_name,
+            item.amount,
+            item.notes,
+            existing_tags=existing_tags,
+            extra_categories=extra_categories,
+        )
         resolved_cat = jev_cat if jev_cat and jev_cat != "General" else auto_categorize(merchant_name)
-        cat_lower = resolved_cat.strip().lower()
-        return merchant_name, resolved_cat, [t for t in jev_tags if t.strip().lower() != cat_lower], None
+        return merchant_name, resolved_cat, strip_redundant_tags(jev_tags, resolved_cat), None
 
     if not skip_llm and not item.tags and not extra_tags:
-        _, _, jev_tags = classify_transaction_jev_with_tags(merchant_name, item.amount, item.notes)
+        _, _, jev_tags = classify_transaction_jev_with_tags(
+            merchant_name,
+            item.amount,
+            item.notes,
+            existing_tags=existing_tags,
+            extra_categories=extra_categories,
+        )
         extra_tags = jev_tags
 
-    cat_lower = resolved_cat.strip().lower()
-    filtered_extra = [t for t in extra_tags if t.strip().lower() != cat_lower]
+    filtered_extra = strip_redundant_tags(extra_tags, resolved_cat)
     return merchant_name, resolved_cat, filtered_extra, rule_recurrence
 
 
@@ -226,6 +244,8 @@ def ingest_normalized_transactions(
         .where(CategorizationRule.is_active == True)
         .order_by(CategorizationRule.priority.asc(), CategorizationRule.id.asc())
     ).all()
+    existing_tags = collect_existing_tags(db) if not skip_llm else []
+    extra_categories = get_extra_jev_categories(db) if not skip_llm else []
 
     # Preload existing (date, amount) counts for this account so cross-source
     # statement uploads do not duplicate API/email-synced rows with different merchant text.
@@ -343,6 +363,8 @@ def ingest_normalized_transactions(
             item,
             active_rules,
             skip_llm=skip_llm,
+            existing_tags=existing_tags,
+            extra_categories=extra_categories,
         )
         tx_currency = (item.currency or account.currency or "NZD")[:10].upper()
         tx_fx_rate = item.exchange_rate

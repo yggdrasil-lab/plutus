@@ -8,13 +8,17 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
 import urllib.error
 import urllib.request
 from typing import Optional, Tuple
 
+from sqlalchemy.orm import Session
+
 from app.config import settings
+from app.services.category_taxonomy import get_canonical_category_names
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +114,11 @@ VALID_JEV_CATEGORIES: frozenset[str] = frozenset(
 )
 
 
+def get_extra_jev_categories(db: Session) -> list[str]:
+    """Return active DB category names not already present in VALID_JEV_CATEGORIES."""
+    return [name for name in get_canonical_category_names(db) if name not in VALID_JEV_CATEGORIES]
+
+
 def call_jev(
     system_prompt: str,
     user_content: str,
@@ -189,7 +198,11 @@ def classify_transaction_jev_with_tags(
     if notes and notes.strip():
         user_content += f", Notes: {notes.strip()}"
     if existing_tags:
-        clean_existing = [str(t).strip().lower().lstrip("#") for t in existing_tags if str(t).strip()][:60]
+        clean_existing = [
+            cleaned
+            for t in existing_tags
+            if (cleaned := str(t).strip().lower().lstrip("#")) and cleaned != "general"
+        ][:80]
         if clean_existing:
             user_content += f", Existing tags: {', '.join(clean_existing)}"
     clean_extra = [str(c).strip() for c in (extra_categories or ()) if str(c).strip()]
@@ -206,12 +219,16 @@ def classify_transaction_jev_with_tags(
             raw_anomaly = parsed.get("is_anomaly", "false")
             is_anomaly = raw_anomaly in (True, "true", "True", 1)
             raw_tags = parsed.get("tags", [])
+            cat_lower = resolved_cat.strip().lower()
+            excluded_tags = {"general", cat_lower, re.sub(r"\s+", "-", cat_lower)}
             tags: list[str] = []
             if isinstance(raw_tags, list):
-                for t in raw_tags[:3]:
-                    cleaned = str(t).strip().lower().lstrip("#").replace(" ", "-")
-                    if cleaned and cleaned not in tags:
-                        tags.append(cleaned[:40])
+                for t in raw_tags:
+                    cleaned = re.sub(r"\s+", "-", str(t).strip().lower().lstrip("#"))[:40]
+                    if cleaned and cleaned not in excluded_tags and cleaned not in tags:
+                        tags.append(cleaned)
+                        if len(tags) >= 3:
+                            break
             return resolved_cat, is_anomaly, tags
     except Exception as exc:
         logger.warning("Error in classify_transaction_jev_with_tags (%s); falling back to heuristic", exc)

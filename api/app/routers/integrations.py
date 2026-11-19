@@ -39,10 +39,10 @@ from app.services.ingestion_service import (
     ingest_normalized_transactions,
     upsert_account_snapshot,
 )
-from app.services.jev_client import classify_transaction_jev_with_tags
+from app.services.jev_client import classify_transaction_jev_with_tags, get_extra_jev_categories
 from app.services.receipt_service import reconcile_unlinked_receipts
 from app.services.transfer_service import reconcile_transfers
-from app.services.rules_engine import evaluate_rules
+from app.services.rules_engine import collect_existing_tags, evaluate_rules, strip_redundant_tags
 from app.services.statement_parser import (
     auto_categorize,
     generate_transaction_hash,
@@ -149,12 +149,17 @@ def quick_log_expense(
     jev_tags: list[str] = []
     if not category or category == "General":
         jev_cat, is_anomaly, jev_tags = classify_transaction_jev_with_tags(
-            payload.merchant, payload.amount, payload.notes
+            payload.merchant,
+            payload.amount,
+            payload.notes,
+            existing_tags=collect_existing_tags(db),
+            extra_categories=get_extra_jev_categories(db),
         )
         if jev_cat and jev_cat != "General":
             category = jev_cat
         else:
             category = auto_categorize(payload.merchant)
+        jev_tags = strip_redundant_tags(jev_tags, category)
         if is_anomaly:
             anomaly_tag = "[Anomaly Detected]"
             notes = f"{notes} {anomaly_tag}".strip() if notes else anomaly_tag

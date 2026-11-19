@@ -1,7 +1,6 @@
 """Service for receipt parsing, line item extraction, cross-domain tagging, and reconciliation."""
 
 import base64
-from collections import Counter
 from datetime import date, datetime, timedelta
 import io
 import json
@@ -19,7 +18,13 @@ from app.models import CategorizationRule, Product, Receipt, ReceiptItem, Transa
 from app.schemas import PricePoint, ProductRead, ProductStatisticItem, ProductStatisticsResponse
 from app.services.category_taxonomy import get_canonical_category_names
 from app.services.jev_client import call_jev, classify_transaction_jev_with_tags
-from app.services.rules_engine import match_receipt_item_rule, normalize_tags, parse_rule_tags
+from app.services.rules_engine import (
+    collect_existing_tags,
+    match_receipt_item_rule,
+    normalize_tags,
+    parse_rule_tags,
+    strip_redundant_tags,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -184,21 +189,6 @@ def extract_tags_for_line_item(
     return sorted(list(tags))
 
 
-def collect_existing_tags(db: Session, limit: int = 80) -> list[str]:
-    """Return existing normalized tags ordered by usage frequency across rules, txs, and items."""
-    counts: Counter[str] = Counter()
-    for raw in db.scalars(select(Transaction.tags).where(Transaction.tags.is_not(None))).all():
-        counts.update(parse_rule_tags(raw))
-    for raw in db.scalars(select(ReceiptItem.tags).where(ReceiptItem.tags.is_not(None))).all():
-        counts.update(parse_rule_tags(raw))
-    for raw in db.scalars(
-        select(CategorizationRule.target_tags).where(CategorizationRule.target_tags.is_not(None))
-    ).all():
-        counts.update(parse_rule_tags(raw))
-    counts.pop("general", None)
-    return [tag for tag, _ in counts.most_common(limit)]
-
-
 def _match_existing_tags_heuristic(
     item_name: str,
     brand: Optional[str],
@@ -232,6 +222,7 @@ def classify_and_tag_receipt_item(
     explicit_tags: Optional[list[str]],
     active_rules: list[CategorizationRule],
     existing_tags: list[str],
+    extra_categories: Optional[list[str]] = None,
 ) -> tuple[str, Optional[str], Optional[str], Optional[str], list[str]]:
     """Resolve (category, domain, product_type, volume_ml, tags) for a new receipt item.
 
@@ -267,14 +258,17 @@ def classify_and_tag_receipt_item(
             -abs(float(total_price)),
             notes=f"Receipt merchant: {merchant}",
             existing_tags=existing_tags,
+            extra_categories=extra_categories,
         )
         if resolved_cat == "General" and jev_cat and jev_cat != "General":
             resolved_cat = jev_cat
         jev_tags = jev_raw_tags
 
-    combined_tags = normalize_tags([*base_explicit_tags, *jev_tags, *matched_existing])
-    cat_lower = resolved_cat.strip().lower()
-    non_cat_tags = [t for t in combined_tags if t != cat_lower]
+    combined_tags = [
+        t for t in normalize_tags([*base_explicit_tags, *jev_tags, *matched_existing])
+        if t != "general"
+    ]
+    non_cat_tags = strip_redundant_tags(combined_tags, resolved_cat)
     if non_cat_tags:
         final_tags = non_cat_tags
     elif combined_tags:

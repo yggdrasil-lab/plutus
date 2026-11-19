@@ -646,10 +646,21 @@ class TestReceiptsRouter(unittest.TestCase):
         self.assertEqual(rule_res.status_code, 201)
 
         # 2. Create a receipt with one rule-matching item and one uncategorized item
+        from app.models import Category
+
+        self.db.add(Category(name="Sports Gear", is_active=True, is_system=False, sort_order=150))
+        self.db.commit()
+
         seen_jev_calls = []
 
-        def fake_jev(merchant, amount, notes=None, existing_tags=None):
-            seen_jev_calls.append({"merchant": merchant, "existing_tags": existing_tags})
+        def fake_jev(merchant, amount, notes=None, existing_tags=None, extra_categories=None):
+            seen_jev_calls.append(
+                {
+                    "merchant": merchant,
+                    "existing_tags": existing_tags,
+                    "extra_categories": extra_categories,
+                }
+            )
             return ("Leisure", False, ["badminton"])
 
         with patch("app.services.receipt_service.classify_transaction_jev_with_tags", side_effect=fake_jev):
@@ -692,6 +703,7 @@ class TestReceiptsRouter(unittest.TestCase):
         self.assertEqual(seen_jev_calls[0]["merchant"], "Yonex Aerosensa Feather Pack")
         self.assertIn("badminton", seen_jev_calls[0]["existing_tags"])
         self.assertIn("coffee-beans", seen_jev_calls[0]["existing_tags"])
+        self.assertEqual(seen_jev_calls[0]["extra_categories"], ["Sports Gear"])
 
         # 3. Creating a new rule later with apply_retroactively=True updates existing receipt items
         yonex_rule = self.client.post(
