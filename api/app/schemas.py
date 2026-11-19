@@ -360,6 +360,7 @@ class PricePoint(BaseModel):
     date: date
     merchant: str
     unit_price: float
+    discount_amount: Optional[float] = None
     total_price: float
     quantity: float
     receipt_id: int
@@ -443,6 +444,7 @@ class ReceiptItemBase(BaseModel):
     brand: Optional[str] = Field(default=None, max_length=100)
     quantity: float = Field(default=1.0, ge=0.01)
     unit_price: float = Field(...)
+    discount_amount: Optional[float] = Field(default=None, ge=0.0)
     total_price: float = Field(...)
     category: str = Field(default="General", max_length=50)
     domain: Optional[str] = Field(default=None, max_length=50)

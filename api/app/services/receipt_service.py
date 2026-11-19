@@ -255,6 +255,7 @@ def build_product_read(db: Session, product: Product) -> ProductRead:
                 date=it.receipt.receipt_date,
                 merchant=it.receipt.merchant,
                 unit_price=u_price,
+                discount_amount=float(it.discount_amount) if it.discount_amount is not None else None,
                 total_price=t_price,
                 quantity=float(it.quantity),
                 receipt_id=it.receipt_id,
@@ -594,9 +595,9 @@ def apply_receipt_discounts_with_jev(items: list[dict[str, Any]]) -> list[dict[s
             target = positive_items[target_idx]
             new_total = round(float(target.get("total_price", 0.0) or 0.0) + disc_total, 2)
             if new_total >= 0:
-                qty = float(target.get("quantity", 1.0) or 1.0)
+                existing_disc = float(target.get("discount_amount") or 0.0)
+                target["discount_amount"] = round(existing_disc + abs(disc_total), 2)
                 target["total_price"] = new_total
-                target["unit_price"] = round(new_total / qty, 2)
                 disc_note = f"Includes {disc_total:.2f} discount ({disc.get('item_name', 'Discount')})"
                 existing_note = str(target.get("notes") or "").strip()
                 target["notes"] = f"{existing_note}; {disc_note}" if existing_note else disc_note
