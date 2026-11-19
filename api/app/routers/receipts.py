@@ -160,6 +160,7 @@ def _apply_parsed_receipt_fields(receipt: Receipt, parsed: dict[str, Any], db: S
             brand=it.get("brand"),
             quantity=float(it.get("quantity", 1.0) or 1.0),
             unit_price=float(it.get("unit_price", 0.0) or 0.0),
+            discount_amount=float(it["discount_amount"]) if it.get("discount_amount") is not None else None,
             total_price=total_price,
             category=it_cat,
             domain=it_dom,

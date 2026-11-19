@@ -239,6 +239,7 @@ class ReceiptItem(Base):
     brand: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     quantity: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
     unit_price: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    discount_amount: Mapped[Optional[float]] = mapped_column(Numeric(12, 2), nullable=True)
     total_price: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
     category: Mapped[str] = mapped_column(String(50), nullable=False, default="General", index=True)
     domain: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)  # e.g. "02-skin", "01-health", "20-home", "general"
