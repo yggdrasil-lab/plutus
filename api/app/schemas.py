@@ -151,6 +151,7 @@ class TransactionRead(TransactionBase):
     account_name: Optional[str] = None
     raw_hash: str
     has_receipt: bool = False
+    receipt_id: Optional[int] = None
     is_receipt_split: bool = False
     created_at: datetime
 
@@ -473,6 +474,13 @@ class ReceiptItemBase(BaseModel):
 
 class ReceiptItemCreate(ReceiptItemBase):
     pass
+
+
+class ReceiptItemUpdate(BaseModel):
+    category: Optional[str] = Field(default=None, max_length=50)
+    domain: Optional[str] = Field(default=None, max_length=50)
+    tags: Optional[list[str]] = None
+    notes: Optional[str] = None
 
 
 class ReceiptItemRead(ReceiptItemBase):

@@ -98,6 +98,7 @@ def list_transactions(
 
             tx.account_name = tx.account.name if tx.account else None
             tx.has_receipt = bool(tx.receipt)
+            tx.receipt_id = tx.receipt.id if tx.receipt else None
 
             if target_cat:
                 tx_cat_lower = (tx.category or "General").strip().lower()
@@ -164,6 +165,7 @@ def list_transactions(
     for tx in txs:
         tx.account_name = tx.account.name if tx.account else None
         tx.has_receipt = bool(tx.receipt)
+        tx.receipt_id = tx.receipt.id if tx.receipt else None
     return txs
 
 
@@ -216,6 +218,7 @@ def update_transaction(
     db.refresh(tx)
     tx.account_name = tx.account.name if tx.account else None
     tx.has_receipt = bool(tx.receipt)
+    tx.receipt_id = tx.receipt.id if tx.receipt else None
     return tx
 
 
@@ -273,6 +276,7 @@ def create_transaction(
 
     tx.account_name = account.name
     tx.has_receipt = bool(tx.receipt)
+    tx.receipt_id = tx.receipt.id if tx.receipt else None
     return tx
 
 

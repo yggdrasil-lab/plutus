@@ -543,3 +543,20 @@ class TestReceiptsRouter(unittest.TestCase):
         self.assertEqual(base_txs.status_code, 200)
         self.assertEqual(len(base_txs.json()), 1)
         self.assertEqual(base_txs.json()[0]["amount"], -81.96)
+        self.assertEqual(base_txs.json()[0]["receipt_id"], res.json()["id"])
+
+        # Edit an individual item's category and tags via PATCH /receipts/{id}/items/{item_id}
+        receipt_data = res.json()
+        slide_item = next(it for it in receipt_data["items"] if it["item_name"] == "Body Glove Slide")
+        patch_res = self.client.patch(
+            f"/receipts/{receipt_data['id']}/items/{slide_item['id']}",
+            json={"category": "Personal Care", "tags": ["footwear", "summer"]},
+        )
+        self.assertEqual(patch_res.status_code, 200)
+        self.assertEqual(patch_res.json()["category"], "Personal Care")
+        self.assertEqual(patch_res.json()["tags"], ["footwear", "summer"])
+
+        updated_breakdown = self.client.get("/budgets/breakdown?period=month")
+        updated_cats = {c["category"]: c["total_spend"] for c in updated_breakdown.json()["categories"]}
+        self.assertEqual(updated_cats.get("Personal Care"), 26.99)
+        self.assertEqual(updated_cats.get("Clothing"), 54.97)

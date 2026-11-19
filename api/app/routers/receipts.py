@@ -13,6 +13,8 @@ from app.schemas import (
     ProductStatisticsResponse,
     ReceiptCreate,
     ReceiptItemCreate,
+    ReceiptItemRead,
+    ReceiptItemUpdate,
     ReceiptRead,
 )
 from app.services.receipt_service import (
@@ -341,6 +343,48 @@ def link_receipt_to_transaction(
     db.commit()
     db.refresh(receipt)
     return receipt
+
+
+@router.patch("/{receipt_id}/items/{item_id}", response_model=ReceiptItemRead)
+def update_receipt_item(
+    receipt_id: int,
+    item_id: int,
+    payload: ReceiptItemUpdate,
+    db: Session = Depends(get_db),
+):
+    """Update category, domain, tags, or notes on a single itemized receipt line."""
+    item = db.scalar(
+        select(ReceiptItem).where(
+            ReceiptItem.id == item_id,
+            ReceiptItem.receipt_id == receipt_id,
+        )
+    )
+    if not item:
+        raise HTTPException(status_code=404, detail="Receipt item not found")
+
+    if payload.category is not None:
+        cat = payload.category.strip()
+        if not cat:
+            raise HTTPException(status_code=400, detail="Category name cannot be empty")
+        item.category = cat
+
+    if "domain" in payload.model_fields_set:
+        item.domain = payload.domain.strip() if payload.domain else None
+
+    if payload.tags is not None:
+        seen: list[str] = []
+        for raw_tag in payload.tags:
+            cleaned = str(raw_tag).strip().lower().lstrip("#").replace(" ", "-")
+            if cleaned and cleaned not in seen:
+                seen.append(cleaned[:40])
+        item.tags = json.dumps(seen)
+
+    if "notes" in payload.model_fields_set:
+        item.notes = payload.notes
+
+    db.commit()
+    db.refresh(item)
+    return item
 
 
 @router.post("/reconcile")
