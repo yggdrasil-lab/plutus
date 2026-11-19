@@ -1,11 +1,13 @@
 """Service for receipt parsing, line item extraction, cross-domain tagging, and reconciliation."""
 
 import base64
+from collections import Counter
 from datetime import date, datetime, timedelta
 import io
 import json
 import logging
 import mimetypes
+import re
 from typing import Any, Optional
 import urllib.request
 
@@ -13,9 +15,10 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.models import Product, Receipt, ReceiptItem, Transaction
+from app.models import CategorizationRule, Product, Receipt, ReceiptItem, Transaction
 from app.schemas import PricePoint, ProductRead, ProductStatisticItem, ProductStatisticsResponse
-from app.services.jev_client import call_jev
+from app.services.jev_client import call_jev, classify_transaction_jev_with_tags
+from app.services.rules_engine import match_receipt_item_rule, normalize_tags, parse_rule_tags
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +176,107 @@ def extract_tags_for_line_item(
         tags.add("general")
 
     return sorted(list(tags))
+
+
+def collect_existing_tags(db: Session, limit: int = 80) -> list[str]:
+    """Return existing normalized tags ordered by usage frequency across rules, txs, and items."""
+    counts: Counter[str] = Counter()
+    for raw in db.scalars(select(Transaction.tags).where(Transaction.tags.is_not(None))).all():
+        counts.update(parse_rule_tags(raw))
+    for raw in db.scalars(select(ReceiptItem.tags).where(ReceiptItem.tags.is_not(None))).all():
+        counts.update(parse_rule_tags(raw))
+    for raw in db.scalars(
+        select(CategorizationRule.target_tags).where(CategorizationRule.target_tags.is_not(None))
+    ).all():
+        counts.update(parse_rule_tags(raw))
+    counts.pop("general", None)
+    return [tag for tag, _ in counts.most_common(limit)]
+
+
+def _match_existing_tags_heuristic(
+    item_name: str,
+    brand: Optional[str],
+    existing_tags: list[str],
+) -> list[str]:
+    """Match existing ledger/rule tags verbatim as whole words against a receipt item."""
+    if not existing_tags:
+        return []
+    combined = f"{brand or ''} {item_name}".lower()
+    norm_text = re.sub(r"[^a-z0-9]+", " ", combined).strip()
+    if not norm_text:
+        return []
+    matched: list[str] = []
+    for tag in existing_tags:
+        phrase = re.sub(r"[^a-z0-9]+", " ", tag.lower()).strip()
+        if len(phrase) >= 4 and re.search(rf"\b{re.escape(phrase)}\b", norm_text):
+            matched.append(tag)
+    return matched
+
+
+def classify_and_tag_receipt_item(
+    *,
+    item_name: str,
+    brand: Optional[str],
+    total_price: float,
+    merchant: str,
+    explicit_category: Optional[str],
+    explicit_domain: Optional[str],
+    explicit_product_type: Optional[str],
+    explicit_volume_ml: Optional[str],
+    explicit_tags: Optional[list[str]],
+    active_rules: list[CategorizationRule],
+    existing_tags: list[str],
+) -> tuple[str, Optional[str], Optional[str], Optional[str], list[str]]:
+    """Resolve (category, domain, product_type, volume_ml, tags) for a new receipt item.
+
+    Evaluates Outlook rules first, then explicit/heuristic fields, and falls
+    back to Jev System One (with existing-tag reuse) when no rule matched.
+    """
+    h_cat, h_dom, h_ptype, h_vol = classify_line_item(item_name)
+    resolved_dom = explicit_domain or h_dom
+    resolved_ptype = explicit_product_type or h_ptype
+    resolved_vol = explicit_volume_ml or h_vol
+    base_explicit_tags = normalize_tags(explicit_tags or [])
+
+    matched_rule = match_receipt_item_rule(item_name, brand, total_price, active_rules)
+    if matched_rule:
+        matched_rule.match_count = int(matched_rule.match_count or 0) + 1
+        rule_tags = parse_rule_tags(matched_rule.target_tags)
+        combined = normalize_tags([*base_explicit_tags, *rule_tags])
+        if not combined:
+            combined = extract_tags_for_line_item(item_name, resolved_dom, resolved_ptype)
+        return matched_rule.target_category, resolved_dom, resolved_ptype, resolved_vol, combined
+
+    raw_cat = (explicit_category or "").strip()
+    resolved_cat = raw_cat if (raw_cat and raw_cat.lower() != "general") else h_cat
+
+    matched_existing = _match_existing_tags_heuristic(item_name, brand, existing_tags)
+    jev_tags: list[str] = []
+    if float(total_price) >= 0 and (resolved_cat == "General" or not base_explicit_tags):
+        jev_label = (
+            f"{brand.strip()} {item_name}".strip() if (brand and brand.strip()) else item_name
+        )
+        jev_cat, _, jev_raw_tags = classify_transaction_jev_with_tags(
+            jev_label,
+            -abs(float(total_price)),
+            notes=f"Receipt merchant: {merchant}",
+            existing_tags=existing_tags,
+        )
+        if resolved_cat == "General" and jev_cat and jev_cat != "General":
+            resolved_cat = jev_cat
+        jev_tags = jev_raw_tags
+
+    combined_tags = normalize_tags([*base_explicit_tags, *jev_tags, *matched_existing])
+    cat_lower = resolved_cat.strip().lower()
+    non_cat_tags = [t for t in combined_tags if t != cat_lower]
+    if non_cat_tags:
+        final_tags = non_cat_tags
+    elif combined_tags:
+        final_tags = combined_tags
+    else:
+        final_tags = extract_tags_for_line_item(item_name, resolved_dom, resolved_ptype)
+
+    return resolved_cat, resolved_dom, resolved_ptype, resolved_vol, final_tags
 
 
 def get_or_create_product(

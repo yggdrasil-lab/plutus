@@ -87,7 +87,7 @@ TRANSACTION_GATES_SCHEMA = {
         },
         "tags": {
             "type": "list",
-            "instructions": "1 to 3 short atomic composable lowercase tags for cross-category querying (e.g. ['gym', 'subscription'], ['mobile', 'subscription'], ['car'], ['badminton', 'sports']). Never repeat the category name itself as a tag (e.g. never return 'insurance' for Insurance or 'food' for Food).",
+            "instructions": "1 to 3 short atomic composable lowercase tags for cross-category querying (e.g. ['gym', 'subscription'], ['mobile', 'subscription'], ['car'], ['badminton', 'sports']). When Existing tags are provided, prefer reusing exact matching tags instead of inventing synonyms. Never repeat the category name itself as a tag.",
         },
     }
 }
@@ -159,8 +159,9 @@ def classify_transaction_jev_with_tags(
     merchant: str,
     amount: float,
     notes: str | None = None,
+    existing_tags: list[str] | tuple[str, ...] | None = None,
 ) -> Tuple[str, bool, list[str]]:
-    """Evaluates category, anomaly status, and granular tags for a transaction via Jev."""
+    """Evaluates category, anomaly status, and granular tags for a transaction or receipt item via Jev."""
     if not merchant or not merchant.strip():
         return "General", False, []
 
@@ -169,6 +170,10 @@ def classify_transaction_jev_with_tags(
     user_content = f"Merchant: {merchant.strip()}, Amount: ${abs_amount:.2f} NZD"
     if notes and notes.strip():
         user_content += f", Notes: {notes.strip()}"
+    if existing_tags:
+        clean_existing = [str(t).strip().lower().lstrip("#") for t in existing_tags if str(t).strip()][:60]
+        if clean_existing:
+            user_content += f", Existing tags: {', '.join(clean_existing)}"
 
     try:
         content, _ = call_jev(system_prompt, user_content, response_format={"type": "json_object"})

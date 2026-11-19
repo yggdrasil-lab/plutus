@@ -612,3 +612,107 @@ class TestReceiptsRouter(unittest.TestCase):
         self.assertEqual(len(inherited_txs.json()), 1)
         self.assertEqual(inherited_txs.json()[0]["amount"], -154.93)
         self.assertFalse(inherited_txs.json()[0]["is_receipt_split"])
+
+    def test_rules_apply_to_receipt_items_and_fallback_to_jev_with_existing_tags(self):
+        # Seed existing tags in ledger so Jev & heuristic reuse them
+        seeded_tx = Transaction(
+            transaction_date=date.today(),
+            account_id=self.acc.id,
+            amount=-20.00,
+            currency="NZD",
+            merchant="Local Cafe",
+            category="Food",
+            tags='["coffee-beans", "badminton"]',
+            raw_hash="hash_existing_tags_seed",
+        )
+        self.db.add(seeded_tx)
+        self.db.commit()
+
+        # 1. Create a rule matching 'CeraVe' -> Personal Care + skincare tags
+        rule_res = self.client.post(
+            "/rules",
+            json={
+                "name": "CeraVe Skincare",
+                "description_pattern": "cerave",
+                "match_type": "contains",
+                "target_category": "Personal Care",
+                "target_tags": ["skincare", "cleanser"],
+                "priority": 5,
+                "is_active": True,
+                "apply_retroactively": False,
+            },
+        )
+        self.assertEqual(rule_res.status_code, 201)
+
+        # 2. Create a receipt with one rule-matching item and one uncategorized item
+        seen_jev_calls = []
+
+        def fake_jev(merchant, amount, notes=None, existing_tags=None):
+            seen_jev_calls.append({"merchant": merchant, "existing_tags": existing_tags})
+            return ("Leisure", False, ["badminton"])
+
+        with patch("app.services.receipt_service.classify_transaction_jev_with_tags", side_effect=fake_jev):
+            create_res = self.client.post(
+                "/receipts",
+                json={
+                    "receipt_date": date.today().isoformat(),
+                    "merchant": "Chemist & Sport",
+                    "total_amount": 64.90,
+                    "items": [
+                        {
+                            "item_name": "CeraVe Hydrating Wash 236ml",
+                            "quantity": 1.0,
+                            "unit_price": 24.90,
+                            "total_price": 24.90,
+                        },
+                        {
+                            "item_name": "Yonex Aerosensa Feather Pack",
+                            "quantity": 1.0,
+                            "unit_price": 40.00,
+                            "total_price": 40.00,
+                        },
+                    ],
+                },
+            )
+
+        self.assertEqual(create_res.status_code, 201)
+        items_by_name = {it["item_name"]: it for it in create_res.json()["items"]}
+
+        # Rule-matched item takes rule category & tags and skips Jev
+        cerave = items_by_name["CeraVe Hydrating Wash 236ml"]
+        self.assertEqual(cerave["category"], "Personal Care")
+        self.assertEqual(cerave["tags"], ["skincare", "cleanser"])
+
+        # Unmatched item falls back to Jev, receiving existing ledger tags as context
+        yonex = items_by_name["Yonex Aerosensa Feather Pack"]
+        self.assertEqual(yonex["category"], "Leisure")
+        self.assertIn("badminton", yonex["tags"])
+        self.assertEqual(len(seen_jev_calls), 1)
+        self.assertEqual(seen_jev_calls[0]["merchant"], "Yonex Aerosensa Feather Pack")
+        self.assertIn("badminton", seen_jev_calls[0]["existing_tags"])
+        self.assertIn("coffee-beans", seen_jev_calls[0]["existing_tags"])
+
+        # 3. Creating a new rule later with apply_retroactively=True updates existing receipt items
+        yonex_rule = self.client.post(
+            "/rules",
+            json={
+                "name": "Yonex Gear",
+                "description_pattern": "yonex",
+                "match_type": "contains",
+                "target_category": "Health",
+                "target_tags": ["sport-gear"],
+                "priority": 10,
+                "is_active": True,
+                "apply_retroactively": True,
+            },
+        )
+        self.assertEqual(yonex_rule.status_code, 201)
+        self.assertEqual(yonex_rule.json()["match_count"], 1)
+
+        refreshed_receipt = self.client.get(f"/receipts/{create_res.json()['id']}")
+        self.assertEqual(refreshed_receipt.status_code, 200)
+        refreshed_yonex = next(
+            it for it in refreshed_receipt.json()["items"] if "Yonex" in it["item_name"]
+        )
+        self.assertEqual(refreshed_yonex["category"], "Health")
+        self.assertEqual(refreshed_yonex["tags"], ["badminton", "sport-gear"])
