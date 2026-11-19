@@ -6,6 +6,7 @@ via Muninn's `jev-decision` model on the Docker Swarm overlay network (http://mu
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import re
@@ -58,6 +59,11 @@ def _record_jev_failure() -> None:
                 _CONSECUTIVE_FAILURES,
             )
 
+VALID_TYPESAFE_QUESTION_TYPES: frozenset[str] = frozenset({"choice", "noul", "score", "box"})
+MAX_TYPESAFE_CHOICE_OPTIONS = 255
+_MAX_PRIMARY_TAG_VOCAB = 250
+_EXCLUDED_EXISTING_TAG_VOCAB: frozenset[str] = frozenset({"general", "none", "subscription"})
+
 TRANSACTION_GATES_SCHEMA = {
     "questions": {
         "category": {
@@ -102,9 +108,9 @@ TRANSACTION_GATES_SCHEMA = {
             "type": "noul",
             "instructions": "True if the spend amount is unusually high, erratic, or unexpected for the merchant type; False if it is standard routine spending.",
         },
-        "tags": {
-            "type": "list",
-            "instructions": "1 to 3 short atomic composable lowercase tags for cross-category querying (e.g. ['gym', 'subscription'], ['mobile', 'subscription'], ['car'], ['badminton', 'sports']). When Existing tags are provided, prefer reusing exact matching tags instead of inventing synonyms. Never repeat the category name itself as a tag.",
+        "is_subscription": {
+            "type": "noul",
+            "instructions": "True if the transaction is a recurring subscription, membership, or ongoing plan (e.g. monthly/fortnightly/annual software, mobile, gym, cloud, streaming); False for one-off or variable purchases.",
         },
     }
 }
@@ -112,6 +118,63 @@ TRANSACTION_GATES_SCHEMA = {
 VALID_JEV_CATEGORIES: frozenset[str] = frozenset(
     TRANSACTION_GATES_SCHEMA["questions"]["category"]["criteria"].keys()
 )
+
+
+def _normalize_tag(raw_tag: object) -> str:
+    """Normalize a candidate tag to lowercase kebab-case capped at 40 characters."""
+    if raw_tag is None:
+        return ""
+    return re.sub(r"\s+", "-", str(raw_tag).strip().lower().lstrip("#").strip())[:40]
+
+
+def _clean_existing_tags(
+    existing_tags: list[str] | tuple[str, ...] | None,
+    limit: int,
+) -> list[str]:
+    """Clean, deduplicate, and cap existing tags while excluding reserved values."""
+    clean_tags: list[str] = []
+    seen_tags: set[str] = set()
+    for raw_tag in existing_tags or ():
+        cleaned = _normalize_tag(raw_tag)
+        if not cleaned or cleaned in _EXCLUDED_EXISTING_TAG_VOCAB or cleaned in seen_tags:
+            continue
+        seen_tags.add(cleaned)
+        clean_tags.append(cleaned)
+        if len(clean_tags) >= limit:
+            break
+    return clean_tags
+
+
+def build_transaction_gates_schema(
+    existing_tags: list[str] | tuple[str, ...] | None = None,
+    extra_categories: list[str] | tuple[str, ...] | None = None,
+) -> dict:
+    """Build a valid TypeSafe System One schema with dynamic categories and tag choices."""
+    schema = copy.deepcopy(TRANSACTION_GATES_SCHEMA)
+    cat_criteria: dict[str, str] = schema["questions"]["category"]["criteria"]
+
+    for raw_cat in extra_categories or ():
+        if raw_cat is None:
+            continue
+        cat_name = str(raw_cat).strip()
+        if not cat_name or cat_name in cat_criteria:
+            continue
+        if len(cat_criteria) >= MAX_TYPESAFE_CHOICE_OPTIONS:
+            break
+        cat_criteria[cat_name] = f"Custom user category: {cat_name}."
+
+    clean_tags = _clean_existing_tags(existing_tags, _MAX_PRIMARY_TAG_VOCAB)
+    if clean_tags:
+        schema["questions"]["primary_tag"] = {
+            "type": "choice",
+            "instructions": "Select the single best existing tag for this item, or 'none' if none fit.",
+            "criteria": {
+                **{t: f"Item matches existing tag '{t}'" for t in clean_tags},
+                "none": "No existing tag applies",
+            },
+        }
+
+    return schema
 
 
 def get_extra_jev_categories(db: Session) -> list[str]:
@@ -192,39 +255,63 @@ def classify_transaction_jev_with_tags(
     if not merchant or not merchant.strip():
         return "General", False, []
 
-    system_prompt = f"Categorize expense, detect anomalies, and assign granular tags:\n```json\n{json.dumps(TRANSACTION_GATES_SCHEMA)}\n```"
+    schema = build_transaction_gates_schema(
+        existing_tags=existing_tags,
+        extra_categories=extra_categories,
+    )
+    system_prompt = (
+        "Categorize expense, detect anomalies, subscription status, and match primary tag:\n"
+        f"```json\n{json.dumps(schema)}\n```"
+    )
     abs_amount = abs(amount)
     user_content = f"Merchant: {merchant.strip()}, Amount: ${abs_amount:.2f} NZD"
     if notes and notes.strip():
         user_content += f", Notes: {notes.strip()}"
     if existing_tags:
-        clean_existing = [
-            cleaned
-            for t in existing_tags
-            if (cleaned := str(t).strip().lower().lstrip("#")) and cleaned != "general"
-        ][:80]
+        clean_existing = _clean_existing_tags(existing_tags, 80)
         if clean_existing:
             user_content += f", Existing tags: {', '.join(clean_existing)}"
-    clean_extra = [str(c).strip() for c in (extra_categories or ()) if str(c).strip()]
+    clean_extra = [
+        cat_name
+        for c in (extra_categories or ())
+        if c is not None and (cat_name := str(c).strip())
+    ]
     if clean_extra:
         user_content += f", Additional custom categories: {', '.join(clean_extra)}"
 
-    valid_cats = set(VALID_JEV_CATEGORIES) | set(clean_extra)
+    valid_cats = set(schema["questions"]["category"]["criteria"].keys())
     try:
         content, _ = call_jev(system_prompt, user_content, response_format={"type": "json_object"})
         if content:
             parsed = json.loads(content)
+            if not isinstance(parsed, dict):
+                return "General", False, []
             cat = parsed.get("category", "General")
             resolved_cat = cat if cat in valid_cats else "General"
             raw_anomaly = parsed.get("is_anomaly", "false")
             is_anomaly = raw_anomaly in (True, "true", "True", 1)
-            raw_tags = parsed.get("tags", [])
             cat_lower = resolved_cat.strip().lower()
-            excluded_tags = {"general", cat_lower, re.sub(r"\s+", "-", cat_lower)}
+            excluded_tags = {"general", "none", cat_lower, re.sub(r"\s+", "-", cat_lower)}
+
             tags: list[str] = []
-            if isinstance(raw_tags, list):
+            raw_primary = parsed.get("primary_tag")
+            if raw_primary is not None:
+                primary_clean = _normalize_tag(raw_primary)
+                if primary_clean and primary_clean not in excluded_tags:
+                    tags.append(primary_clean)
+
+            raw_subscription = parsed.get("is_subscription", "false")
+            if (
+                raw_subscription in (True, "true", "True", 1)
+                and "subscription" not in excluded_tags
+                and "subscription" not in tags
+            ):
+                tags.append("subscription")
+
+            raw_tags = parsed.get("tags", [])
+            if isinstance(raw_tags, list) and len(tags) < 3:
                 for t in raw_tags:
-                    cleaned = re.sub(r"\s+", "-", str(t).strip().lower().lstrip("#"))[:40]
+                    cleaned = _normalize_tag(t)
                     if cleaned and cleaned not in excluded_tags and cleaned not in tags:
                         tags.append(cleaned)
                         if len(tags) >= 3:
