@@ -20,40 +20,104 @@ from app.schemas import (
 )
 from app.services.burn_service import (
     TRANSFER_CATEGORIES,
-    expand_expense_transaction_by_receipt,
+    expand_expense_lines_by_receipt,
     to_nzd_amount,
 )
 from app.services.category_taxonomy import get_root_category
 from app.services.period_service import resolve_period_dates
 from app.services.receipt_service import reconcile_unlinked_receipts
+from app.services.rules_engine import normalize_tags, parse_rule_tags
 from app.services.statement_parser import generate_transaction_hash
 from app.services.transfer_service import reconcile_transfers
 
 router = APIRouter(prefix="/transactions", tags=["Transactions"])
 
 
-def _normalize_tags(raw_tags: Optional[list[str]]) -> list[str]:
-    if not raw_tags:
-        return []
-    seen: list[str] = []
-    for item in raw_tags:
-        cleaned = str(item).strip().lower().lstrip("#").replace(" ", "-")
-        if cleaned and cleaned not in seen:
-            seen.append(cleaned[:40])
-    return seen
+def _matches_receipt_transaction_filter(
+    tx: Transaction,
+    *,
+    category: Optional[str],
+    target_cat: Optional[str],
+    target_tag: Optional[str],
+    include_subclasses: bool,
+) -> Optional[TransactionRead]:
+    """Filter a transaction by category and/or tag, expanding matched receipt items.
 
+    Matched receipt items inherit tags from their parent transaction alongside
+    their own item-level tags. Returns a full or receipt-split TransactionRead,
+    or None if the transaction does not match.
+    """
+    tx_cat_lower = (tx.category or "General").strip().lower()
+    is_expandable = (
+        float(tx.amount) < 0
+        and tx.receipt is not None
+        and bool(tx.receipt.items)
+        and tx_cat_lower not in TRANSFER_CATEGORIES
+    )
+    if not is_expandable:
+        if target_tag and target_tag not in parse_rule_tags(tx.tags):
+            return None
+        if target_cat:
+            effective_lower = (
+                get_root_category(tx.category or "General").lower()
+                if include_subclasses
+                else tx_cat_lower
+            )
+            if effective_lower != target_cat:
+                return None
+        return TransactionRead.model_validate(tx)
 
-def _parse_stored_tags(raw_tags: Optional[str]) -> list[str]:
-    """Safely parse and normalize JSON-encoded transaction tags."""
-    if not raw_tags:
-        return []
-    try:
-        parsed = json.loads(raw_tags)
-    except (TypeError, ValueError):
-        return []
-    if not isinstance(parsed, list):
-        return []
-    return _normalize_tags(parsed)
+    lines = expand_expense_lines_by_receipt(tx)
+    matched_lines = [
+        line
+        for line in lines
+        if (not target_tag or target_tag in line.effective_tags)
+        and (
+            not target_cat
+            or (
+                get_root_category(line.category).lower()
+                if include_subclasses
+                else line.category.lower()
+            )
+            == target_cat
+        )
+    ]
+    if not matched_lines:
+        return None
+
+    matched_nzd = round(sum(line.amount_nzd for line in matched_lines), 2)
+    total_tx_nzd = round(sum(line.amount_nzd for line in lines), 2)
+    matched_cats = {line.category for line in matched_lines}
+    if target_cat and include_subclasses:
+        matched_cat = category.strip() if category else (tx.category or "General")
+    elif len(matched_cats) == 1:
+        matched_cat = next(iter(matched_cats))
+    else:
+        matched_cat = tx.category or "General"
+
+    merged_tags = normalize_tags(t for line in matched_lines for t in line.effective_tags)
+    is_partial = len(matched_lines) < len(lines) or abs(matched_nzd - total_tx_nzd) > 0.01
+    if is_partial or (target_cat and matched_cat.lower() != tx_cat_lower):
+        fx_unit = to_nzd_amount(1.0, tx.currency, tx.exchange_rate)
+        split_orig = round(matched_nzd / fx_unit, 2) if fx_unit > 0 else matched_nzd
+        item_names = ", ".join(line.item_name for line in matched_lines if line.item_name)
+        return TransactionRead.model_validate(tx).model_copy(
+            update={
+                "amount": -abs(split_orig),
+                "category": matched_cat,
+                "tags": merged_tags,
+                "is_receipt_split": True,
+                "notes": (
+                    f"Receipt split ({item_names}) of {tx.currency} {abs(float(tx.amount)):.2f}"
+                    if item_names
+                    else tx.notes
+                ),
+            }
+        )
+
+    return TransactionRead.model_validate(tx).model_copy(
+        update={"tags": merged_tags or parse_rule_tags(tx.tags)}
+    )
 
 
 @router.get("", response_model=list[TransactionRead])
@@ -93,77 +157,27 @@ def list_transactions(
         rows = db.scalars(ordered_stmt).unique().all()
         results: list[TransactionRead] = []
         for tx in rows:
-            if target_tag and target_tag not in _parse_stored_tags(tx.tags):
-                continue
-
             tx.account_name = tx.account.name if tx.account else None
             tx.has_receipt = bool(tx.receipt)
-
-            if target_cat:
-                tx_cat_lower = (tx.category or "General").strip().lower()
-                if (
-                    float(tx.amount) < 0
-                    and tx.receipt is not None
-                    and tx.receipt.items
-                    and tx_cat_lower not in TRANSFER_CATEGORIES
-                ):
-                    split = expand_expense_transaction_by_receipt(tx)
-                    matched = [
-                        (c, amt)
-                        for c, amt in split
-                        if (get_root_category(c).lower() if include_subclasses else c.lower()) == target_cat
-                    ]
-                    if not matched:
-                        continue
-                    matched_nzd = sum(amt for _, amt in matched)
-                    matched_cat = category.strip() if include_subclasses else matched[0][0]
-                    if len(split) > 1 or matched_cat.lower() != tx_cat_lower:
-                        fx_unit = to_nzd_amount(1.0, tx.currency, tx.exchange_rate)
-                        split_orig = round(matched_nzd / fx_unit, 2) if fx_unit > 0 else matched_nzd
-                        item_names = ", ".join(
-                            it.item_name
-                            for it in tx.receipt.items
-                            if (
-                                get_root_category(it.category or tx.category or "General").lower()
-                                if include_subclasses
-                                else (it.category or tx.category or "General").strip().lower()
-                            ) == target_cat
-                            and float(it.total_price) > 0
-                        )
-                        dto = TransactionRead.model_validate(tx).model_copy(
-                            update={
-                                "amount": -abs(split_orig),
-                                "category": matched_cat,
-                                "is_receipt_split": True,
-                                "notes": (
-                                    f"Receipt split ({item_names}) of {tx.currency} {abs(float(tx.amount)):.2f}"
-                                    if item_names
-                                    else tx.notes
-                                ),
-                            }
-                        )
-                        results.append(dto)
-                        if len(results) >= limit:
-                            break
-                        continue
-                else:
-                    effective_lower = (
-                        get_root_category(tx.category or "General").lower()
-                        if include_subclasses
-                        else tx_cat_lower
-                    )
-                    if effective_lower != target_cat:
-                        continue
-
-            results.append(TransactionRead.model_validate(tx))
-            if len(results) >= limit:
-                break
+            tx.receipt_id = tx.receipt.id if tx.receipt else None
+            dto = _matches_receipt_transaction_filter(
+                tx,
+                category=category,
+                target_cat=target_cat,
+                target_tag=target_tag,
+                include_subclasses=include_subclasses,
+            )
+            if dto is not None:
+                results.append(dto)
+                if len(results) >= limit:
+                    break
         return results
 
     txs = db.scalars(ordered_stmt.limit(limit)).unique().all()
     for tx in txs:
         tx.account_name = tx.account.name if tx.account else None
         tx.has_receipt = bool(tx.receipt)
+        tx.receipt_id = tx.receipt.id if tx.receipt else None
     return txs
 
 
@@ -207,7 +221,7 @@ def update_transaction(
         tx.notes = payload.notes
 
     if payload.tags is not None:
-        tx.tags = json.dumps(_normalize_tags(payload.tags))
+        tx.tags = json.dumps(normalize_tags(payload.tags))
 
     if "recurrence" in payload.model_fields_set:
         tx.recurrence = payload.recurrence
@@ -216,6 +230,7 @@ def update_transaction(
     db.refresh(tx)
     tx.account_name = tx.account.name if tx.account else None
     tx.has_receipt = bool(tx.receipt)
+    tx.receipt_id = tx.receipt.id if tx.receipt else None
     return tx
 
 
@@ -258,7 +273,7 @@ def create_transaction(
         linked_transaction_id=payload.linked_transaction_id,
         exchange_rate=payload.exchange_rate,
         fee_amount=payload.fee_amount,
-        tags=json.dumps(_normalize_tags(payload.tags)),
+        tags=json.dumps(normalize_tags(payload.tags or [])),
         recurrence=payload.recurrence,
         notes=payload.notes,
     )
@@ -273,6 +288,7 @@ def create_transaction(
 
     tx.account_name = account.name
     tx.has_receipt = bool(tx.receipt)
+    tx.receipt_id = tx.receipt.id if tx.receipt else None
     return tx
 
 
@@ -324,54 +340,64 @@ def get_tag_spending_summary(
     end_date: Optional[date] = Query(default=None),
     db: Session = Depends(get_db),
 ):
-    """Aggregate NZD expense totals and per-category breakdowns for every transaction tag."""
+    """Aggregate NZD expense totals and per-category breakdowns for every tag.
+
+    Matched receipt items inherit tags from their parent transaction and combine
+    them with any item-level tags so multi-category receipts split cleanly by tag.
+    """
     effective_period = None if (start_date is not None or end_date is not None) else period
     start_date, end_date = resolve_period_dates(effective_period, start_date, end_date)
 
-    stmt = select(Transaction).where(
-        Transaction.amount < 0,
-        func.lower(Transaction.category).not_in(TRANSFER_CATEGORIES),
-        Transaction.tags.is_not(None),
-        Transaction.tags != "[]",
+    stmt = (
+        select(Transaction)
+        .options(joinedload(Transaction.receipt).joinedload(Receipt.items))
+        .where(
+            Transaction.amount < 0,
+            func.lower(Transaction.category).not_in(TRANSFER_CATEGORIES),
+        )
     )
     if start_date:
         stmt = stmt.where(Transaction.transaction_date >= start_date)
     if end_date:
         stmt = stmt.where(Transaction.transaction_date <= end_date)
 
-    rows = db.scalars(stmt.order_by(desc(Transaction.transaction_date), desc(Transaction.id))).all()
+    rows = (
+        db.scalars(stmt.order_by(desc(Transaction.transaction_date), desc(Transaction.id)))
+        .unique()
+        .all()
+    )
 
     total_tagged_spend = 0.0
     tag_map: dict[str, dict] = {}
     for tx in rows:
-        tx_tags = _parse_stored_tags(tx.tags)
-        if not tx_tags:
-            continue
-        amt_nzd = to_nzd_amount(tx.amount, tx.currency, tx.exchange_rate)
-        cat_name = (tx.category or "General").strip() or "General"
-        total_tagged_spend += amt_nzd
+        for line in expand_expense_lines_by_receipt(tx):
+            if not line.effective_tags:
+                continue
+            total_tagged_spend += line.amount_nzd
 
-        for tag_key in tx_tags:
-            bucket = tag_map.setdefault(
-                tag_key,
-                {
-                    "spend": 0.0,
-                    "count": 0,
-                    "first_date": tx.transaction_date,
-                    "last_date": tx.transaction_date,
-                    "categories": {},
-                },
-            )
-            bucket["spend"] += amt_nzd
-            bucket["count"] += 1
-            if tx.transaction_date < bucket["first_date"]:
-                bucket["first_date"] = tx.transaction_date
-            if tx.transaction_date > bucket["last_date"]:
-                bucket["last_date"] = tx.transaction_date
+            for tag_key in line.effective_tags:
+                bucket = tag_map.setdefault(
+                    tag_key,
+                    {
+                        "spend": 0.0,
+                        "tx_ids": set(),
+                        "first_date": tx.transaction_date,
+                        "last_date": tx.transaction_date,
+                        "categories": {},
+                    },
+                )
+                bucket["spend"] += line.amount_nzd
+                bucket["tx_ids"].add(tx.id)
+                if tx.transaction_date < bucket["first_date"]:
+                    bucket["first_date"] = tx.transaction_date
+                if tx.transaction_date > bucket["last_date"]:
+                    bucket["last_date"] = tx.transaction_date
 
-            cat_bucket = bucket["categories"].setdefault(cat_name, {"spend": 0.0, "count": 0})
-            cat_bucket["spend"] += amt_nzd
-            cat_bucket["count"] += 1
+                cat_bucket = bucket["categories"].setdefault(
+                    line.category, {"spend": 0.0, "tx_ids": set()}
+                )
+                cat_bucket["spend"] += line.amount_nzd
+                cat_bucket["tx_ids"].add(tx.id)
 
     tag_items: list[TagSpendingSummaryItem] = []
     for tag_key, bucket in tag_map.items():
@@ -380,7 +406,7 @@ def get_tag_spending_summary(
             TagCategoryBreakdownItem(
                 category=cat_name,
                 total_spend=round(cat_data["spend"], 2),
-                transaction_count=cat_data["count"],
+                transaction_count=len(cat_data["tx_ids"]),
                 percentage=round(cat_data["spend"] / tag_total * 100.0, 1) if tag_total > 0 else 0.0,
             )
             for cat_name, cat_data in bucket["categories"].items()
@@ -390,7 +416,7 @@ def get_tag_spending_summary(
             TagSpendingSummaryItem(
                 tag=tag_key,
                 total_spend=tag_total,
-                transaction_count=bucket["count"],
+                transaction_count=len(bucket["tx_ids"]),
                 first_date=bucket["first_date"],
                 last_date=bucket["last_date"],
                 categories=cat_items,

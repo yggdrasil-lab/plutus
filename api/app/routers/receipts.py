@@ -5,19 +5,24 @@ import json
 from typing import Any, Optional
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.db import get_db
-from app.models import Receipt, ReceiptItem, Transaction
+from app.models import CategorizationRule, Receipt, ReceiptItem, Transaction
+from app.services.rules_engine import normalize_tags
 from app.schemas import (
     ProductStatisticsResponse,
     ReceiptCreate,
     ReceiptItemCreate,
+    ReceiptItemRead,
+    ReceiptItemUpdate,
     ReceiptRead,
 )
 from app.services.receipt_service import (
     apply_receipt_discounts_with_jev,
+    classify_and_tag_receipt_item,
     classify_line_item,
+    collect_existing_tags,
     compress_receipt_image,
     compute_product_statistics,
     extract_tags_for_line_item,
@@ -38,10 +43,95 @@ def list_receipts(
     db: Session = Depends(get_db),
 ):
     """List receipts ordered by receipt_date descending."""
-    stmt = select(Receipt)
+    stmt = select(Receipt).options(
+        joinedload(Receipt.transaction),
+        selectinload(Receipt.items),
+    )
     if status:
         stmt = stmt.where(Receipt.status == status)
-    return db.scalars(stmt.order_by(Receipt.receipt_date.desc(), Receipt.id.desc()).limit(limit)).all()
+    return (
+        db.scalars(stmt.order_by(Receipt.receipt_date.desc(), Receipt.id.desc()).limit(limit))
+        .unique()
+        .all()
+    )
+
+
+def _create_classified_receipt_item(
+    db: Session,
+    *,
+    receipt: Receipt,
+    item_name: str,
+    brand: Optional[str],
+    quantity: float,
+    unit_price: float,
+    discount_amount: Optional[float],
+    total_price: float,
+    explicit_category: Optional[str],
+    explicit_domain: Optional[str],
+    explicit_product_type: Optional[str],
+    explicit_volume_ml: Optional[str],
+    explicit_tags: Optional[list[str]],
+    notes: Optional[str],
+    active_rules: list[CategorizationRule],
+    existing_tags: list[str],
+) -> None:
+    """Resolve rules/Jev classification and persist one ReceiptItem and Product."""
+    clean_name = item_name.strip() or "Item"
+    clean_brand = brand.strip() if brand else None
+    cat, dom, ptype, vol, tags_list = classify_and_tag_receipt_item(
+        item_name=clean_name,
+        brand=clean_brand,
+        total_price=total_price,
+        merchant=receipt.merchant,
+        explicit_category=explicit_category,
+        explicit_domain=explicit_domain,
+        explicit_product_type=explicit_product_type,
+        explicit_volume_ml=explicit_volume_ml,
+        explicit_tags=explicit_tags,
+        active_rules=active_rules,
+        existing_tags=existing_tags,
+    )
+    prod_id: Optional[int] = None
+    if total_price >= 0:
+        prod = get_or_create_product(
+            db=db,
+            item_name=clean_name,
+            brand=clean_brand,
+            category=cat,
+            domain=dom,
+            tags=tags_list,
+            volume_ml=vol,
+        )
+        prod_id = prod.id
+
+    db.add(
+        ReceiptItem(
+            receipt_id=receipt.id,
+            product_id=prod_id,
+            item_name=clean_name,
+            brand=clean_brand,
+            quantity=quantity,
+            unit_price=unit_price,
+            discount_amount=discount_amount,
+            total_price=total_price,
+            category=cat or "General",
+            domain=dom,
+            product_type=ptype,
+            tags=json.dumps(tags_list),
+            volume_ml=vol,
+            notes=notes,
+        )
+    )
+
+
+def _load_rule_context(db: Session) -> tuple[list[CategorizationRule], list[str]]:
+    """Fetch active priority-ordered rules and existing tag vocabulary once per receipt."""
+    active_rules = db.scalars(
+        select(CategorizationRule)
+        .where(CategorizationRule.is_active == True)
+        .order_by(CategorizationRule.priority.asc(), CategorizationRule.id.asc())
+    ).all()
+    return list(active_rules), collect_existing_tags(db)
 
 
 @router.post("", response_model=ReceiptRead, status_code=status.HTTP_201_CREATED)
@@ -62,46 +152,26 @@ def create_receipt(
     db.add(receipt)
     db.flush()
 
+    active_rules, existing_tags = _load_rule_context(db)
     for item in payload.items:
-        cat = item.category
-        dom = item.domain
-        ptype = item.product_type
-        vol = item.volume_ml
-
-        if not dom or not ptype:
-            auto_cat, auto_dom, auto_ptype, auto_vol = classify_line_item(item.item_name)
-            cat = cat or auto_cat
-            dom = dom or auto_dom
-            ptype = ptype or auto_ptype
-            vol = vol or auto_vol
-
-        tags_list = item.tags or extract_tags_for_line_item(item.item_name, dom, ptype)
-        prod = get_or_create_product(
-            db=db,
-            item_name=item.item_name.strip(),
-            brand=item.brand.strip() if item.brand else None,
-            category=cat,
-            domain=dom,
-            tags=tags_list,
-            volume_ml=vol,
-        )
-
-        r_item = ReceiptItem(
-            receipt_id=receipt.id,
-            product_id=prod.id,
-            item_name=item.item_name.strip(),
-            brand=item.brand.strip() if item.brand else None,
+        _create_classified_receipt_item(
+            db,
+            receipt=receipt,
+            item_name=item.item_name,
+            brand=item.brand,
             quantity=item.quantity,
             unit_price=item.unit_price,
+            discount_amount=item.discount_amount,
             total_price=item.total_price,
-            category=cat or "General",
-            domain=dom,
-            product_type=ptype,
-            tags=json.dumps(tags_list),
-            volume_ml=vol,
+            explicit_category=item.category,
+            explicit_domain=item.domain,
+            explicit_product_type=item.product_type,
+            explicit_volume_ml=item.volume_ml,
+            explicit_tags=item.tags,
             notes=item.notes,
+            active_rules=active_rules,
+            existing_tags=existing_tags,
         )
-        db.add(r_item)
 
     db.commit()
     db.refresh(receipt)
@@ -129,47 +199,29 @@ def _apply_parsed_receipt_fields(receipt: Receipt, parsed: dict[str, Any], db: S
     receipt.items.clear()
     db.flush()
 
+    active_rules, existing_tags = _load_rule_context(db)
     resolved_items = apply_receipt_discounts_with_jev(parsed.get("items", []))
     for it in resolved_items:
-        item_name = str(it.get("item_name") or "Item").strip()
-        total_price = float(it.get("total_price", 0.0) or 0.0)
-        cat, dom, ptype, vol = classify_line_item(item_name)
-        it_cat = it.get("category") or cat
-        it_dom = it.get("domain") or dom
-        it_ptype = it.get("product_type") or ptype
-        it_vol = it.get("volume_ml") or vol
-        it_tags = it.get("tags") or extract_tags_for_line_item(item_name, it_dom, it_ptype)
-
-        prod_id: Optional[int] = None
-        if total_price >= 0:
-            prod = get_or_create_product(
-                db=db,
-                item_name=item_name,
-                brand=it.get("brand"),
-                category=it_cat,
-                domain=it_dom,
-                tags=it_tags,
-                volume_ml=it_vol,
-            )
-            prod_id = prod.id
-
-        r_item = ReceiptItem(
-            receipt_id=receipt.id,
-            product_id=prod_id,
-            item_name=item_name,
+        _create_classified_receipt_item(
+            db,
+            receipt=receipt,
+            item_name=str(it.get("item_name") or "Item"),
             brand=it.get("brand"),
             quantity=float(it.get("quantity", 1.0) or 1.0),
             unit_price=float(it.get("unit_price", 0.0) or 0.0),
-            discount_amount=float(it["discount_amount"]) if it.get("discount_amount") is not None else None,
-            total_price=total_price,
-            category=it_cat,
-            domain=it_dom,
-            product_type=it_ptype,
-            tags=json.dumps(it_tags),
-            volume_ml=it_vol,
+            discount_amount=(
+                float(it["discount_amount"]) if it.get("discount_amount") is not None else None
+            ),
+            total_price=float(it.get("total_price", 0.0) or 0.0),
+            explicit_category=it.get("category"),
+            explicit_domain=it.get("domain"),
+            explicit_product_type=it.get("product_type"),
+            explicit_volume_ml=it.get("volume_ml"),
+            explicit_tags=it.get("tags"),
             notes=it.get("notes"),
+            active_rules=active_rules,
+            existing_tags=existing_tags,
         )
-        db.add(r_item)
 
 
 @router.post("/upload", response_model=ReceiptRead, status_code=status.HTTP_201_CREATED)
@@ -301,7 +353,11 @@ def get_receipt(
     db: Session = Depends(get_db),
 ):
     """Retrieve a single receipt with itemized line items."""
-    receipt = db.get(Receipt, receipt_id)
+    receipt = db.scalar(
+        select(Receipt)
+        .options(joinedload(Receipt.transaction), selectinload(Receipt.items))
+        .where(Receipt.id == receipt_id)
+    )
     if not receipt:
         raise HTTPException(status_code=404, detail="Receipt not found")
     return receipt
@@ -341,6 +397,45 @@ def link_receipt_to_transaction(
     db.commit()
     db.refresh(receipt)
     return receipt
+
+
+@router.patch("/{receipt_id}/items/{item_id}", response_model=ReceiptItemRead)
+def update_receipt_item(
+    receipt_id: int,
+    item_id: int,
+    payload: ReceiptItemUpdate,
+    db: Session = Depends(get_db),
+):
+    """Update category, domain, tags, or notes on a single itemized receipt line."""
+    item = db.scalar(
+        select(ReceiptItem)
+        .options(joinedload(ReceiptItem.receipt).joinedload(Receipt.transaction))
+        .where(
+            ReceiptItem.id == item_id,
+            ReceiptItem.receipt_id == receipt_id,
+        )
+    )
+    if not item:
+        raise HTTPException(status_code=404, detail="Receipt item not found")
+
+    if payload.category is not None:
+        cat = payload.category.strip()
+        if not cat:
+            raise HTTPException(status_code=400, detail="Category name cannot be empty")
+        item.category = cat
+
+    if "domain" in payload.model_fields_set:
+        item.domain = payload.domain.strip() if payload.domain else None
+
+    if payload.tags is not None:
+        item.tags = json.dumps(normalize_tags(payload.tags))
+
+    if "notes" in payload.model_fields_set:
+        item.notes = payload.notes
+
+    db.commit()
+    db.refresh(item)
+    return item
 
 
 @router.post("/reconcile")

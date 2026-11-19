@@ -252,6 +252,15 @@ class ReceiptItem(Base):
     receipt: Mapped["Receipt"] = relationship("Receipt", back_populates="items")
     product: Mapped[Optional["Product"]] = relationship("Product", back_populates="receipt_items")
 
+    @property
+    def inherited_tags(self) -> list[str]:
+        """Return normalized tags inherited from the linked parent transaction."""
+        if not self.receipt or not self.receipt.transaction:
+            return []
+        from app.services.rules_engine import parse_rule_tags
+
+        return parse_rule_tags(self.receipt.transaction.tags)
+
 
 class ExchangeRate(Base):
     """Cached historical and spot FX rates for fiat and crypto conversions."""

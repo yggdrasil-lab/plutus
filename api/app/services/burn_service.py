@@ -14,6 +14,7 @@ from app.models import Account, AssetSnapshot, BudgetRule, Receipt, Transaction
 from app.services.category_taxonomy import get_parent_category
 from app.services.fx_service import FxRateFetcher, get_exchange_rate, to_nzd_amount
 from app.services.recurrence_service import get_active_recurring_commitments
+from app.services.rules_engine import normalize_tags, parse_rule_tags
 
 TRANSFER_CATEGORIES = ("transfers", "transfer")
 DEFAULT_WEEKLY_BURN = 1000.0
@@ -228,42 +229,72 @@ def get_annual_budget_categories(db: Session) -> set[str]:
     return {cat for cat, period in get_active_budget_periods(db).items() if period == "annual"}
 
 
+@dataclass(frozen=True)
+class ExpandedReceiptLine:
+    """Single expense allocation from a transaction or matched receipt item."""
+
+    category: str
+    amount_nzd: float
+    effective_tags: list[str]
+    item_name: Optional[str] = None
+
+
+def expand_expense_lines_by_receipt(tx: Transaction) -> list[ExpandedReceiptLine]:
+    """Expand an expense transaction into itemized receipt allocations in NZD.
+
+    Each receipt line item inherits its parent transaction's tags in addition to
+    its own interface tags, and falls back to the parent transaction's category.
+    Line NZD totals are scaled and rounded so sum(amount_nzd) == tx_nzd.
+    """
+    tx_cat = (tx.category or "General").strip() or "General"
+    tx_nzd = round(to_nzd_amount(abs(float(tx.amount)), tx.currency, tx.exchange_rate), 2)
+    parent_tags = parse_rule_tags(tx.tags)
+    receipt = getattr(tx, "receipt", None)
+    items = getattr(receipt, "items", None) if receipt is not None else None
+    positive_items = [it for it in (items or []) if float(it.total_price) > 0]
+    items_sum = sum(float(it.total_price) for it in positive_items)
+    if items_sum <= 0 or not positive_items:
+        return [ExpandedReceiptLine(category=tx_cat, amount_nzd=tx_nzd, effective_tags=parent_tags)]
+
+    scale = tx_nzd / items_sum
+    result: list[ExpandedReceiptLine] = []
+    for it in positive_items:
+        raw_cat = (it.category or tx_cat).strip() or tx_cat
+        item_tags = normalize_tags([*parent_tags, *parse_rule_tags(it.tags)])
+        result.append(
+            ExpandedReceiptLine(
+                category=raw_cat,
+                amount_nzd=round(float(it.total_price) * scale, 2),
+                effective_tags=item_tags,
+                item_name=it.item_name,
+            )
+        )
+    delta = round(tx_nzd - sum(line.amount_nzd for line in result), 2)
+    if delta != 0.0 and result:
+        max_idx = max(range(len(result)), key=lambda i: result[i].amount_nzd)
+        target = result[max_idx]
+        result[max_idx] = ExpandedReceiptLine(
+            category=target.category,
+            amount_nzd=round(target.amount_nzd + delta, 2),
+            effective_tags=target.effective_tags,
+            item_name=target.item_name,
+        )
+    return result
+
+
 def expand_expense_transaction_by_receipt(tx: Transaction) -> list[tuple[str, float]]:
     """Split a matched expense transaction into itemized receipt category buckets in NZD.
 
     If no linked receipt items exist, returns the parent transaction's single
     (category, nzd_amount) tuple. Totals are scaled and rounded so sum(buckets) == tx_nzd.
     """
-    tx_cat = (tx.category or "General").strip() or "General"
-    tx_nzd = round(to_nzd_amount(abs(float(tx.amount)), tx.currency, tx.exchange_rate), 2)
-    receipt = getattr(tx, "receipt", None)
-    items = getattr(receipt, "items", None) if receipt is not None else None
-    if not items:
-        return [(tx_cat, tx_nzd)]
-
     grouped: dict[str, float] = {}
     canonical: dict[str, str] = {}
-    for it in items:
-        raw_cat = (it.category or tx_cat).strip() or tx_cat
-        key = raw_cat.lower()
-        canonical.setdefault(key, raw_cat)
-        grouped[key] = grouped.get(key, 0.0) + float(it.total_price)
-
-    positive_buckets = [(key, amt) for key, amt in grouped.items() if amt > 0]
-    items_sum = sum(amt for _, amt in positive_buckets)
-    if items_sum <= 0 or not positive_buckets:
-        return [(tx_cat, tx_nzd)]
-
-    scale = tx_nzd / items_sum
-    result: list[tuple[str, float]] = [
-        (canonical[key], round(amt * scale, 2)) for key, amt in positive_buckets
-    ]
-    delta = round(tx_nzd - sum(val for _, val in result), 2)
-    if delta != 0.0 and result:
-        max_idx = max(range(len(result)), key=lambda i: result[i][1])
-        cat_label, max_val = result[max_idx]
-        result[max_idx] = (cat_label, round(max_val + delta, 2))
-    return result
+    for line in expand_expense_lines_by_receipt(tx):
+        key = line.category.lower()
+        canonical.setdefault(key, line.category)
+        grouped[key] = grouped.get(key, 0.0) + line.amount_nzd
+    return [(canonical[key], round(amt, 2)) for key, amt in grouped.items()]
 
 
 def _fetch_expanded_variable_expenses(

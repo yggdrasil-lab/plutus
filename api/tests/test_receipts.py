@@ -543,3 +543,176 @@ class TestReceiptsRouter(unittest.TestCase):
         self.assertEqual(base_txs.status_code, 200)
         self.assertEqual(len(base_txs.json()), 1)
         self.assertEqual(base_txs.json()[0]["amount"], -81.96)
+        self.assertEqual(base_txs.json()[0]["receipt_id"], res.json()["id"])
+
+        # Edit an individual item's category and tags via PATCH /receipts/{id}/items/{item_id}
+        receipt_data = res.json()
+        slide_item = next(it for it in receipt_data["items"] if it["item_name"] == "Body Glove Slide")
+        patch_res = self.client.patch(
+            f"/receipts/{receipt_data['id']}/items/{slide_item['id']}",
+            json={"category": "Personal Care", "tags": ["footwear", "summer"]},
+        )
+        self.assertEqual(patch_res.status_code, 200)
+        self.assertEqual(patch_res.json()["category"], "Personal Care")
+        self.assertEqual(patch_res.json()["tags"], ["footwear", "summer"])
+
+        updated_breakdown = self.client.get("/budgets/breakdown?period=month")
+        updated_cats = {c["category"]: c["total_spend"] for c in updated_breakdown.json()["categories"]}
+        self.assertEqual(updated_cats.get("Personal Care"), 26.99)
+        self.assertEqual(updated_cats.get("Clothing"), 54.97)
+
+        # Tag inheritance: tagging the main transaction propagates dynamically to all receipt items
+        tx_patch = self.client.patch(
+            f"/transactions/{tx.id}",
+            json={"tags": ["costco-run", "bulk"]},
+        )
+        self.assertEqual(tx_patch.status_code, 200)
+
+        receipt_detail = self.client.get(f"/receipts/{receipt_data['id']}")
+        self.assertEqual(receipt_detail.status_code, 200)
+        for item in receipt_detail.json()["items"]:
+            self.assertEqual(item["inherited_tags"], ["costco-run", "bulk"])
+
+        # Editing item tags preserves inherited_tags without duplicating parent tags into item.tags
+        slide_patch = self.client.patch(
+            f"/receipts/{receipt_data['id']}/items/{slide_item['id']}",
+            json={"tags": ["footwear", "summer"]},
+        )
+        self.assertEqual(slide_patch.status_code, 200)
+        self.assertEqual(slide_patch.json()["tags"], ["footwear", "summer"])
+        self.assertEqual(slide_patch.json()["inherited_tags"], ["costco-run", "bulk"])
+
+        # Tag spending summary expands matched receipts per item and splits by item category
+        tag_summary = self.client.get("/transactions/summary/tags?period=month")
+        self.assertEqual(tag_summary.status_code, 200)
+        tag_map = {item["tag"]: item for item in tag_summary.json()["tags"]}
+
+        costco_tag = tag_map["costco-run"]
+        self.assertEqual(costco_tag["total_spend"], 154.93)
+        self.assertEqual(costco_tag["transaction_count"], 1)
+        costco_cats = {c["category"]: c["total_spend"] for c in costco_tag["categories"]}
+        self.assertEqual(costco_cats, {"Groceries": 72.97, "Clothing": 54.97, "Personal Care": 26.99})
+
+        footwear_tag = tag_map["footwear"]
+        self.assertEqual(footwear_tag["total_spend"], 26.99)
+        self.assertEqual(footwear_tag["transaction_count"], 1)
+        self.assertEqual(footwear_tag["categories"][0]["category"], "Personal Care")
+
+        # Filtering transactions by item-only tag returns receipt split carrying inherited + item tags
+        footwear_txs = self.client.get("/transactions?tag=footwear&period=month")
+        self.assertEqual(footwear_txs.status_code, 200)
+        self.assertEqual(len(footwear_txs.json()), 1)
+        self.assertEqual(footwear_txs.json()[0]["amount"], -26.99)
+        self.assertTrue(footwear_txs.json()[0]["is_receipt_split"])
+        self.assertEqual(footwear_txs.json()[0]["tags"], ["costco-run", "bulk", "footwear", "summer"])
+
+        # Filtering transactions by inherited parent tag returns the full transaction
+        inherited_txs = self.client.get("/transactions?tag=costco-run&period=month")
+        self.assertEqual(inherited_txs.status_code, 200)
+        self.assertEqual(len(inherited_txs.json()), 1)
+        self.assertEqual(inherited_txs.json()[0]["amount"], -154.93)
+        self.assertFalse(inherited_txs.json()[0]["is_receipt_split"])
+
+    def test_rules_apply_to_receipt_items_and_fallback_to_jev_with_existing_tags(self):
+        # Seed existing tags in ledger so Jev & heuristic reuse them
+        seeded_tx = Transaction(
+            transaction_date=date.today(),
+            account_id=self.acc.id,
+            amount=-20.00,
+            currency="NZD",
+            merchant="Local Cafe",
+            category="Food",
+            tags='["coffee-beans", "badminton"]',
+            raw_hash="hash_existing_tags_seed",
+        )
+        self.db.add(seeded_tx)
+        self.db.commit()
+
+        # 1. Create a rule matching 'CeraVe' -> Personal Care + skincare tags
+        rule_res = self.client.post(
+            "/rules",
+            json={
+                "name": "CeraVe Skincare",
+                "description_pattern": "cerave",
+                "match_type": "contains",
+                "target_category": "Personal Care",
+                "target_tags": ["skincare", "cleanser"],
+                "priority": 5,
+                "is_active": True,
+                "apply_retroactively": False,
+            },
+        )
+        self.assertEqual(rule_res.status_code, 201)
+
+        # 2. Create a receipt with one rule-matching item and one uncategorized item
+        seen_jev_calls = []
+
+        def fake_jev(merchant, amount, notes=None, existing_tags=None):
+            seen_jev_calls.append({"merchant": merchant, "existing_tags": existing_tags})
+            return ("Leisure", False, ["badminton"])
+
+        with patch("app.services.receipt_service.classify_transaction_jev_with_tags", side_effect=fake_jev):
+            create_res = self.client.post(
+                "/receipts",
+                json={
+                    "receipt_date": date.today().isoformat(),
+                    "merchant": "Chemist & Sport",
+                    "total_amount": 64.90,
+                    "items": [
+                        {
+                            "item_name": "CeraVe Hydrating Wash 236ml",
+                            "quantity": 1.0,
+                            "unit_price": 24.90,
+                            "total_price": 24.90,
+                        },
+                        {
+                            "item_name": "Yonex Aerosensa Feather Pack",
+                            "quantity": 1.0,
+                            "unit_price": 40.00,
+                            "total_price": 40.00,
+                        },
+                    ],
+                },
+            )
+
+        self.assertEqual(create_res.status_code, 201)
+        items_by_name = {it["item_name"]: it for it in create_res.json()["items"]}
+
+        # Rule-matched item takes rule category & tags and skips Jev
+        cerave = items_by_name["CeraVe Hydrating Wash 236ml"]
+        self.assertEqual(cerave["category"], "Personal Care")
+        self.assertEqual(cerave["tags"], ["skincare", "cleanser"])
+
+        # Unmatched item falls back to Jev, receiving existing ledger tags as context
+        yonex = items_by_name["Yonex Aerosensa Feather Pack"]
+        self.assertEqual(yonex["category"], "Leisure")
+        self.assertIn("badminton", yonex["tags"])
+        self.assertEqual(len(seen_jev_calls), 1)
+        self.assertEqual(seen_jev_calls[0]["merchant"], "Yonex Aerosensa Feather Pack")
+        self.assertIn("badminton", seen_jev_calls[0]["existing_tags"])
+        self.assertIn("coffee-beans", seen_jev_calls[0]["existing_tags"])
+
+        # 3. Creating a new rule later with apply_retroactively=True updates existing receipt items
+        yonex_rule = self.client.post(
+            "/rules",
+            json={
+                "name": "Yonex Gear",
+                "description_pattern": "yonex",
+                "match_type": "contains",
+                "target_category": "Health",
+                "target_tags": ["sport-gear"],
+                "priority": 10,
+                "is_active": True,
+                "apply_retroactively": True,
+            },
+        )
+        self.assertEqual(yonex_rule.status_code, 201)
+        self.assertEqual(yonex_rule.json()["match_count"], 1)
+
+        refreshed_receipt = self.client.get(f"/receipts/{create_res.json()['id']}")
+        self.assertEqual(refreshed_receipt.status_code, 200)
+        refreshed_yonex = next(
+            it for it in refreshed_receipt.json()["items"] if "Yonex" in it["item_name"]
+        )
+        self.assertEqual(refreshed_yonex["category"], "Health")
+        self.assertEqual(refreshed_yonex["tags"], ["badminton", "sport-gear"])
