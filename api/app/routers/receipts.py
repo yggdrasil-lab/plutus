@@ -5,10 +5,11 @@ import json
 from typing import Any, Optional
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.db import get_db
 from app.models import Receipt, ReceiptItem, Transaction
+from app.services.rules_engine import normalize_tags
 from app.schemas import (
     ProductStatisticsResponse,
     ReceiptCreate,
@@ -40,10 +41,17 @@ def list_receipts(
     db: Session = Depends(get_db),
 ):
     """List receipts ordered by receipt_date descending."""
-    stmt = select(Receipt)
+    stmt = select(Receipt).options(
+        joinedload(Receipt.transaction),
+        selectinload(Receipt.items),
+    )
     if status:
         stmt = stmt.where(Receipt.status == status)
-    return db.scalars(stmt.order_by(Receipt.receipt_date.desc(), Receipt.id.desc()).limit(limit)).all()
+    return (
+        db.scalars(stmt.order_by(Receipt.receipt_date.desc(), Receipt.id.desc()).limit(limit))
+        .unique()
+        .all()
+    )
 
 
 @router.post("", response_model=ReceiptRead, status_code=status.HTTP_201_CREATED)
@@ -303,7 +311,11 @@ def get_receipt(
     db: Session = Depends(get_db),
 ):
     """Retrieve a single receipt with itemized line items."""
-    receipt = db.get(Receipt, receipt_id)
+    receipt = db.scalar(
+        select(Receipt)
+        .options(joinedload(Receipt.transaction), selectinload(Receipt.items))
+        .where(Receipt.id == receipt_id)
+    )
     if not receipt:
         raise HTTPException(status_code=404, detail="Receipt not found")
     return receipt
@@ -354,7 +366,9 @@ def update_receipt_item(
 ):
     """Update category, domain, tags, or notes on a single itemized receipt line."""
     item = db.scalar(
-        select(ReceiptItem).where(
+        select(ReceiptItem)
+        .options(joinedload(ReceiptItem.receipt).joinedload(Receipt.transaction))
+        .where(
             ReceiptItem.id == item_id,
             ReceiptItem.receipt_id == receipt_id,
         )
@@ -372,12 +386,7 @@ def update_receipt_item(
         item.domain = payload.domain.strip() if payload.domain else None
 
     if payload.tags is not None:
-        seen: list[str] = []
-        for raw_tag in payload.tags:
-            cleaned = str(raw_tag).strip().lower().lstrip("#").replace(" ", "-")
-            if cleaned and cleaned not in seen:
-                seen.append(cleaned[:40])
-        item.tags = json.dumps(seen)
+        item.tags = json.dumps(normalize_tags(payload.tags))
 
     if "notes" in payload.model_fields_set:
         item.notes = payload.notes

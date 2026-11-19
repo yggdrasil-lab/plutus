@@ -486,6 +486,7 @@ class ReceiptItemUpdate(BaseModel):
 class ReceiptItemRead(ReceiptItemBase):
     id: int
     receipt_id: int
+    inherited_tags: list[str] = Field(default_factory=list)
     created_at: datetime
 
     class Config:

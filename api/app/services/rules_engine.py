@@ -9,18 +9,20 @@ from sqlalchemy.orm import Session
 from app.models import CategorizationRule, Transaction
 
 
-def normalize_tags(tags: Iterable[str]) -> list[str]:
+def normalize_tags(tags: Iterable[str], max_length: int = 40) -> list[str]:
     """Normalize tags to deduplicated lowercase kebab-case tokens."""
     seen: list[str] = []
     for raw in tags:
         cleaned = re.sub(r"\s+", "-", str(raw).strip().lower().lstrip("#"))
-        if cleaned and cleaned not in seen:
-            seen.append(cleaned)
+        if cleaned:
+            cleaned = cleaned[:max_length]
+            if cleaned not in seen:
+                seen.append(cleaned)
     return seen
 
 
 def parse_rule_tags(raw_tags: Optional[str]) -> list[str]:
-    """Parse JSON-encoded tag list from a CategorizationRule or Transaction."""
+    """Parse JSON-encoded or comma-separated tag list from a rule, transaction, or item."""
     if not raw_tags:
         return []
     try:
@@ -28,7 +30,7 @@ def parse_rule_tags(raw_tags: Optional[str]) -> list[str]:
         if isinstance(parsed, list):
             return normalize_tags(str(t) for t in parsed)
     except (ValueError, TypeError):
-        pass
+        return normalize_tags(part for part in str(raw_tags).split(",") if part.strip())
     return []
 
 
