@@ -509,6 +509,34 @@ class CategorizationRuleRead(CategorizationRuleBase):
         from_attributes = True
 
 
+class ClassifyUncategorizedRequest(BaseModel):
+    limit: int = Field(default=50, ge=1, le=500)
+    include_untagged: bool = False
+    dry_run: bool = True
+    only_outflows: bool = False
+
+
+class ClassifyUncategorizedItem(BaseModel):
+    transaction_id: int
+    transaction_date: date
+    merchant: str
+    amount: float
+    currency: str
+    old_category: str
+    new_category: str
+    old_tags: list[str]
+    new_tags: list[str]
+
+
+class ClassifyUncategorizedResponse(BaseModel):
+    dry_run: bool
+    evaluated: int
+    updated: int
+    skipped_circuit_open: int
+    remaining: int
+    changes: list[ClassifyUncategorizedItem]
+
+
 # --- Product Catalog & Price History Schemas ---
 class PricePoint(BaseModel):
     """Historical unit price record from an itemized receipt."""

@@ -12,8 +12,14 @@ from app.schemas import (
     CategorizationRuleCreate,
     CategorizationRuleRead,
     CategorizationRuleUpdate,
+    ClassifyUncategorizedRequest,
+    ClassifyUncategorizedResponse,
 )
-from app.services.rules_engine import apply_rules_to_existing_transactions, normalize_tags
+from app.services.rules_engine import (
+    apply_rules_to_existing_transactions,
+    classify_uncategorized_transactions,
+    normalize_tags,
+)
 
 router = APIRouter(prefix="/rules", tags=["Categorization Rules"])
 
@@ -168,3 +174,19 @@ def apply_all_rules(
     """Re-run all active categorization rules across all transactions."""
     result = apply_rules_to_existing_transactions(db)
     return result
+
+
+@router.post("/classify-uncategorized", response_model=ClassifyUncategorizedResponse)
+def classify_uncategorized(
+    payload: Optional[ClassifyUncategorizedRequest] = None,
+    db: Session = Depends(get_db),
+):
+    """Retroactively classify uncategorized or untagged transactions via Jev System One."""
+    req = payload or ClassifyUncategorizedRequest()
+    return classify_uncategorized_transactions(
+        db,
+        limit=req.limit,
+        include_untagged=req.include_untagged,
+        dry_run=req.dry_run,
+        only_outflows=req.only_outflows,
+    )

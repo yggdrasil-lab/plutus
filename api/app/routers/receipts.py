@@ -9,7 +9,8 @@ from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.db import get_db
 from app.models import CategorizationRule, Receipt, ReceiptItem, Transaction
-from app.services.rules_engine import normalize_tags
+from app.services.jev_client import get_extra_jev_categories
+from app.services.rules_engine import collect_existing_tags, normalize_tags
 from app.schemas import (
     ProductStatisticsResponse,
     ReceiptCreate,
@@ -22,7 +23,6 @@ from app.services.receipt_service import (
     apply_receipt_discounts_with_jev,
     classify_and_tag_receipt_item,
     classify_line_item,
-    collect_existing_tags,
     compress_receipt_image,
     compute_product_statistics,
     extract_tags_for_line_item,
@@ -74,6 +74,7 @@ def _create_classified_receipt_item(
     notes: Optional[str],
     active_rules: list[CategorizationRule],
     existing_tags: list[str],
+    extra_categories: Optional[list[str]] = None,
 ) -> None:
     """Resolve rules/Jev classification and persist one ReceiptItem and Product."""
     clean_name = item_name.strip() or "Item"
@@ -90,6 +91,7 @@ def _create_classified_receipt_item(
         explicit_tags=explicit_tags,
         active_rules=active_rules,
         existing_tags=existing_tags,
+        extra_categories=extra_categories,
     )
     prod_id: Optional[int] = None
     if total_price >= 0:
@@ -124,14 +126,14 @@ def _create_classified_receipt_item(
     )
 
 
-def _load_rule_context(db: Session) -> tuple[list[CategorizationRule], list[str]]:
-    """Fetch active priority-ordered rules and existing tag vocabulary once per receipt."""
+def _load_rule_context(db: Session) -> tuple[list[CategorizationRule], list[str], list[str]]:
+    """Fetch active priority-ordered rules, existing tag vocabulary, and custom Jev categories once per receipt."""
     active_rules = db.scalars(
         select(CategorizationRule)
         .where(CategorizationRule.is_active == True)
         .order_by(CategorizationRule.priority.asc(), CategorizationRule.id.asc())
     ).all()
-    return list(active_rules), collect_existing_tags(db)
+    return list(active_rules), collect_existing_tags(db), get_extra_jev_categories(db)
 
 
 @router.post("", response_model=ReceiptRead, status_code=status.HTTP_201_CREATED)
@@ -152,7 +154,7 @@ def create_receipt(
     db.add(receipt)
     db.flush()
 
-    active_rules, existing_tags = _load_rule_context(db)
+    active_rules, existing_tags, extra_categories = _load_rule_context(db)
     for item in payload.items:
         _create_classified_receipt_item(
             db,
@@ -171,6 +173,7 @@ def create_receipt(
             notes=item.notes,
             active_rules=active_rules,
             existing_tags=existing_tags,
+            extra_categories=extra_categories,
         )
 
     db.commit()
@@ -199,7 +202,7 @@ def _apply_parsed_receipt_fields(receipt: Receipt, parsed: dict[str, Any], db: S
     receipt.items.clear()
     db.flush()
 
-    active_rules, existing_tags = _load_rule_context(db)
+    active_rules, existing_tags, extra_categories = _load_rule_context(db)
     resolved_items = apply_receipt_discounts_with_jev(parsed.get("items", []))
     for it in resolved_items:
         _create_classified_receipt_item(
@@ -221,6 +224,7 @@ def _apply_parsed_receipt_fields(receipt: Receipt, parsed: dict[str, Any], db: S
             notes=it.get("notes"),
             active_rules=active_rules,
             existing_tags=existing_tags,
+            extra_categories=extra_categories,
         )
 
 

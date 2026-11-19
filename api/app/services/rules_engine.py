@@ -1,12 +1,18 @@
 """Outlook-style transaction categorization rules engine."""
 
+from collections import Counter
 import json
 import re
-from typing import Iterable, Optional, Tuple
-from sqlalchemy import func, select
+from typing import Any, Iterable, Optional, Tuple
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.models import CategorizationRule, ReceiptItem, Transaction
+from app.services.jev_client import (
+    classify_transaction_jev_with_tags,
+    get_extra_jev_categories,
+    is_jev_circuit_open,
+)
 
 
 def normalize_tags(tags: Iterable[str], max_length: int = 40) -> list[str]:
@@ -21,6 +27,16 @@ def normalize_tags(tags: Iterable[str], max_length: int = 40) -> list[str]:
     return seen
 
 
+def strip_redundant_tags(tags: Iterable[str], category: Optional[str]) -> list[str]:
+    """Normalize tags and strip 'general' plus any tag matching the category name."""
+    cat_lower = (category or "").strip().lower()
+    excluded = {"general"}
+    if cat_lower:
+        excluded.add(cat_lower)
+        excluded.add(re.sub(r"\s+", "-", cat_lower))
+    return [tag for tag in normalize_tags(tags) if tag not in excluded]
+
+
 def parse_rule_tags(raw_tags: Optional[str]) -> list[str]:
     """Parse JSON-encoded or comma-separated tag list from a rule, transaction, or item."""
     if not raw_tags:
@@ -32,6 +48,21 @@ def parse_rule_tags(raw_tags: Optional[str]) -> list[str]:
     except (ValueError, TypeError):
         return normalize_tags(part for part in str(raw_tags).split(",") if part.strip())
     return []
+
+
+def collect_existing_tags(db: Session, limit: int = 80) -> list[str]:
+    """Return existing normalized tags ordered by usage frequency across rules, txs, and items."""
+    counts: Counter[str] = Counter()
+    for raw in db.scalars(select(Transaction.tags).where(Transaction.tags.is_not(None))).all():
+        counts.update(parse_rule_tags(raw))
+    for raw in db.scalars(select(ReceiptItem.tags).where(ReceiptItem.tags.is_not(None))).all():
+        counts.update(parse_rule_tags(raw))
+    for raw in db.scalars(
+        select(CategorizationRule.target_tags).where(CategorizationRule.target_tags.is_not(None))
+    ).all():
+        counts.update(parse_rule_tags(raw))
+    counts.pop("general", None)
+    return [tag for tag, _ in counts.most_common(limit)]
 
 
 def matches_rule(rule: CategorizationRule, raw_description: str, amount: float) -> bool:
@@ -207,4 +238,136 @@ def apply_rules_to_existing_transactions(
         "updated": updated_count,
         "receipt_items_evaluated": len(receipt_items),
         "receipt_items_updated": receipt_items_updated,
+    }
+
+
+def classify_uncategorized_transactions(
+    db: Session,
+    *,
+    limit: int = 50,
+    include_untagged: bool = False,
+    dry_run: bool = True,
+    only_outflows: bool = False,
+) -> dict[str, Any]:
+    """Retroactively classify uncategorized or untagged transactions via Jev System One."""
+    stmt = select(Transaction).where(
+        Transaction.linked_transaction_id.is_(None),
+        Transaction.category.notin_(("Transfers", "Income")),
+    )
+    if only_outflows:
+        stmt = stmt.where(Transaction.amount < 0)
+    if include_untagged:
+        stmt = stmt.where(
+            or_(
+                Transaction.category == "General",
+                Transaction.tags.is_(None),
+                Transaction.tags.in_(("", "[]")),
+            )
+        )
+    else:
+        stmt = stmt.where(Transaction.category == "General")
+
+    candidates = db.scalars(
+        stmt.order_by(Transaction.transaction_date.desc(), Transaction.id.desc())
+    ).all()
+
+    rules = list(
+        db.scalars(
+            select(CategorizationRule)
+            .where(CategorizationRule.is_active == True)
+            .order_by(CategorizationRule.priority.asc(), CategorizationRule.id.asc())
+        ).all()
+    )
+
+    eligible: list[Transaction] = []
+    for tx in candidates:
+        desc = tx.raw_description or tx.merchant
+        rule_cat, _, _ = evaluate_rules(desc, float(tx.amount), rules)
+        if rule_cat is not None:
+            continue
+        eligible.append(tx)
+
+    batch = eligible[:limit]
+    remaining = max(0, len(eligible) - len(batch))
+    if not batch:
+        return {
+            "dry_run": dry_run,
+            "evaluated": 0,
+            "updated": 0,
+            "skipped_circuit_open": 0,
+            "remaining": remaining,
+            "changes": [],
+        }
+
+    existing_tags = collect_existing_tags(db)
+    extra_categories = get_extra_jev_categories(db)
+    verdict_cache: dict[tuple[str, float], tuple[str, list[str]]] = {}
+
+    evaluated = 0
+    updated = 0
+    skipped_circuit_open = 0
+    changes: list[dict[str, Any]] = []
+
+    for idx, tx in enumerate(batch):
+        amt = float(tx.amount)
+        cache_key = ((tx.merchant or "").strip().lower(), round(amt, 2))
+        if cache_key in verdict_cache:
+            jev_cat, jev_tags = verdict_cache[cache_key]
+        else:
+            if is_jev_circuit_open():
+                skipped_circuit_open = len(batch) - idx
+                break
+            jev_cat, _, jev_tags = classify_transaction_jev_with_tags(
+                tx.merchant,
+                amt,
+                tx.notes,
+                existing_tags=existing_tags,
+                extra_categories=extra_categories,
+            )
+            verdict_cache[cache_key] = (jev_cat, jev_tags)
+
+        evaluated += 1
+        old_category = tx.category
+        old_tags = parse_rule_tags(tx.tags)
+
+        if old_category == "General":
+            candidate_cat = (jev_cat or "General").strip() or "General"
+            if candidate_cat.lower() == "income" and amt <= 0:
+                new_category = "General"
+            else:
+                new_category = candidate_cat
+        else:
+            new_category = old_category
+
+        new_tags = strip_redundant_tags([*old_tags, *(jev_tags or ())], new_category)
+
+        if new_category != old_category or new_tags != old_tags:
+            updated += 1
+            changes.append(
+                {
+                    "transaction_id": tx.id,
+                    "transaction_date": tx.transaction_date,
+                    "merchant": tx.merchant,
+                    "amount": amt,
+                    "currency": tx.currency or "NZD",
+                    "old_category": old_category,
+                    "new_category": new_category,
+                    "old_tags": old_tags,
+                    "new_tags": new_tags,
+                }
+            )
+            if not dry_run:
+                tx.category = new_category[:50]
+                tx.tags = json.dumps(new_tags)
+
+    if not dry_run and updated > 0:
+        db.commit()
+
+    return {
+        "dry_run": dry_run,
+        "evaluated": evaluated,
+        "updated": updated,
+        "skipped_circuit_open": skipped_circuit_open,
+        "remaining": remaining,
+        "changes": changes,
     }
