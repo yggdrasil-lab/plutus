@@ -1,8 +1,10 @@
 """Shared recurrence amortization helpers for weekly budgets and runway burn."""
 
 from datetime import date, timedelta
+from typing import Optional
+
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.models import Transaction
 from app.services.fx_service import to_nzd_amount
@@ -24,13 +26,39 @@ RECURRENCE_LOOKBACK_DAYS: dict[str, int] = {
 }
 
 
+def get_period_amortized_recurrences(period: Optional[str]) -> frozenset[str]:
+    """Return recurrence keys amortized into category totals for a named period."""
+    if period in ("week", "last_week"):
+        return frozenset(RECURRENCE_WEEKLY_FACTOR.keys())
+    if period in ("month", "last_month"):
+        return frozenset(("annual", "quarterly"))
+    return frozenset()
+
+
+def is_recurrence_excluded_from_period(
+    period: Optional[str],
+    recurrence: Optional[str],
+) -> bool:
+    """Return True if a raw transaction's recurrence is excluded from direct period sums."""
+    rec = (recurrence or "").strip().lower()
+    if not rec:
+        return False
+    if period in ("week", "last_week"):
+        return True
+    if period in ("month", "last_month"):
+        return rec in ("annual", "quarterly", "one-off")
+    return False
+
+
 def get_active_recurring_commitments(
     db: Session,
     as_of: date,
+    *,
+    eager_load: bool = False,
 ) -> list[tuple[Transaction, float]]:
     """Return latest non-transfer expense per (merchant, recurrence) with weekly NZD cost."""
     max_lookback = as_of - timedelta(days=366)
-    rows = db.scalars(
+    stmt = (
         select(Transaction)
         .where(
             Transaction.transaction_date >= max_lookback,
@@ -40,7 +68,12 @@ def get_active_recurring_commitments(
             func.lower(Transaction.category).not_in(("transfers", "transfer")),
         )
         .order_by(Transaction.transaction_date.desc(), Transaction.id.desc())
-    ).all()
+    )
+    if eager_load:
+        stmt = stmt.options(joinedload(Transaction.account), joinedload(Transaction.receipt))
+        rows = db.scalars(stmt).unique().all()
+    else:
+        rows = db.scalars(stmt).all()
 
     seen: set[tuple[str, str]] = set()
     commitments: list[tuple[Transaction, float]] = []

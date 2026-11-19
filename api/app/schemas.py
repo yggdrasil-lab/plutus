@@ -153,6 +153,10 @@ class TransactionRead(TransactionBase):
     has_receipt: bool = False
     receipt_id: Optional[int] = None
     is_receipt_split: bool = False
+    is_amortized_commitment: bool = False
+    amortized_period_amount_nzd: Optional[float] = None
+    amortized_cadence: Optional[str] = None
+    excluded_from_period_budget: bool = False
     created_at: datetime
 
     class Config:
@@ -218,6 +222,8 @@ class CategorySpendingReport(BaseModel):
     parent_category: Optional[str] = None
     total_spend: float
     transaction_count: int
+    actual_transaction_count: int = 0
+    amortized_count: int = 0
     percentage: float
     budget_limit: Optional[float] = None
     percent_used: Optional[float] = None
