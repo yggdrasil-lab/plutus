@@ -2,8 +2,8 @@
 
 from datetime import date
 import json
-from typing import Optional
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from typing import Any, Optional
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -17,11 +17,13 @@ from app.schemas import (
 )
 from app.services.receipt_service import (
     classify_line_item,
+    compress_receipt_image,
     compute_product_statistics,
     extract_tags_for_line_item,
     get_or_create_product,
+    infer_receipt_mime_type,
     match_receipt_to_transaction,
-    parse_receipt_text_with_llm,
+    parse_receipt_with_llm,
     reconcile_unlinked_receipts,
 )
 
@@ -109,89 +111,169 @@ def create_receipt(
     return receipt
 
 
+def _apply_parsed_receipt_fields(receipt: Receipt, parsed: dict[str, Any], db: Session) -> None:
+    """Populate receipt header fields and itemized line items from parsed LLM JSON."""
+    try:
+        r_date = date.fromisoformat(parsed.get("receipt_date", date.today().isoformat()))
+    except (TypeError, ValueError):
+        r_date = date.today()
+
+    receipt.receipt_date = r_date
+    receipt.merchant = str(parsed.get("merchant") or "Unknown Merchant").strip()[:150]
+    receipt.total_amount = float(parsed.get("total_amount", 0.0) or 0.0)
+    receipt.tax_amount = float(parsed["tax_amount"]) if parsed.get("tax_amount") is not None else None
+    receipt.is_processed = True
+    receipt.notes = None
+
+    receipt.items.clear()
+    db.flush()
+
+    for it in parsed.get("items", []):
+        item_name = str(it.get("item_name") or "Item").strip()
+        cat, dom, ptype, vol = classify_line_item(item_name)
+        it_cat = it.get("category") or cat
+        it_dom = it.get("domain") or dom
+        it_ptype = it.get("product_type") or ptype
+        it_vol = it.get("volume_ml") or vol
+        it_tags = it.get("tags") or extract_tags_for_line_item(item_name, it_dom, it_ptype)
+
+        prod = get_or_create_product(
+            db=db,
+            item_name=item_name,
+            brand=it.get("brand"),
+            category=it_cat,
+            domain=it_dom,
+            tags=it_tags,
+            volume_ml=it_vol,
+        )
+
+        r_item = ReceiptItem(
+            receipt_id=receipt.id,
+            product_id=prod.id,
+            item_name=item_name,
+            brand=it.get("brand"),
+            quantity=float(it.get("quantity", 1.0) or 1.0),
+            unit_price=float(it.get("unit_price", 0.0) or 0.0),
+            total_price=float(it.get("total_price", 0.0) or 0.0),
+            category=it_cat,
+            domain=it_dom,
+            product_type=it_ptype,
+            tags=json.dumps(it_tags),
+            volume_ml=it_vol,
+        )
+        db.add(r_item)
+
+
 @router.post("/upload", response_model=ReceiptRead, status_code=status.HTTP_201_CREATED)
 async def upload_receipt(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
-    """Upload a receipt image or text document, parse structured items with Jev, and store."""
-    content = await file.read()
-    raw_text = ""
-    try:
-        raw_text = content.decode("utf-8")
-    except UnicodeDecodeError:
-        raw_text = f"Receipt file: {file.filename} (binary size: {len(content)} bytes)"
+    """Upload a receipt photo/PDF/text, parse with Hydrogen Vision, and store in DB.
 
-    parsed = parse_receipt_text_with_llm(raw_text)
+    Processed images are downscaled and WebP-compressed to save database space.
+    Unprocessed receipts retain their original image quality for later reprocessing.
+    """
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded receipt file is empty")
+
+    mime_type = infer_receipt_mime_type(file.filename, file.content_type)
+    raw_text: Optional[str] = None
+    if mime_type.startswith("text/"):
+        try:
+            raw_text = content.decode("utf-8")
+        except UnicodeDecodeError:
+            raw_text = None
+
+    parsed = parse_receipt_with_llm(content, file.filename, mime_type)
 
     if parsed and "merchant" in parsed and "total_amount" in parsed:
-        try:
-            r_date = date.fromisoformat(parsed.get("receipt_date", date.today().isoformat()))
-        except ValueError:
-            r_date = date.today()
-
+        stored_bytes, stored_mime = compress_receipt_image(content, mime_type)
         receipt = Receipt(
-            receipt_date=r_date,
-            merchant=parsed.get("merchant", "Unknown Merchant"),
-            total_amount=float(parsed.get("total_amount", 0.0)),
-            tax_amount=float(parsed.get("tax_amount", 0.0)) if parsed.get("tax_amount") else None,
+            receipt_date=date.today(),
+            merchant="Pending",
+            total_amount=0.0,
             raw_text=raw_text,
+            image_data=stored_bytes,
+            image_mime_type=stored_mime,
+            image_filename=file.filename,
+            is_processed=True,
             status="unlinked",
         )
         db.add(receipt)
         db.flush()
-
-        for it in parsed.get("items", []):
-            item_name = it.get("item_name", "Item")
-            cat, dom, ptype, vol = classify_line_item(item_name)
-            it_cat = it.get("category") or cat
-            it_dom = it.get("domain") or dom
-            it_ptype = it.get("product_type") or ptype
-            it_vol = it.get("volume_ml") or vol
-            it_tags = it.get("tags") or extract_tags_for_line_item(item_name, it_dom, it_ptype)
-
-            prod = get_or_create_product(
-                db=db,
-                item_name=item_name,
-                brand=it.get("brand"),
-                category=it_cat,
-                domain=it_dom,
-                tags=it_tags,
-                volume_ml=it_vol,
-            )
-
-            r_item = ReceiptItem(
-                receipt_id=receipt.id,
-                product_id=prod.id,
-                item_name=item_name,
-                brand=it.get("brand"),
-                quantity=float(it.get("quantity", 1.0)),
-                unit_price=float(it.get("unit_price", 0.0)),
-                total_price=float(it.get("total_price", 0.0)),
-                category=it_cat,
-                domain=it_dom,
-                product_type=it_ptype,
-                tags=json.dumps(it_tags),
-                volume_ml=it_vol,
-            )
-            db.add(r_item)
-
+        _apply_parsed_receipt_fields(receipt, parsed, db)
         db.commit()
         db.refresh(receipt)
         match_receipt_to_transaction(receipt, db)
         return receipt
 
-    # Fallback when LLM is unavailable: create unlinked placeholder
+    # Unprocessed fallback: preserve original image quality in DB for manual linking or reprocessing
     receipt = Receipt(
         receipt_date=date.today(),
-        merchant=file.filename or "Scanned Receipt",
+        merchant=file.filename or "Unprocessed Receipt",
         total_amount=0.0,
         raw_text=raw_text,
+        image_data=content,
+        image_mime_type=mime_type,
+        image_filename=file.filename,
+        is_processed=False,
         status="unlinked",
+        notes="Pending vision processing (original quality preserved)",
     )
     db.add(receipt)
     db.commit()
     db.refresh(receipt)
+    return receipt
+
+
+@router.get("/{receipt_id}/image")
+def get_receipt_image(
+    receipt_id: int,
+    db: Session = Depends(get_db),
+):
+    """Serve the stored receipt image or document from the database."""
+    receipt = db.get(Receipt, receipt_id)
+    if not receipt or not receipt.image_data:
+        raise HTTPException(status_code=404, detail="Receipt image not found")
+
+    filename = receipt.image_filename or f"receipt-{receipt_id}"
+    return Response(
+        content=receipt.image_data,
+        media_type=receipt.image_mime_type or "application/octet-stream",
+        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+    )
+
+
+@router.post("/{receipt_id}/reprocess", response_model=ReceiptRead)
+def reprocess_receipt(
+    receipt_id: int,
+    db: Session = Depends(get_db),
+):
+    """Re-run Hydrogen Vision parsing on an unprocessed stored receipt and compress on success."""
+    receipt = db.get(Receipt, receipt_id)
+    if not receipt:
+        raise HTTPException(status_code=404, detail="Receipt not found")
+    if not receipt.image_data:
+        raise HTTPException(status_code=400, detail="Receipt has no stored image to reprocess")
+
+    mime_type = receipt.image_mime_type or infer_receipt_mime_type(receipt.image_filename, None)
+    parsed = parse_receipt_with_llm(receipt.image_data, receipt.image_filename, mime_type)
+    if not parsed or "merchant" not in parsed or "total_amount" not in parsed:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Receipt vision parsing failed; original image preserved.",
+        )
+
+    _apply_parsed_receipt_fields(receipt, parsed, db)
+    compressed_bytes, compressed_mime = compress_receipt_image(receipt.image_data, mime_type)
+    receipt.image_data = compressed_bytes
+    receipt.image_mime_type = compressed_mime
+    db.commit()
+    db.refresh(receipt)
+    if receipt.status == "unlinked":
+        match_receipt_to_transaction(receipt, db)
     return receipt
 
 

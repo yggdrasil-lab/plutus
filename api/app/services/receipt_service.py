@@ -1,8 +1,11 @@
 """Service for receipt parsing, line item extraction, cross-domain tagging, and reconciliation."""
 
+import base64
 from datetime import date, datetime, timedelta
+import io
 import json
 import logging
+import mimetypes
 from typing import Any, Optional
 import urllib.request
 
@@ -14,6 +17,37 @@ from app.models import Product, Receipt, ReceiptItem, Transaction
 from app.schemas import PricePoint, ProductRead, ProductStatisticItem, ProductStatisticsResponse
 
 logger = logging.getLogger(__name__)
+
+try:
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener()
+except ImportError:
+    pass
+
+RECEIPT_PARSING_PROMPT = """You are a specialized receipt parsing engine.
+Extract the merchant name, receipt date (YYYY-MM-DD), total amount, tax amount (if any), and itemized line items from this receipt.
+
+Respond STRICTLY with valid JSON following this exact schema:
+{
+  "merchant": "Merchant Name",
+  "receipt_date": "YYYY-MM-DD",
+  "total_amount": 0.00,
+  "tax_amount": 0.00,
+  "items": [
+    {
+      "item_name": "Product Name",
+      "brand": "Brand or null",
+      "quantity": 1.0,
+      "unit_price": 0.00,
+      "total_price": 0.00,
+      "category": "Skincare | Supplements | Groceries | Household | General",
+      "domain": "02-skin | 01-health | 20-home | general",
+      "product_type": "serum | cleanser | sunscreen | protein | creatine | null",
+      "volume_ml": "e.g. 30ml, 1kg, 60 caps or null"
+    }
+  ]
+}"""
 
 
 def classify_line_item(item_name: str) -> tuple[str, Optional[str], Optional[str], Optional[str]]:
@@ -280,36 +314,112 @@ def build_product_read(db: Session, product: Product) -> ProductRead:
     )
 
 
-def parse_receipt_text_with_llm(raw_text: str) -> Optional[dict[str, Any]]:
-    """Invokes Jev / Muninn LLM to extract structured line items from raw receipt text."""
+def infer_receipt_mime_type(filename: Optional[str], content_type: Optional[str]) -> str:
+    """Resolve an accurate MIME type from upload headers or filename extension."""
+    ct = (content_type or "").split(";")[0].strip().lower()
+    if ct and ct != "application/octet-stream":
+        return ct
+    if filename:
+        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        if ext in ("heic", "heif"):
+            return f"image/{ext}"
+        guessed, _ = mimetypes.guess_type(filename)
+        if guessed:
+            return guessed
+    return "application/octet-stream"
+
+
+def _normalize_image_rgb(img: Any) -> Any:
+    """Apply EXIF orientation and convert an image to RGB for WebP/JPEG encoding."""
+    from PIL import Image, ImageOps
+
+    img = ImageOps.exif_transpose(img)
+    if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+        background = Image.new("RGB", img.size, (255, 255, 255))
+        rgba = img.convert("RGBA")
+        background.paste(rgba, mask=rgba.split()[3])
+        return background
+    if img.mode != "RGB":
+        return img.convert("RGB")
+    return img
+
+
+def compress_receipt_image(
+    content: bytes,
+    mime_type: str,
+    max_dimension: int = 1400,
+    quality: int = 75,
+) -> tuple[bytes, str]:
+    """Downscale and WebP-compress a processed receipt image to minimize DB storage."""
+    if not mime_type.startswith("image/"):
+        return content, mime_type
+
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(content)) as raw_img:
+            img = _normalize_image_rgb(raw_img)
+            if max(img.size) > max_dimension:
+                img.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+            out = io.BytesIO()
+            img.save(out, format="WEBP", quality=quality, method=4)
+            compressed = out.getvalue()
+            if len(compressed) < len(content):
+                return compressed, "image/webp"
+            return content, mime_type
+    except Exception as exc:
+        logger.warning("Receipt image compression skipped (%s); retaining original bytes.", exc)
+        return content, mime_type
+
+
+def prepare_image_for_llm(
+    content: bytes,
+    mime_type: str,
+    max_dimension: int = 2048,
+) -> tuple[bytes, str]:
+    """Normalize image format (e.g. HEIC -> JPEG) and cap resolution for LLM vision."""
+    if not mime_type.startswith("image/"):
+        return content, mime_type
+
+    needs_transcode = mime_type not in ("image/jpeg", "image/png", "image/webp")
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(content)) as raw_img:
+            if not needs_transcode and max(raw_img.size) <= max_dimension:
+                return content, mime_type
+            img = _normalize_image_rgb(raw_img)
+            if max(img.size) > max_dimension:
+                img.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+            out = io.BytesIO()
+            img.save(out, format="JPEG", quality=88, optimize=True)
+            return out.getvalue(), "image/jpeg"
+    except Exception as exc:
+        logger.warning("Failed to normalize image for LLM (%s); sending raw bytes.", exc)
+        return content, mime_type
+
+
+def extract_pdf_text(content: bytes) -> str:
+    """Extract readable text from an uploaded PDF receipt using pdfplumber."""
+    try:
+        import pdfplumber
+
+        pages: list[str] = []
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text() or ""
+                if text.strip():
+                    pages.append(text.strip())
+        return "\n\n".join(pages)
+    except Exception as exc:
+        logger.warning("PDF receipt text extraction failed: %s", exc)
+        return ""
+
+
+def _invoke_receipt_llm(messages: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Call Muninn LLM gateway with configured receipt vision model and parse JSON."""
     if not settings.llm_api_key and not settings.llm_base_url:
         return None
-
-    prompt = f"""You are a specialized receipt parsing engine.
-Extract the merchant name, receipt date (YYYY-MM-DD), total amount, tax amount (if any), and itemized line items from this receipt text:
-
-{raw_text}
-
-Respond STRICTLY with valid JSON following this exact schema:
-{{
-  "merchant": "Merchant Name",
-  "receipt_date": "YYYY-MM-DD",
-  "total_amount": 0.00,
-  "tax_amount": 0.00,
-  "items": [
-    {{
-      "item_name": "Product Name",
-      "brand": "Brand or null",
-      "quantity": 1.0,
-      "unit_price": 0.00,
-      "total_price": 0.00,
-      "category": "Skincare | Supplements | Groceries | Household | General",
-      "domain": "02-skin | 01-health | 20-home | general",
-      "product_type": "serum | cleanser | sunscreen | protein | creatine | null",
-      "volume_ml": "e.g. 30ml, 1kg, 60 caps or null"
-    }}
-  ]
-}}"""
 
     url = f"{settings.llm_base_url.rstrip('/')}/chat/completions"
     headers = {
@@ -318,8 +428,8 @@ Respond STRICTLY with valid JSON following this exact schema:
         "User-Agent": "Yggdrasil-Plutus/1.0",
     }
     payload = {
-        "model": settings.llm_model,
-        "messages": [{"role": "user", "content": prompt}],
+        "model": settings.receipt_llm_model,
+        "messages": messages,
         "temperature": 0.1,
     }
 
@@ -330,15 +440,62 @@ Respond STRICTLY with valid JSON following this exact schema:
             headers=headers,
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=10) as response:
+        with urllib.request.urlopen(req, timeout=60) as response:
             res_data = json.loads(response.read().decode("utf-8"))
             content = res_data["choices"][0]["message"]["content"].strip()
             if content.startswith("```"):
                 content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
             return json.loads(content)
     except Exception as e:
-        logger.warning(f"LLM receipt parsing failed: {e}; falling back to deterministic extraction")
+        logger.warning("LLM receipt parsing failed (%s): %s", settings.receipt_llm_model, e)
         return None
+
+
+def parse_receipt_text_with_llm(raw_text: str) -> Optional[dict[str, Any]]:
+    """Invoke receipt LLM to extract structured line items from raw receipt text."""
+    messages = [
+        {
+            "role": "user",
+            "content": f"{RECEIPT_PARSING_PROMPT}\n\nReceipt text:\n{raw_text}",
+        }
+    ]
+    return _invoke_receipt_llm(messages)
+
+
+def parse_receipt_with_llm(
+    content: bytes,
+    filename: Optional[str],
+    mime_type: str,
+) -> Optional[dict[str, Any]]:
+    """Extract structured receipt fields from an image, PDF, or text document using Hydrogen."""
+    if mime_type.startswith("image/"):
+        llm_bytes, llm_mime = prepare_image_for_llm(content, mime_type)
+        b64_data = base64.b64encode(llm_bytes).decode("ascii")
+        data_uri = f"data:{llm_mime};base64,{b64_data}"
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": RECEIPT_PARSING_PROMPT},
+                    {"type": "image_url", "image_url": {"url": data_uri}},
+                ],
+            }
+        ]
+        return _invoke_receipt_llm(messages)
+
+    if mime_type == "application/pdf" or (filename and filename.lower().endswith(".pdf")):
+        pdf_text = extract_pdf_text(content)
+        if not pdf_text:
+            return None
+        return parse_receipt_text_with_llm(pdf_text)
+
+    try:
+        raw_text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if not raw_text.strip():
+        return None
+    return parse_receipt_text_with_llm(raw_text)
 
 
 def match_receipt_to_transaction(receipt: Receipt, db: Session) -> Optional[Transaction]:

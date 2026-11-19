@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     llm_base_url: str = "http://muninn:4000/v1"
     llm_api_key: str = ""
     llm_model: str = "app-synthesize"
+    receipt_llm_model: str = "gemini-4-hydrogen"
     jev_model: str = "jev-decision"
     akahu_app_token: str = Field(
         default="",

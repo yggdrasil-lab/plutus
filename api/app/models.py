@@ -10,6 +10,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Integer,
+    LargeBinary,
     Numeric,
     String,
     Text,
@@ -200,6 +201,10 @@ class Receipt(Base):
     tax_amount: Mapped[Optional[float]] = mapped_column(Numeric(12, 2), nullable=True)
     status: Mapped[str] = mapped_column(String(30), nullable=False, default="unlinked")  # unlinked, matched, verified
     image_path: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    image_data: Mapped[Optional[bytes]] = mapped_column(LargeBinary, nullable=True)
+    image_mime_type: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    image_filename: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    is_processed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     raw_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
@@ -207,6 +212,11 @@ class Receipt(Base):
 
     transaction: Mapped[Optional["Transaction"]] = relationship("Transaction", back_populates="receipt", foreign_keys=[transaction_id])
     items: Mapped[list["ReceiptItem"]] = relationship("ReceiptItem", back_populates="receipt", cascade="all, delete-orphan")
+
+    @property
+    def has_image(self) -> bool:
+        """Return True when binary receipt media is stored in the database."""
+        return self.image_data is not None and len(self.image_data) > 0
 
 
 class ReceiptItem(Base):

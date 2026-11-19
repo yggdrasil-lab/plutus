@@ -1,9 +1,11 @@
 """Unit tests for Receipt parsing, line items, cross-domain telemetry, and transaction matching."""
 
 from datetime import date, timedelta
+import io
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -231,3 +233,101 @@ class TestReceiptsRouter(unittest.TestCase):
         self.assertEqual(prod["total_spent"], 68.00)
         self.assertEqual(prod["avg_days_between_purchases"], 61.0)
         self.assertEqual(prod["estimated_depletion_date"], "2026-12-01")
+
+    @staticmethod
+    def _make_test_png_bytes(width: int = 2000, height: int = 2000) -> bytes:
+        from PIL import Image, ImageDraw
+
+        img = Image.new("RGB", (width, height), color=(255, 255, 255))
+        draw = ImageDraw.Draw(img)
+        draw.rectangle([50, 50, width - 50, height - 50], outline=(0, 0, 0), width=4)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
+    def test_upload_receipt_image_processed_compresses_and_serves(self):
+        raw_png = self._make_test_png_bytes(2000, 2000)
+        mock_parsed = {
+            "merchant": "Chemist Warehouse",
+            "receipt_date": "2026-11-19",
+            "total_amount": 34.00,
+            "tax_amount": 4.43,
+            "items": [
+                {
+                    "item_name": "Geek & Gorgeous C-Glow Vitamin C 30ml",
+                    "brand": "Geek & Gorgeous",
+                    "quantity": 1.0,
+                    "unit_price": 34.00,
+                    "total_price": 34.00,
+                }
+            ],
+        }
+
+        with patch("app.routers.receipts.parse_receipt_with_llm", return_value=mock_parsed) as mock_llm:
+            res = self.client.post(
+                "/receipts/upload",
+                files={"file": ("receipt.png", raw_png, "image/png")},
+            )
+            mock_llm.assert_called_once()
+
+        self.assertEqual(res.status_code, 201)
+        data = res.json()
+        self.assertTrue(data["is_processed"])
+        self.assertTrue(data["has_image"])
+        self.assertEqual(data["merchant"], "Chemist Warehouse")
+        self.assertEqual(data["total_amount"], 34.0)
+        self.assertEqual(data["image_mime_type"], "image/webp")
+        self.assertEqual(len(data["items"]), 1)
+
+        img_res = self.client.get(f"/receipts/{data['id']}/image")
+        self.assertEqual(img_res.status_code, 200)
+        self.assertEqual(img_res.headers["content-type"], "image/webp")
+        self.assertLess(len(img_res.content), len(raw_png))
+
+    def test_upload_unprocessed_preserves_original_until_reprocessed_then_delete(self):
+        raw_png = self._make_test_png_bytes(1800, 1800)
+
+        with patch("app.routers.receipts.parse_receipt_with_llm", return_value=None):
+            res = self.client.post(
+                "/receipts/upload",
+                files={"file": ("IMG_1234.png", raw_png, "image/png")},
+            )
+
+        self.assertEqual(res.status_code, 201)
+        data = res.json()
+        self.assertFalse(data["is_processed"])
+        self.assertTrue(data["has_image"])
+        self.assertEqual(data["image_mime_type"], "image/png")
+
+        # Original bytes preserved verbatim while unprocessed
+        img_res = self.client.get(f"/receipts/{data['id']}/image")
+        self.assertEqual(img_res.status_code, 200)
+        self.assertEqual(img_res.content, raw_png)
+
+        # Reprocess succeeds and compresses the stored image
+        mock_parsed = {
+            "merchant": "Woolworths",
+            "receipt_date": "2026-11-19",
+            "total_amount": 12.50,
+            "items": [
+                {
+                    "item_name": "Organic Milk 2L",
+                    "quantity": 1.0,
+                    "unit_price": 12.50,
+                    "total_price": 12.50,
+                }
+            ],
+        }
+        with patch("app.routers.receipts.parse_receipt_with_llm", return_value=mock_parsed):
+            re_res = self.client.post(f"/receipts/{data['id']}/reprocess")
+
+        self.assertEqual(re_res.status_code, 200)
+        re_data = re_res.json()
+        self.assertTrue(re_data["is_processed"])
+        self.assertEqual(re_data["merchant"], "Woolworths")
+        self.assertEqual(re_data["image_mime_type"], "image/webp")
+
+        # Delete removes both receipt and stored image
+        del_res = self.client.delete(f"/receipts/{data['id']}")
+        self.assertEqual(del_res.status_code, 204)
+        self.assertEqual(self.client.get(f"/receipts/{data['id']}/image").status_code, 404)
