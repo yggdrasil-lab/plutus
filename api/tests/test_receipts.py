@@ -403,8 +403,9 @@ class TestReceiptsRouter(unittest.TestCase):
         data = res.json()
         self.assertEqual(len(data["items"]), 2)
         coke = next(it for it in data["items"] if "Coca Cola" in it["item_name"])
+        self.assertEqual(coke["unit_price"], 34.99)
+        self.assertEqual(coke["discount_amount"], 7.0)
         self.assertEqual(coke["total_price"], 27.99)
-        self.assertEqual(coke["unit_price"], 27.99)
         self.assertIn("TPD Coca Cola No S", coke["notes"])
 
     def test_apply_receipt_discounts_heuristic_fallback_when_jev_offline(self):
@@ -419,4 +420,6 @@ class TestReceiptsRouter(unittest.TestCase):
             resolved = apply_receipt_discounts_with_jev(items)
 
         self.assertEqual(len(resolved), 2)
+        self.assertEqual(resolved[1]["unit_price"], 34.99)
+        self.assertEqual(resolved[1]["discount_amount"], 7.0)
         self.assertEqual(resolved[1]["total_price"], 27.99)
