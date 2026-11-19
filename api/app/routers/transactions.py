@@ -9,7 +9,7 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session, joinedload
 
 from app.db import get_db
-from app.models import Account, Transaction
+from app.models import Account, Receipt, Transaction
 from app.schemas import (
     TagCategoryBreakdownItem,
     TagSpendingSummaryItem,
@@ -18,7 +18,12 @@ from app.schemas import (
     TransactionRead,
     TransactionUpdate,
 )
-from app.services.burn_service import TRANSFER_CATEGORIES, to_nzd_amount
+from app.services.burn_service import (
+    TRANSFER_CATEGORIES,
+    expand_expense_transaction_by_receipt,
+    to_nzd_amount,
+)
+from app.services.category_taxonomy import get_root_category
 from app.services.period_service import resolve_period_dates
 from app.services.receipt_service import reconcile_unlinked_receipts
 from app.services.statement_parser import generate_transaction_hash
@@ -56,6 +61,7 @@ def list_transactions(
     start_date: Optional[date] = Query(default=None),
     end_date: Optional[date] = Query(default=None),
     category: Optional[str] = Query(default=None),
+    include_subclasses: bool = Query(default=False, description="Match child categories inheriting from category"),
     tag: Optional[str] = Query(default=None),
     period: Optional[str] = Query(
         default=None,
@@ -70,7 +76,7 @@ def list_transactions(
 
     stmt = select(Transaction).options(
         joinedload(Transaction.account),
-        joinedload(Transaction.receipt),
+        joinedload(Transaction.receipt).joinedload(Receipt.items),
     )
     if account_id is not None:
         stmt = stmt.where(Transaction.account_id == account_id)
@@ -78,18 +84,83 @@ def list_transactions(
         stmt = stmt.where(Transaction.transaction_date >= start_date)
     if end_date:
         stmt = stmt.where(Transaction.transaction_date <= end_date)
-    if category:
-        stmt = stmt.where(func.lower(Transaction.category) == category.strip().lower())
 
     ordered_stmt = stmt.order_by(desc(Transaction.transaction_date), desc(Transaction.id))
-    if tag:
-        target_tag = tag.strip().lower().lstrip("#").replace(" ", "-")
-        rows = db.scalars(
-            ordered_stmt.where(Transaction.tags.is_not(None), Transaction.tags != "[]")
-        ).all()
-        txs = [tx for tx in rows if target_tag in _parse_stored_tags(tx.tags)][:limit]
-    else:
-        txs = db.scalars(ordered_stmt.limit(limit)).all()
+    target_cat = category.strip().lower() if category else None
+    target_tag = tag.strip().lower().lstrip("#").replace(" ", "-") if tag else None
+
+    if target_cat or target_tag:
+        rows = db.scalars(ordered_stmt).unique().all()
+        results: list[TransactionRead] = []
+        for tx in rows:
+            if target_tag and target_tag not in _parse_stored_tags(tx.tags):
+                continue
+
+            tx.account_name = tx.account.name if tx.account else None
+            tx.has_receipt = bool(tx.receipt)
+
+            if target_cat:
+                tx_cat_lower = (tx.category or "General").strip().lower()
+                if (
+                    float(tx.amount) < 0
+                    and tx.receipt is not None
+                    and tx.receipt.items
+                    and tx_cat_lower not in TRANSFER_CATEGORIES
+                ):
+                    split = expand_expense_transaction_by_receipt(tx)
+                    matched = [
+                        (c, amt)
+                        for c, amt in split
+                        if (get_root_category(c).lower() if include_subclasses else c.lower()) == target_cat
+                    ]
+                    if not matched:
+                        continue
+                    matched_nzd = sum(amt for _, amt in matched)
+                    matched_cat = category.strip() if include_subclasses else matched[0][0]
+                    if len(split) > 1 or matched_cat.lower() != tx_cat_lower:
+                        fx_unit = to_nzd_amount(1.0, tx.currency, tx.exchange_rate)
+                        split_orig = round(matched_nzd / fx_unit, 2) if fx_unit > 0 else matched_nzd
+                        item_names = ", ".join(
+                            it.item_name
+                            for it in tx.receipt.items
+                            if (
+                                get_root_category(it.category or tx.category or "General").lower()
+                                if include_subclasses
+                                else (it.category or tx.category or "General").strip().lower()
+                            ) == target_cat
+                            and float(it.total_price) > 0
+                        )
+                        dto = TransactionRead.model_validate(tx).model_copy(
+                            update={
+                                "amount": -abs(split_orig),
+                                "category": matched_cat,
+                                "is_receipt_split": True,
+                                "notes": (
+                                    f"Receipt split ({item_names}) of {tx.currency} {abs(float(tx.amount)):.2f}"
+                                    if item_names
+                                    else tx.notes
+                                ),
+                            }
+                        )
+                        results.append(dto)
+                        if len(results) >= limit:
+                            break
+                        continue
+                else:
+                    effective_lower = (
+                        get_root_category(tx.category or "General").lower()
+                        if include_subclasses
+                        else tx_cat_lower
+                    )
+                    if effective_lower != target_cat:
+                        continue
+
+            results.append(TransactionRead.model_validate(tx))
+            if len(results) >= limit:
+                break
+        return results
+
+    txs = db.scalars(ordered_stmt.limit(limit)).unique().all()
     for tx in txs:
         tx.account_name = tx.account.name if tx.account else None
         tx.has_receipt = bool(tx.receipt)
