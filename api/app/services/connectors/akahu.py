@@ -4,7 +4,6 @@
 # 1. IMPORTS & CONSTANTS
 # ============================================================================
 from datetime import date, datetime, timedelta, timezone
-import re
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -106,11 +105,6 @@ def _concise_akahu_tags(lower_category: str, canonical: str) -> tuple[str, ...]:
     for keywords, tags in AKAHU_TAG_HINTS:
         if any(kw in lower_category for kw in keywords):
             return tags
-    # Fallback to first clause before comma/slash, capped at 24 chars
-    head = re.split(r"[,/&]", lower_category, maxsplit=1)[0].strip()
-    slug = re.sub(r"[^a-z0-9]+", "-", head).strip("-")[:24]
-    if slug and slug != canonical.lower():
-        return (slug,)
     return ()
 
 

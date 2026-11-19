@@ -89,6 +89,23 @@ class TestTransactionTagsAndAkahuCategories(unittest.TestCase):
         self.assertEqual(feeds[0].transactions[0].category, "Fitness")
         self.assertEqual(feeds[0].transactions[0].tags, ("gym", "subscription"))
 
+    def test_akahu_omits_unmatched_mcc_fallback_slugs(self):
+        cat_tech, tags_tech = normalize_akahu_category(
+            "Electronic and appliance stores", "Apple Store", "APPLE STORE NZ"
+        )
+        self.assertEqual(cat_tech, "Tech")
+        self.assertEqual(tags_tech, ())
+
+        cat_shop, tags_shop = normalize_akahu_category(
+            "Department stores and general merchandise", "Kmart", "KMART ALBANY"
+        )
+        self.assertEqual(cat_shop, "Shopping")
+        self.assertEqual(tags_shop, ())
+
+        cat_fuel, tags_fuel = normalize_akahu_category("Fuel stations", "BP", "BP ALBANY")
+        self.assertEqual(cat_fuel, "Fuel")
+        self.assertEqual(tags_fuel, ("fuel",))
+
     def test_akahu_utc_timestamp_converts_to_auckland_local_date(self):
         from datetime import date
         from app.services.connectors.akahu import _parse_iso_date

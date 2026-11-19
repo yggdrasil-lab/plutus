@@ -20,6 +20,7 @@ from app.models import Account, Receipt, ReceiptItem, Transaction
 from app.services.receipt_service import (
     classify_line_item,
     compute_product_statistics,
+    extract_tags_for_line_item,
     match_receipt_to_transaction,
     reconcile_unlinked_receipts,
 )
@@ -716,3 +717,40 @@ class TestReceiptsRouter(unittest.TestCase):
         )
         self.assertEqual(refreshed_yonex["category"], "Health")
         self.assertEqual(refreshed_yonex["tags"], ["badminton", "sport-gear"])
+
+    def test_extract_tags_omits_general_fallback_tag(self):
+        self.assertEqual(extract_tags_for_line_item("Mystery Item"), [])
+        self.assertEqual(extract_tags_for_line_item("Mystery Item", domain="general"), [])
+        self.assertEqual(
+            extract_tags_for_line_item(
+                "Copper & Oak Pant", domain="general", product_type="clothing"
+            ),
+            ["clothing"],
+        )
+
+        with patch(
+            "app.services.receipt_service.classify_transaction_jev_with_tags",
+            return_value=("General", False, []),
+        ):
+            res = self.client.post(
+                "/receipts",
+                json={
+                    "receipt_date": date.today().isoformat(),
+                    "merchant": "Corner Shop",
+                    "total_amount": 12.00,
+                    "items": [
+                        {
+                            "item_name": "Zebra Gizmo",
+                            "quantity": 1.0,
+                            "unit_price": 12.00,
+                            "total_price": 12.00,
+                        }
+                    ],
+                },
+            )
+        self.assertEqual(res.status_code, 201)
+        item = res.json()["items"][0]
+        self.assertEqual(item["tags"], [])
+        products_res = self.client.get("/products")
+        self.assertEqual(products_res.status_code, 200)
+        self.assertEqual(products_res.json()["products"][0]["tags"], [])
