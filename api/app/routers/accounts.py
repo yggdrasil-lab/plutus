@@ -15,6 +15,7 @@ from app.schemas import (
     AssetSnapshotCreate,
     AssetSnapshotRead,
 )
+from app.services.ingestion_service import upsert_account_snapshot
 
 router = APIRouter(prefix="/accounts", tags=["Accounts"])
 
@@ -64,41 +65,22 @@ def record_asset_snapshot(
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
 
-    balance_nzd = payload.balance * payload.exchange_rate
-
-    # Check for existing snapshot on the same date for idempotency
-    existing = db.scalar(
-        select(AssetSnapshot).where(
-            AssetSnapshot.account_id == account_id,
-            AssetSnapshot.snapshot_date == payload.snapshot_date,
-        )
+    target_currency = (
+        payload.currency
+        if ("currency" in payload.model_fields_set and payload.currency)
+        else (account.currency or "NZD")
     )
-
-    if existing:
-        existing.balance = payload.balance
-        existing.currency = payload.currency
-        existing.exchange_rate = payload.exchange_rate
-        existing.balance_nzd = balance_nzd
-        existing.source = payload.source
-        existing.notes = payload.notes
-        db.commit()
-        db.refresh(existing)
-        return existing
-
-    snapshot = AssetSnapshot(
-        account_id=account_id,
+    return upsert_account_snapshot(
+        db,
+        account=account,
         snapshot_date=payload.snapshot_date,
         balance=payload.balance,
-        currency=payload.currency,
-        exchange_rate=payload.exchange_rate,
-        balance_nzd=balance_nzd,
+        currency=target_currency,
         source=payload.source,
         notes=payload.notes,
+        exchange_rate=payload.exchange_rate,
+        preserve_existing_notes_if_none=False,
     )
-    db.add(snapshot)
-    db.commit()
-    db.refresh(snapshot)
-    return snapshot
 
 
 @router.get("/{account_id}/snapshots", response_model=list[AssetSnapshotRead])

@@ -5,7 +5,7 @@ import json
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import desc, func, select
+from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.orm import Session, joinedload
 
 from app.db import get_db
@@ -25,6 +25,7 @@ from app.services.burn_service import (
     weekly_to_monthly,
 )
 from app.services.category_taxonomy import get_category_parent_map, get_root_category
+from app.services.fx_service import get_exchange_rate
 from app.services.period_service import resolve_period_dates
 from app.services.receipt_service import reconcile_unlinked_receipts
 from app.services.recurrence_service import (
@@ -37,6 +38,57 @@ from app.services.statement_parser import generate_transaction_hash
 from app.services.transfer_service import reconcile_transfers
 
 router = APIRouter(prefix="/transactions", tags=["Transactions"])
+
+
+def _transaction_load_options(*, include_receipt_items: bool = False):
+    """Return consistent eager-load options for TransactionRead hydration."""
+    receipt_load = (
+        joinedload(Transaction.receipt).joinedload(Receipt.items)
+        if include_receipt_items
+        else joinedload(Transaction.receipt)
+    )
+    return (
+        joinedload(Transaction.account),
+        joinedload(Transaction.counterpart_account),
+        joinedload(Transaction.linked_transaction).joinedload(Transaction.account),
+        receipt_load,
+    )
+
+
+def hydrate_transaction(tx: Transaction) -> Transaction:
+    """Populate derived account, counterpart, linked-transfer, and receipt fields."""
+    tx.account_name = tx.account.name if tx.account else None
+    tx.counterpart_account_name = (
+        tx.counterpart_account.name if tx.counterpart_account else None
+    )
+    linked = tx.linked_transaction
+    if linked is not None:
+        tx.linked_account_name = linked.account.name if linked.account else None
+        tx.linked_amount = float(linked.amount)
+        tx.linked_currency = linked.currency
+    else:
+        tx.linked_account_name = None
+        tx.linked_amount = None
+        tx.linked_currency = None
+    tx.has_receipt = bool(tx.receipt)
+    tx.receipt_id = tx.receipt.id if tx.receipt else None
+    return tx
+
+
+def _resolve_unlinked_fx_rate(db: Session, leg: Transaction) -> Optional[float]:
+    """Return None for NZD or resolved currency->NZD rate for unlinked non-NZD transactions."""
+    currency = (leg.currency or "NZD").strip().upper()
+    if currency == "NZD":
+        return None
+    resolved = get_exchange_rate(
+        db,
+        rate_date=leg.transaction_date,
+        from_currency=currency,
+        to_currency="NZD",
+    )
+    if resolved is not None and resolved[0] > 0:
+        return round(float(resolved[0]), 8)
+    return None
 
 
 def _matches_receipt_transaction_filter(
@@ -158,9 +210,7 @@ def _collect_amortized_commitments(
         if effective_rec_lower != target_cat:
             continue
 
-        rec_tx.account_name = rec_tx.account.name if rec_tx.account else None
-        rec_tx.has_receipt = bool(rec_tx.receipt)
-        rec_tx.receipt_id = rec_tx.receipt.id if rec_tx.receipt else None
+        hydrate_transaction(rec_tx)
         amortized_nzd = weekly_to_monthly(weekly_nzd) if is_monthly else weekly_nzd
         amortized_results.append(
             TransactionRead.model_validate(rec_tx).model_copy(
@@ -207,12 +257,17 @@ def list_transactions(
     ref_date = end_date or date.today()
     amortized_recurrences = get_period_amortized_recurrences(effective_period)
 
-    stmt = select(Transaction).options(
-        joinedload(Transaction.account),
-        joinedload(Transaction.receipt).joinedload(Receipt.items),
-    )
+    stmt = select(Transaction).options(*_transaction_load_options(include_receipt_items=True))
     if account_id is not None:
-        stmt = stmt.where(Transaction.account_id == account_id)
+        stmt = stmt.where(
+            or_(
+                Transaction.account_id == account_id,
+                and_(
+                    Transaction.counterpart_account_id == account_id,
+                    Transaction.linked_transaction_id.is_(None),
+                ),
+            )
+        )
     if start_date:
         stmt = stmt.where(Transaction.transaction_date >= start_date)
     if end_date:
@@ -254,9 +309,7 @@ def list_transactions(
             for tx in rows:
                 if tx.id in amortized_tx_ids:
                     continue
-                tx.account_name = tx.account.name if tx.account else None
-                tx.has_receipt = bool(tx.receipt)
-                tx.receipt_id = tx.receipt.id if tx.receipt else None
+                hydrate_transaction(tx)
                 dto = _matches_receipt_transaction_filter(
                     tx,
                     category=category,
@@ -280,9 +333,7 @@ def list_transactions(
 
     txs = db.scalars(ordered_stmt.limit(limit)).unique().all()
     for tx in txs:
-        tx.account_name = tx.account.name if tx.account else None
-        tx.has_receipt = bool(tx.receipt)
-        tx.receipt_id = tx.receipt.id if tx.receipt else None
+        hydrate_transaction(tx)
     return txs
 
 
@@ -295,7 +346,7 @@ def update_transaction(
     """Update category, merchant, or notes of an existing transaction."""
     tx = db.scalar(
         select(Transaction)
-        .options(joinedload(Transaction.account), joinedload(Transaction.receipt))
+        .options(*_transaction_load_options())
         .where(Transaction.id == transaction_id)
     )
     if not tx:
@@ -305,17 +356,21 @@ def update_transaction(
         cat = payload.category.strip()
         if not cat:
             raise HTTPException(status_code=400, detail="Category name cannot be empty")
+        was_transfer_or_linked = (
+            (tx.category or "").strip().lower() in TRANSFER_CATEGORIES
+            or tx.linked_transaction_id is not None
+        )
         tx.category = cat
-        if cat.lower() not in ("transfers", "transfer"):
+        if cat.lower() not in TRANSFER_CATEGORIES and was_transfer_or_linked:
             if tx.linked_transaction_id is not None:
                 partner = db.get(Transaction, tx.linked_transaction_id)
                 if partner is not None:
                     partner.linked_transaction_id = None
-                    partner.exchange_rate = None
                     partner.fee_amount = None
+                    partner.exchange_rate = _resolve_unlinked_fx_rate(db, partner)
             tx.linked_transaction_id = None
-            tx.exchange_rate = None
             tx.fee_amount = None
+            tx.exchange_rate = _resolve_unlinked_fx_rate(db, tx)
 
     if payload.merchant is not None:
         m = payload.merchant.strip()
@@ -332,11 +387,12 @@ def update_transaction(
         tx.recurrence = payload.recurrence
 
     db.commit()
-    db.refresh(tx)
-    tx.account_name = tx.account.name if tx.account else None
-    tx.has_receipt = bool(tx.receipt)
-    tx.receipt_id = tx.receipt.id if tx.receipt else None
-    return tx
+    hydrated = db.scalar(
+        select(Transaction)
+        .options(*_transaction_load_options())
+        .where(Transaction.id == transaction_id)
+    )
+    return hydrate_transaction(hydrated or tx)
 
 
 @router.post("", response_model=TransactionRead, status_code=status.HTTP_201_CREATED)
@@ -358,13 +414,11 @@ def create_transaction(
 
     existing = db.scalar(
         select(Transaction)
-        .options(joinedload(Transaction.account), joinedload(Transaction.receipt))
+        .options(*_transaction_load_options())
         .where(Transaction.raw_hash == raw_hash)
     )
     if existing:
-        existing.account_name = account.name
-        existing.has_receipt = bool(existing.receipt)
-        return existing
+        return hydrate_transaction(existing)
 
     tx = Transaction(
         transaction_date=payload.transaction_date,
@@ -389,12 +443,13 @@ def create_transaction(
     # Automatically reconcile any unlinked receipts and internal/cross-currency transfers
     reconcile_unlinked_receipts(db)
     reconcile_transfers(db)
-    db.refresh(tx)
 
-    tx.account_name = account.name
-    tx.has_receipt = bool(tx.receipt)
-    tx.receipt_id = tx.receipt.id if tx.receipt else None
-    return tx
+    hydrated = db.scalar(
+        select(Transaction)
+        .options(*_transaction_load_options())
+        .where(Transaction.id == tx.id)
+    )
+    return hydrate_transaction(hydrated or tx)
 
 
 @router.post("/reconcile-transfers")

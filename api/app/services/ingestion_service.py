@@ -22,6 +22,7 @@ from app.services.fx_service import get_exchange_rate
 from app.services.jev_client import classify_transaction_jev_with_tags, get_extra_jev_categories
 from app.services.receipt_service import reconcile_unlinked_receipts
 from app.services.rules_engine import (
+    apply_counterpart_account_for_rule,
     collect_existing_tags,
     evaluate_rules,
     normalize_tags,
@@ -175,27 +176,28 @@ def _resolve_category_and_merchant(
     skip_llm: bool = False,
     existing_tags: list[str] | tuple[str, ...] | None = None,
     extra_categories: list[str] | tuple[str, ...] | None = None,
-) -> tuple[str, str, list[str], Optional[str]]:
-    """Resolve final (merchant, category, extra_tags, recurrence) using rules, upstream category, and Jev."""
+) -> tuple[str, str, list[str], Optional[str], Optional[CategorizationRule]]:
+    """Resolve final (merchant, category, extra_tags, recurrence, matched_rule)."""
     desc = item.raw_description or item.merchant
     rule_cat, rename, rule_id = evaluate_rules(desc, item.amount, active_rules)
     merchant_name = (rename if rename else item.merchant)[:150]
 
     extra_tags: list[str] = []
     rule_recurrence: Optional[str] = None
+    matched_rule: Optional[CategorizationRule] = None
     if rule_cat:
         if rule_id:
-            matched = next((r for r in active_rules if r.id == rule_id), None)
-            if matched:
-                matched.match_count += 1
-                extra_tags = parse_rule_tags(matched.target_tags)
-                rule_recurrence = matched.target_recurrence
+            matched_rule = next((r for r in active_rules if r.id == rule_id), None)
+            if matched_rule:
+                matched_rule.match_count += 1
+                extra_tags = parse_rule_tags(matched_rule.target_tags)
+                rule_recurrence = matched_rule.target_recurrence
         resolved_cat = rule_cat
     elif item.category and item.category != "General":
         resolved_cat = item.category
     elif skip_llm:
         resolved_cat = auto_categorize(merchant_name)
-        return merchant_name, resolved_cat, [], None
+        return merchant_name, resolved_cat, [], None, None
     else:
         jev_cat, _, jev_tags = classify_transaction_jev_with_tags(
             merchant_name,
@@ -205,7 +207,7 @@ def _resolve_category_and_merchant(
             extra_categories=extra_categories,
         )
         resolved_cat = jev_cat if jev_cat and jev_cat != "General" else auto_categorize(merchant_name)
-        return merchant_name, resolved_cat, strip_redundant_tags(jev_tags, resolved_cat), None
+        return merchant_name, resolved_cat, strip_redundant_tags(jev_tags, resolved_cat), None, None
 
     if not skip_llm and not item.tags and not extra_tags:
         _, _, jev_tags = classify_transaction_jev_with_tags(
@@ -218,7 +220,7 @@ def _resolve_category_and_merchant(
         extra_tags = jev_tags
 
     filtered_extra = strip_redundant_tags(extra_tags, resolved_cat)
-    return merchant_name, resolved_cat, filtered_extra, rule_recurrence
+    return merchant_name, resolved_cat, filtered_extra, rule_recurrence, matched_rule
 
 
 def _cross_source_key(tx_date: date, amount: float | Decimal) -> tuple[date, Decimal]:
@@ -285,6 +287,7 @@ def ingest_normalized_transactions(
     }
 
     created: list[Transaction] = []
+    matched_tx_rules: list[tuple[Transaction, CategorizationRule]] = []
     skipped = 0
     reconcile_needed = False
 
@@ -359,7 +362,7 @@ def ingest_normalized_transactions(
         if ext_note:
             seen_external_notes.add(ext_note)
 
-        merchant_name, tx_cat, rule_tags, rule_recurrence = _resolve_category_and_merchant(
+        merchant_name, tx_cat, rule_tags, rule_recurrence, matched_rule = _resolve_category_and_merchant(
             item,
             active_rules,
             skip_llm=skip_llm,
@@ -395,6 +398,8 @@ def ingest_normalized_transactions(
         )
         db.add(tx)
         created.append(tx)
+        if matched_rule is not None and matched_rule.counterpart_account_id is not None:
+            matched_tx_rules.append((tx, matched_rule))
 
     account.last_synced_at = datetime.now(timezone.utc)
     db.commit()
@@ -404,6 +409,16 @@ def ingest_normalized_transactions(
     if created:
         reconcile_unlinked_receipts(db)
         reconcile_transfers(db)
+        if matched_tx_rules:
+            counterpart_updated = False
+            for tx, matched_rule in matched_tx_rules:
+                db.refresh(tx)
+                if apply_counterpart_account_for_rule(db, tx, matched_rule):
+                    counterpart_updated = True
+            if counterpart_updated:
+                db.commit()
+                for tx in created:
+                    db.refresh(tx)
     elif reconcile_needed:
         reconcile_transfers(db)
 
@@ -419,19 +434,24 @@ def upsert_account_snapshot(
     currency: str,
     source: str,
     notes: Optional[str] = None,
+    exchange_rate: Optional[float] = None,
+    preserve_existing_notes_if_none: bool = True,
 ) -> AssetSnapshot:
     """Insert or update the balance snapshot for an account on a given date."""
     normalized_currency = (currency or account.currency or "NZD")[:10].upper()
     fx_rate = 1.0
     if normalized_currency != "NZD":
-        resolved = get_exchange_rate(
-            db,
-            rate_date=snapshot_date,
-            from_currency=normalized_currency,
-            to_currency="NZD",
-        )
-        if resolved is not None:
-            fx_rate = resolved[0]
+        if exchange_rate is not None and float(exchange_rate) > 0:
+            fx_rate = float(exchange_rate)
+        else:
+            resolved = get_exchange_rate(
+                db,
+                rate_date=snapshot_date,
+                from_currency=normalized_currency,
+                to_currency="NZD",
+            )
+            if resolved is not None and resolved[0] > 0:
+                fx_rate = float(resolved[0])
     balance_nzd = round(float(balance) * fx_rate, 2)
 
     existing = db.scalar(
@@ -446,7 +466,7 @@ def upsert_account_snapshot(
         existing.balance_nzd = balance_nzd
         existing.currency = normalized_currency[:3]
         existing.source = source[:30]
-        if notes:
+        if notes or not preserve_existing_notes_if_none:
             existing.notes = notes
         db.commit()
         db.refresh(existing)

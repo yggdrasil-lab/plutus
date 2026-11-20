@@ -46,7 +46,11 @@ class Account(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
 
     snapshots: Mapped[list["AssetSnapshot"]] = relationship("AssetSnapshot", back_populates="account", cascade="all, delete-orphan")
-    transactions: Mapped[list["Transaction"]] = relationship("Transaction", back_populates="account")
+    transactions: Mapped[list["Transaction"]] = relationship(
+        "Transaction",
+        back_populates="account",
+        foreign_keys="Transaction.account_id",
+    )
 
 
 class AssetSnapshot(Base):
@@ -86,6 +90,7 @@ class Transaction(Base):
     raw_description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     raw_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
     linked_transaction_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("transactions.id", ondelete="SET NULL"), nullable=True, index=True)
+    counterpart_account_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("accounts.id", ondelete="SET NULL"), nullable=True, index=True)
     exchange_rate: Mapped[Optional[float]] = mapped_column(Numeric(18, 8), nullable=True)
     fee_amount: Mapped[Optional[float]] = mapped_column(Numeric(18, 8), nullable=True)
     tags: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
@@ -93,7 +98,15 @@ class Transaction(Base):
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
-    account: Mapped["Account"] = relationship("Account", back_populates="transactions")
+    account: Mapped["Account"] = relationship(
+        "Account",
+        back_populates="transactions",
+        foreign_keys=[account_id],
+    )
+    counterpart_account: Mapped[Optional["Account"]] = relationship(
+        "Account",
+        foreign_keys=[counterpart_account_id],
+    )
     linked_transaction: Mapped[Optional["Transaction"]] = relationship(
         "Transaction",
         remote_side="Transaction.id",
@@ -194,11 +207,17 @@ class CategorizationRule(Base):
     target_tags: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     target_recurrence: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     rename_merchant: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
+    counterpart_account_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("accounts.id", ondelete="SET NULL"), nullable=True, index=True)
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     match_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+    counterpart_account: Mapped[Optional["Account"]] = relationship(
+        "Account",
+        foreign_keys=[counterpart_account_id],
+    )
 
 
 class Product(Base):

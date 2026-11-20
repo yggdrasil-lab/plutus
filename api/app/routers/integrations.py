@@ -29,6 +29,7 @@ from app.schemas import (
     SyncResult,
     TransactionRead,
 )
+from app.routers.transactions import _transaction_load_options, hydrate_transaction
 from app.services.connectors import ConnectorConfigError, ConnectorUpstreamError
 from app.services.connectors.akahu import sync_akahu
 from app.services.connectors.bitcoin import sync_bitcoin
@@ -139,9 +140,13 @@ def quick_log_expense(
         account_id=target_account.id,
     )
 
-    existing = db.scalar(select(Transaction).where(Transaction.raw_hash == raw_hash))
+    existing = db.scalar(
+        select(Transaction)
+        .options(*_transaction_load_options())
+        .where(Transaction.raw_hash == raw_hash)
+    )
     if existing:
-        return existing
+        return hydrate_transaction(existing)
 
     # Category resolution via Jev System One or rule-based fallback
     category = payload.category
@@ -184,7 +189,12 @@ def quick_log_expense(
     reconcile_unlinked_receipts(db)
     reconcile_transfers(db)
 
-    return tx
+    hydrated = db.scalar(
+        select(Transaction)
+        .options(*_transaction_load_options())
+        .where(Transaction.id == tx.id)
+    )
+    return hydrate_transaction(hydrated or tx)
 
 
 @router.post("/statement", response_model=StatementParseResult)
@@ -398,7 +408,16 @@ def receive_dbs_alert(
 ):
     """Ingest a forwarded DBS transaction alert email from Cloudflare Email Worker."""
     try:
-        return ingest_dbs_alert(db, payload)
+        result = ingest_dbs_alert(db, payload)
+        if result.transaction is not None:
+            hydrated = db.scalar(
+                select(Transaction)
+                .options(*_transaction_load_options())
+                .where(Transaction.id == result.transaction.id)
+            )
+            if hydrated is not None:
+                result.transaction = TransactionRead.model_validate(hydrate_transaction(hydrated))
+        return result
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
