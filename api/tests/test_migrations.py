@@ -5,6 +5,7 @@ import sqlite3
 
 from alembic import command as alembic_command
 from alembic.config import Config as AlembicConfig
+from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
@@ -113,7 +114,7 @@ def test_alembic_upgrade_head_creates_loans_and_commits(tmp_path: Path, monkeypa
         "created_at",
     }.issubset(split_columns)
     assert version is not None
-    assert version[0] == "0020_email_ingestion_and_receipt_fields"
+    assert version[0] == "0020_email_ingestion"
 
     parent_by_name = {name: parent for name, parent, _ in seeded_categories}
     system_by_name = {name: bool(is_sys) for name, _, is_sys in seeded_categories}
@@ -179,7 +180,7 @@ def test_alembic_upgrade_head_creates_loans_and_commits(tmp_path: Path, monkeypa
             conn.execute("SELECT name, account_type FROM accounts").fetchall()
         )
     assert reup_ver is not None
-    assert reup_ver[0] == "0020_email_ingestion_and_receipt_fields"
+    assert reup_ver[0] == "0020_email_ingestion"
     assert "ingested_emails" in reup_tables
     assert "account_number_last4" in reup_account_cols
     assert {"order_number", "source_email_message_id"}.issubset(reup_receipt_cols)
@@ -203,3 +204,17 @@ def test_alembic_upgrade_head_creates_loans_and_commits(tmp_path: Path, monkeypa
                 session.scalars(select(model).limit(1)).all()
     finally:
         engine.dispose()
+
+
+def test_all_alembic_revision_ids_fit_postgres_varchar32() -> None:
+    """Guard against revision IDs exceeding PostgreSQL alembic_version.version_num VARCHAR(32)."""
+    api_root = Path(__file__).resolve().parent.parent
+    cfg = AlembicConfig(str(api_root / "alembic.ini"))
+    cfg.set_main_option("script_location", str(api_root / "alembic"))
+    scripts = ScriptDirectory.from_config(cfg)
+    too_long = [
+        f"{rev.revision} ({len(rev.revision)} chars)"
+        for rev in scripts.walk_revisions()
+        if len(rev.revision) > 32
+    ]
+    assert too_long == []

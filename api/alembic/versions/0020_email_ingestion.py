@@ -1,6 +1,6 @@
 """Add email ingestion audit table, account suffix, receipt order/email fields, and DBS card type fix.
 
-Revision ID: 0020_email_ingestion_and_receipt_fields
+Revision ID: 0020_email_ingestion
 Revises: 0019_transaction_splits
 Create Date: 2026-11-21 12:00:00.000000
 
@@ -10,7 +10,7 @@ from typing import Sequence, Union
 from alembic import op
 import sqlalchemy as sa
 
-revision: str = "0020_email_ingestion_and_receipt_fields"
+revision: str = "0020_email_ingestion"
 down_revision: Union[str, None] = "0019_transaction_splits"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
