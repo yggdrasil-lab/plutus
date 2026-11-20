@@ -3,11 +3,12 @@
 from datetime import date, timedelta
 from typing import Optional
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, joinedload
 
 from app.models import Transaction, TransactionSplit
 from app.services.fx_service import to_nzd_amount
+from app.services.split_utils import resolve_signed_split_amount
 
 RECURRENCE_WEEKLY_FACTOR: dict[str, float] = {
     "weekly": 1.0,
@@ -63,9 +64,15 @@ def get_active_recurring_commitments(
         .where(
             Transaction.transaction_date >= max_lookback,
             Transaction.transaction_date <= as_of,
-            Transaction.amount < 0,
+            or_(
+                Transaction.amount < 0,
+                Transaction.splits.any(TransactionSplit.amount < 0),
+            ),
             Transaction.recurrence.in_(tuple(RECURRENCE_WEEKLY_FACTOR.keys())),
-            func.lower(Transaction.category).not_in(("transfers", "transfer")),
+            or_(
+                func.lower(Transaction.category).not_in(("transfers", "transfer")),
+                Transaction.splits.any(),
+            ),
         )
         .order_by(Transaction.transaction_date.desc(), Transaction.id.desc())
     )
@@ -91,18 +98,19 @@ def get_active_recurring_commitments(
     for tx in rows:
         splits = getattr(tx, "splits", None) or []
         if splits:
-            non_excluded_splits = [
-                s
-                for s in splits
-                if (s.category or "").strip().lower() not in ("transfers", "transfer")
-                and not (
-                    s.loan is not None
-                    and (s.loan.loan_type or "").strip().lower() == "lent"
-                )
-            ]
-            if not non_excluded_splits:
+            outflow_amounts: list[float] = []
+            for s in splits:
+                signed_amt = resolve_signed_split_amount(s, splits, float(tx.amount))
+                if signed_amt >= 0:
+                    continue
+                if (s.category or "").strip().lower() in ("transfers", "transfer"):
+                    continue
+                if s.loan is not None and (s.loan.loan_type or "").strip().lower() == "lent":
+                    continue
+                outflow_amounts.append(abs(signed_amt))
+            if not outflow_amounts:
                 continue
-            effective_amount = sum(abs(float(s.amount)) for s in non_excluded_splits)
+            effective_amount = sum(outflow_amounts)
         else:
             if tx.loan is not None and (tx.loan.loan_type or "").strip().lower() == "lent":
                 continue

@@ -113,10 +113,10 @@ def test_outflow_split_breakdown_transactions_and_burn():
         split_data = split_res.json()
         assert split_data["is_split"] is True
         assert len(split_data["splits"]) == 2
-        assert split_data["splits"][0]["amount"] == 80.0
+        assert split_data["splits"][0]["amount"] == -80.0
         assert split_data["splits"][0]["category"] == "Groceries"
         assert split_data["splits"][0]["tags"] == ["pantry"]
-        assert split_data["splits"][1]["amount"] == 40.0
+        assert split_data["splits"][1]["amount"] == -40.0
         assert split_data["splits"][1]["category"] == "Household"
 
         # Breakdown reflects split categories (manual splits override receipt items)
@@ -515,5 +515,163 @@ def test_split_validation_clearing_rules_and_lent_outflow_exclusion():
         cleared = clear_res.json()
         assert cleared["is_split"] is False
         assert cleared["splits"] == []
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_signed_splits_zero_rejection_legacy_db_rows_tags_and_recurrence():
+    from app.models import TransactionSplit
+
+    client, TestingSessionLocal = _build_test_client()
+
+    try:
+        today = date.today()
+        with TestingSessionLocal() as db:
+            acc = Account(
+                name="ANZ Checking",
+                institution="ANZ",
+                account_type="checking",
+                tier="cash",
+                currency="NZD",
+            )
+            db.add(acc)
+            db.commit()
+            db.refresh(acc)
+            acc_id = acc.id
+
+        # 1. Zero split amount rejected with 422
+        tx_neg = client.post(
+            "/transactions",
+            json={
+                "transaction_date": today.isoformat(),
+                "account_id": acc_id,
+                "amount": -120.0,
+                "currency": "NZD",
+                "merchant": "Split Merchant",
+                "category": "General",
+            },
+        ).json()
+        zero_res = client.put(
+            f"/transactions/{tx_neg['id']}/splits",
+            json={
+                "splits": [
+                    {"amount": 0.0, "category": "Groceries"},
+                    {"amount": -120.0, "category": "Household"},
+                ]
+            },
+        )
+        assert zero_res.status_code == 422
+        assert "Split amount cannot be zero" in zero_res.text
+
+        # 2. Signed negative splits on negative parent persist as signed
+        signed_neg_res = client.put(
+            f"/transactions/{tx_neg['id']}/splits",
+            json={
+                "splits": [
+                    {"amount": -80.0, "category": "Groceries"},
+                    {"amount": -40.0, "category": "Household"},
+                ]
+            },
+        )
+        assert signed_neg_res.status_code == 200
+        assert [s["amount"] for s in signed_neg_res.json()["splits"]] == [-80.0, -40.0]
+
+        # 3. Signed netted split on net-positive parent + tag summary
+        tx_net_pos = client.post(
+            "/transactions",
+            json={
+                "transaction_date": today.isoformat(),
+                "account_id": acc_id,
+                "amount": 137.17,
+                "currency": "NZD",
+                "merchant": "Netted Travel Refund",
+                "category": "General",
+            },
+        ).json()
+        net_split_res = client.put(
+            f"/transactions/{tx_net_pos['id']}/splits",
+            json={
+                "splits": [
+                    {"amount": 1000.0, "category": "Income"},
+                    {"amount": -862.83, "category": "Travel", "tags": ["japan-trip"]},
+                ]
+            },
+        )
+        assert net_split_res.status_code == 200
+
+        tag_summary = client.get("/transactions/summary/tags?period=all").json()
+        assert tag_summary["total_tagged_spend"] == 862.83
+        assert len(tag_summary["tags"]) == 1
+        assert tag_summary["tags"][0]["tag"] == "japan-trip"
+        assert tag_summary["tags"][0]["total_spend"] == 862.83
+
+        # 4. Recurring net-positive parent with signed negative outflow split contributes to recurring burn
+        tx_rec = client.post(
+            "/transactions",
+            json={
+                "transaction_date": today.isoformat(),
+                "account_id": acc_id,
+                "amount": 50.0,
+                "currency": "NZD",
+                "merchant": "Monthly Split Host",
+                "category": "General",
+                "recurrence": "monthly",
+            },
+        ).json()
+        assert (
+            client.put(
+                f"/transactions/{tx_rec['id']}/splits",
+                json={
+                    "splits": [
+                        {"amount": 150.0, "category": "Income"},
+                        {"amount": -100.0, "category": "Utilities"},
+                    ]
+                },
+            ).status_code
+            == 200
+        )
+        burn = client.get("/budgets/average-burn?lookback_weeks=4").json()
+        assert burn["recurring_weekly_burn"] == round(100.0 * (12.0 / 52.0), 2)
+
+        # 5. Legacy unsigned positive splits directly in DB on a negative parent still resolve as outflows
+        with TestingSessionLocal() as db:
+            legacy_tx = Transaction(
+                transaction_date=today,
+                account_id=acc_id,
+                amount=-120.0,
+                currency="NZD",
+                merchant="Legacy Unsigned Split",
+                category="General",
+                raw_hash="legacy-unsigned-split",
+            )
+            db.add(legacy_tx)
+            db.flush()
+            db.add_all(
+                [
+                    TransactionSplit(
+                        transaction_id=legacy_tx.id,
+                        amount=70.0,
+                        category="Dining",
+                        tags="[]",
+                    ),
+                    TransactionSplit(
+                        transaction_id=legacy_tx.id,
+                        amount=50.0,
+                        category="Alcohol",
+                        tags="[]",
+                    ),
+                ]
+            )
+            db.commit()
+
+        dining_rows = client.get("/transactions?category=Dining").json()
+        assert len(dining_rows) == 1
+        assert dining_rows[0]["amount"] == -70.0
+
+        bd = client.get("/budgets/breakdown?period=all").json()
+        bd_cats = {c["category"]: c["total_spend"] for c in bd["categories"]}
+        assert bd_cats["Dining"] == 70.0
+        assert bd_cats["Alcohol"] == 50.0
+        assert bd_cats["Travel"] == 862.83
     finally:
         app.dependency_overrides.clear()

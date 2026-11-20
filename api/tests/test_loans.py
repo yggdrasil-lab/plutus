@@ -566,6 +566,10 @@ def test_two_way_lent_loan_partial_repayment_and_budget_purity():
         )
         assert switched.status_code == 200
         assert switched.json()["loan_payment_amount"] is None
+        assert client.patch(
+            f"/transactions/{part_out['id']}",
+            json={"loan_id": None},
+        ).status_code == 200
 
         # Clear loan_id on mixed_tx -> clears loan_payment_amount to None
         unlinked_mixed = client.patch(
@@ -675,5 +679,282 @@ def test_cross_currency_partial_loan_payment_override():
         # Remaining 50 SGD * 1.30 = 65 NZD counts as non-loan income
         bd = client.get("/budgets/breakdown?period=all").json()
         assert bd["total_income"] == 65.0
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_brother_multi_disbursement_lent_timeline_with_signed_splits():
+    client, TestingSessionLocal = _build_test_client()
+
+    try:
+        today = date.today()
+        with TestingSessionLocal() as db:
+            acc = Account(
+                name="ANZ Checking",
+                institution="ANZ",
+                account_type="checking",
+                tier="cash",
+                currency="NZD",
+            )
+            db.add(acc)
+            db.commit()
+            db.refresh(acc)
+            acc_id = acc.id
+
+        loan_res = client.post(
+            "/loans",
+            json={
+                "name": "Loan to Brother",
+                "lender": "Brother",
+                "loan_type": "lent",
+                "principal_amount": 10000.0,
+                "annual_interest_rate": 0.0,
+                "term_months": 0,
+                "monthly_payment": 0.0,
+                "start_date": "2025-08-08",
+            },
+        )
+        assert loan_res.status_code == 201
+        loan_id = loan_res.json()["id"]
+
+        def _post_tx(tx_date: str, amount: float, merchant: str, category: str = "Debt & Loans"):
+            res = client.post(
+                "/transactions",
+                json={
+                    "transaction_date": tx_date,
+                    "account_id": acc_id,
+                    "amount": amount,
+                    "currency": "NZD",
+                    "merchant": merchant,
+                    "category": category,
+                },
+            )
+            assert res.status_code == 201
+            return res.json()["id"]
+
+        # 1. Initial disbursement: -10,000 on 2025-08-08
+        tx_disb1 = _post_tx("2025-08-08", -10000.0, "Brother Loan Initial")
+        assert client.patch(f"/transactions/{tx_disb1}", json={"loan_id": loan_id}).status_code == 200
+
+        # 2. First repayment + ride-along income: +5,020 split (+5,000 Debt & Loans + +20 Family)
+        tx_rep1 = _post_tx("2025-08-20", 5020.0, "Brother Repayment 1", category="Income")
+        assert (
+            client.put(
+                f"/transactions/{tx_rep1}/splits",
+                json={
+                    "splits": [
+                        {"amount": 5000.0, "category": "Debt & Loans", "loan_id": loan_id},
+                        {"amount": 20.0, "category": "Family"},
+                    ]
+                },
+            ).status_code
+            == 200
+        )
+
+        # 3. Top-up disbursement: -2,000 on 2025-09-20
+        tx_disb2 = _post_tx("2025-09-20", -2000.0, "Brother Loan Top-Up")
+        assert client.patch(f"/transactions/{tx_disb2}", json={"loan_id": loan_id}).status_code == 200
+
+        # 4. Subsequent repayments: +1,000 and +500
+        tx_rep2 = _post_tx("2025-10-05", 1000.0, "Brother Repayment 2")
+        assert client.patch(f"/transactions/{tx_rep2}", json={"loan_id": loan_id}).status_code == 200
+        tx_rep3 = _post_tx("2025-10-20", 500.0, "Brother Repayment 3")
+        assert client.patch(f"/transactions/{tx_rep3}", json={"loan_id": loan_id}).status_code == 200
+
+        # 5. Signed netted split on recent date: +137.17 (+1,000 Debt & Loans + -862.83 Travel)
+        recent_date = (today - timedelta(days=5)).isoformat()
+        tx_netted = _post_tx(recent_date, 137.17, "Brother Netted Repayment - Flight", category="General")
+        split_netted_res = client.put(
+            f"/transactions/{tx_netted}/splits",
+            json={
+                "splits": [
+                    {
+                        "amount": 1000.0,
+                        "category": "Debt & Loans",
+                        "loan_id": loan_id,
+                        "notes": "Loan offset",
+                    },
+                    {
+                        "amount": -862.83,
+                        "category": "Travel",
+                        "tags": ["flights"],
+                        "notes": "Flight cost netted",
+                    },
+                ]
+            },
+        )
+        assert split_netted_res.status_code == 200
+
+        # 6. Final repayment: +500
+        tx_rep5 = _post_tx(today.isoformat(), 500.0, "Brother Repayment 5")
+        assert client.patch(f"/transactions/{tx_rep5}", json={"loan_id": loan_id}).status_code == 200
+
+        # Assert loan math across multi-disbursement + signed netted splits
+        loans_summary = client.get("/loans").json()
+        assert loans_summary["total_receivables"] == 4000.0
+        brother = next(item for item in loans_summary["loans"] if item["id"] == loan_id)
+        assert brother["principal_amount"] == 12000.0
+        assert brother["principal_paid"] == 8000.0
+        assert brother["remaining_principal"] == 4000.0
+        assert brother["total_paid_amount"] == 8000.0
+        assert brother["payments_made"] == 5
+        assert len(brother["disbursements"]) == 2
+
+        # Assert breakdown reports 862.83 Travel spend and ONLY 20.00 income
+        bd = client.get("/budgets/breakdown?period=all").json()
+        assert bd["total_income"] == 20.0
+        assert bd["total_spend"] == 862.83
+        bd_cats = {c["category"]: c["total_spend"] for c in bd["categories"]}
+        assert bd_cats == {"Travel": 862.83}
+
+        # Assert category filter returns exact signed amounts
+        travel_txs = client.get("/transactions?category=Travel").json()
+        assert len(travel_txs) == 1
+        assert travel_txs[0]["id"] == tx_netted
+        assert travel_txs[0]["amount"] == -862.83
+        assert travel_txs[0]["category"] == "Travel"
+        assert travel_txs[0]["is_split"] is True
+
+        debt_txs = client.get("/transactions?category=Debt+%26+Loans").json()
+        netted_debt = next(t for t in debt_txs if t["id"] == tx_netted)
+        assert netted_debt["amount"] == 1000.0
+
+        # Assert average-burn includes 862.83 in Travel
+        burn = client.get("/budgets/average-burn?lookback_weeks=12").json()
+        burn_cats = {c["category"]: c["variable_weekly_burn"] for c in burn["categories"]}
+        assert burn_cats["Travel"] == round(862.83 / 12.0, 2)
+
+        # Also verify annual Travel budget picks up 862.83 in annual burn & monthly breakdown
+        assert (
+            client.post(
+                "/budgets",
+                json={
+                    "category": "Travel",
+                    "weekly_limit": 50.0,
+                    "monthly_limit": 216.67,
+                    "budget_period": "annual",
+                },
+            ).status_code
+            == 200
+        )
+        annual_burn = client.get("/budgets/average-burn?lookback_weeks=12").json()
+        annual_burn_cats = {c["category"]: c["variable_weekly_burn"] for c in annual_burn["categories"]}
+        assert annual_burn_cats["Travel"] == round(862.83 / 52.0, 2)
+        monthly_bd = client.get("/budgets/breakdown?period=month").json()
+        monthly_travel = next(c for c in monthly_bd["categories"] if c["category"] == "Travel")
+        assert monthly_travel["total_spend"] == 862.83
+        assert monthly_travel["budget_period"] == "annual"
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_lent_loan_chronological_interest_with_topup_and_split_disbursement():
+    client, TestingSessionLocal = _build_test_client()
+
+    try:
+        today = date.today()
+        with TestingSessionLocal() as db:
+            acc = Account(
+                name="ANZ Checking",
+                institution="ANZ",
+                account_type="checking",
+                tier="cash",
+                currency="NZD",
+            )
+            db.add(acc)
+            db.commit()
+            db.refresh(acc)
+            acc_id = acc.id
+
+        loan_res = client.post(
+            "/loans",
+            json={
+                "name": "Interest Top-up Lent Loan",
+                "lender": "Friend",
+                "loan_type": "lent",
+                "principal_amount": 1000.0,
+                "annual_interest_rate": 0.12,
+                "term_months": 0,
+                "monthly_payment": 0.0,
+                "start_date": "2025-01-01",
+            },
+        )
+        assert loan_res.status_code == 201
+        loan_id = loan_res.json()["id"]
+
+        d1 = client.post(
+            "/transactions",
+            json={
+                "transaction_date": "2025-01-01",
+                "account_id": acc_id,
+                "amount": -1000.0,
+                "currency": "NZD",
+                "merchant": "Advance 1",
+                "category": "Debt & Loans",
+            },
+        ).json()["id"]
+        assert client.patch(f"/transactions/{d1}", json={"loan_id": loan_id}).status_code == 200
+
+        # Repayment of 110: 1% monthly interest on 1000 = 10, principal = 100 -> balance 900
+        r1 = client.post(
+            "/transactions",
+            json={
+                "transaction_date": "2025-02-01",
+                "account_id": acc_id,
+                "amount": 110.0,
+                "currency": "NZD",
+                "merchant": "Repay 1",
+                "category": "Debt & Loans",
+            },
+        ).json()["id"]
+        assert client.patch(f"/transactions/{r1}", json={"loan_id": loan_id}).status_code == 200
+
+        # Top-up disbursement of 500 via signed negative split on a -50 parent:
+        # e.g. +550 inflow offset? No, -50 parent = +450 refund + -500 lent advance!
+        d2 = client.post(
+            "/transactions",
+            json={
+                "transaction_date": "2025-03-01",
+                "account_id": acc_id,
+                "amount": -50.0,
+                "currency": "NZD",
+                "merchant": "Top-up + Refund Split",
+                "category": "General",
+            },
+        ).json()["id"]
+        assert (
+            client.put(
+                f"/transactions/{d2}/splits",
+                json={
+                    "splits": [
+                        {"amount": -500.0, "category": "Debt & Loans", "loan_id": loan_id},
+                        {"amount": 450.0, "category": "Income"},
+                    ]
+                },
+            ).status_code
+            == 200
+        )
+        # After top-up: balance = 900 + 500 = 1400, effective_principal = 1500
+
+        # Repayment of 214: 1% monthly interest on 1400 = 14, principal = 200 -> balance 1200
+        r2 = client.post(
+            "/transactions",
+            json={
+                "transaction_date": today.isoformat(),
+                "account_id": acc_id,
+                "amount": 214.0,
+                "currency": "NZD",
+                "merchant": "Repay 2",
+                "category": "Debt & Loans",
+            },
+        ).json()["id"]
+        assert client.patch(f"/transactions/{r2}", json={"loan_id": loan_id}).status_code == 200
+
+        status_data = client.get("/loans").json()["loans"][0]
+        assert status_data["principal_amount"] == 1500.0
+        assert status_data["interest_paid"] == 24.0
+        assert status_data["remaining_principal"] == 1200.0
+        assert status_data["principal_paid"] == 300.0
+        assert status_data["total_paid_amount"] == 324.0
     finally:
         app.dependency_overrides.clear()

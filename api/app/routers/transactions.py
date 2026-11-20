@@ -35,6 +35,7 @@ from app.services.recurrence_service import (
     is_recurrence_excluded_from_period,
 )
 from app.services.rules_engine import normalize_tags, parse_rule_tags
+from app.services.split_utils import resolve_signed_split_amount
 from app.services.statement_parser import generate_transaction_hash
 from app.services.transfer_service import reconcile_transfers
 
@@ -139,8 +140,17 @@ def _matches_receipt_transaction_filter(
         if not matched_splits:
             return None
 
-        matched_orig = round(sum(float(s.amount) for s, _, _ in matched_splits), 2)
-        total_orig = round(sum(float(s.amount) for s in splits), 2)
+        matched_orig = round(
+            sum(
+                resolve_signed_split_amount(s, splits, float(tx.amount))
+                for s, _, _ in matched_splits
+            ),
+            2,
+        )
+        total_orig = round(
+            sum(resolve_signed_split_amount(s, splits, float(tx.amount)) for s in splits),
+            2,
+        )
         matched_cats = {s_cat for _, s_cat, _ in matched_splits}
         if target_cat and include_subclasses:
             matched_cat = category.strip() if category else (tx.category or "General")
@@ -151,7 +161,6 @@ def _matches_receipt_transaction_filter(
 
         merged_tags = normalize_tags(t for _, _, s_tags in matched_splits for t in s_tags)
         is_partial = len(matched_splits) < len(splits) or abs(matched_orig - total_orig) > 0.01
-        sign = -1.0 if float(tx.amount) < 0 else 1.0
         if is_partial or (target_cat and matched_cat.lower() != tx_cat_lower):
             split_notes = ", ".join(s.notes for s, _, _ in matched_splits if s.notes)
             resolved_notes = (
@@ -165,7 +174,7 @@ def _matches_receipt_transaction_filter(
             )
             return TransactionRead.model_validate(tx).model_copy(
                 update={
-                    "amount": round(sign * abs(matched_orig), 2),
+                    "amount": matched_orig,
                     "category": matched_cat,
                     "tags": merged_tags,
                     "is_split": True,
@@ -401,7 +410,7 @@ def list_transactions(
                 )
                 if dto is not None:
                     if should_include_amortized and (
-                        float(tx.amount) >= 0
+                        float(dto.amount) >= 0
                         or is_recurrence_excluded_from_period(effective_period, tx.recurrence)
                     ):
                         dto = dto.model_copy(update={"excluded_from_period_budget": True})
@@ -543,12 +552,22 @@ def replace_transaction_splits(
             detail="At least 2 split lines are required when splitting a transaction.",
         )
 
-    split_total = round(sum(float(item.amount) for item in payload.splits), 2)
+    signed_sum = round(sum(float(item.amount) for item in payload.splits), 2)
+    tx_signed = round(float(tx.amount), 2)
     tx_abs = round(abs(float(tx.amount)), 2)
-    if abs(split_total - tx_abs) > 0.01:
+    is_signed_match = abs(signed_sum - tx_signed) <= 0.01
+    is_legacy_unsigned = (
+        float(tx.amount) < 0
+        and all(float(item.amount) > 0 for item in payload.splits)
+        and abs(signed_sum - tx_abs) <= 0.01
+    )
+    if not is_signed_match and not is_legacy_unsigned:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Split amounts ({split_total:.2f}) must sum to transaction amount ({tx_abs:.2f}).",
+            detail=(
+                f"Signed split amounts ({signed_sum:.2f}) must sum to "
+                f"transaction amount ({tx_signed:.2f})."
+            ),
         )
 
     prepared_splits: list[TransactionSplit] = []
@@ -575,9 +594,13 @@ def replace_transaction_splits(
         notes_clean = item.notes.strip() if item.notes is not None else None
         if notes_clean == "":
             notes_clean = None
+        effective_amount = round(
+            -float(item.amount) if is_legacy_unsigned else float(item.amount),
+            2,
+        )
         prepared_splits.append(
             TransactionSplit(
-                amount=round(float(item.amount), 2),
+                amount=effective_amount,
                 category=cat_clean,
                 tags=json.dumps(normalize_tags(item.tags)),
                 loan_id=item.loan_id,
@@ -720,7 +743,10 @@ def get_tag_spending_summary(
             joinedload(Transaction.splits).joinedload(TransactionSplit.loan),
         )
         .where(
-            Transaction.amount < 0,
+            or_(
+                Transaction.amount < 0,
+                Transaction.splits.any(TransactionSplit.amount < 0),
+            ),
             or_(
                 func.lower(Transaction.category).not_in(TRANSFER_CATEGORIES),
                 Transaction.splits.any(),

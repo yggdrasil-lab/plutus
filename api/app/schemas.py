@@ -233,11 +233,18 @@ class QuickLogRequest(BaseModel):
 
 
 class TransactionSplitInput(BaseModel):
-    amount: float = Field(..., gt=0.0)
+    amount: float
     category: str
     tags: list[str] = Field(default_factory=list)
     loan_id: Optional[int] = None
     notes: Optional[str] = Field(default=None, max_length=255)
+
+    @field_validator("amount")
+    @classmethod
+    def reject_zero_amount(cls, v: float) -> float:
+        if float(v) == 0.0:
+            raise ValueError("Split amount cannot be zero")
+        return float(v)
 
 
 class TransactionSplitsUpdate(BaseModel):
