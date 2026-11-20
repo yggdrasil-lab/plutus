@@ -6,10 +6,12 @@ services:
     environment:
       - POSTGRES_USER=plutus
       - POSTGRES_DB=plutus
-      - POSTGRES_PASSWORD=plutus
+      - POSTGRES_PASSWORD_FILE=/run/secrets/plutus_db_password
       - TZ=Pacific/Auckland
     volumes:
       - ${PLUTUS_DB_MOUNT_PATH}:/var/lib/postgresql/data
+    secrets:
+      - plutus_db_password
     networks:
       - aether-net
     labels:
@@ -40,7 +42,11 @@ services:
     image: ${REGISTRY_PREFIX}plutus-api:${IMAGE_TAG}
     build: ./api
     environment:
-      - PLUTUS_DATABASE_URL=postgresql+psycopg://plutus:plutus@plutus-db:5432/plutus
+      - PLUTUS_DB_HOST=plutus-db
+      - PLUTUS_DB_PORT=5432
+      - PLUTUS_DB_NAME=plutus
+      - PLUTUS_DB_USER=plutus
+      - PLUTUS_DB_PASSWORD_FILE=/run/secrets/plutus_db_password
       - PLUTUS_ENVIRONMENT=production
       - PLUTUS_MCP_TOKEN_FILE=/run/secrets/plutus_mcp_token
       - PLUTUS_LLM_BASE_URL=${PLUTUS_LLM_BASE_URL}
@@ -58,6 +64,7 @@ services:
       - TZ=Pacific/Auckland
     secrets:
       - plutus_mcp_token
+      - plutus_db_password
     networks:
       - aether-net
     labels:
@@ -111,6 +118,9 @@ secrets:
   plutus_mcp_token:
     external: true
     name: ${PLUTUS_MCP_TOKEN_NAME}
+  plutus_db_password:
+    external: true
+    name: ${PLUTUS_DB_PASSWORD_NAME}
 
 networks:
   aether-net:
