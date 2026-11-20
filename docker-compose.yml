@@ -49,6 +49,9 @@ services:
       - PLUTUS_DB_PASSWORD_FILE=/run/secrets/plutus_db_password
       - PLUTUS_ENVIRONMENT=production
       - PLUTUS_MCP_TOKEN_FILE=/run/secrets/plutus_mcp_token
+      - PLUTUS_WEBHOOK_SECRET_FILE=/run/secrets/plutus_webhook_secret
+      - PLUTUS_DBS_ACCOUNT_MAP=${PLUTUS_DBS_ACCOUNT_MAP}
+      - PLUTUS_OWN_ACCOUNT_SUFFIXES=${PLUTUS_OWN_ACCOUNT_SUFFIXES}
       - PLUTUS_LLM_BASE_URL=${PLUTUS_LLM_BASE_URL}
       - PLUTUS_LLM_API_KEY=${PLUTUS_LLM_API_KEY}
       - PLUTUS_LLM_MODEL=${PLUTUS_LLM_MODEL}
@@ -65,6 +68,7 @@ services:
     secrets:
       - plutus_mcp_token
       - plutus_db_password
+      - plutus_webhook_secret
     networks:
       - aether-net
     labels:
@@ -121,6 +125,9 @@ secrets:
   plutus_db_password:
     external: true
     name: ${PLUTUS_DB_PASSWORD_NAME}
+  plutus_webhook_secret:
+    external: true
+    name: ${PLUTUS_WEBHOOK_SECRET_NAME}
 
 networks:
   aether-net:

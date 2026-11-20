@@ -8,9 +8,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.db import get_db
-from app.models import CategorizationRule, Receipt, ReceiptItem, Transaction
-from app.services.jev_client import get_extra_jev_categories
-from app.services.rules_engine import collect_existing_tags, normalize_tags
+from app.models import Receipt, ReceiptItem, Transaction
+from app.services.rules_engine import normalize_tags
 from app.schemas import (
     ProductStatisticsResponse,
     ReceiptCreate,
@@ -18,17 +17,19 @@ from app.schemas import (
     ReceiptItemRead,
     ReceiptItemUpdate,
     ReceiptRead,
+    TransactionCandidateRead,
 )
 from app.services.receipt_service import (
     apply_receipt_discounts_with_jev,
-    classify_and_tag_receipt_item,
-    classify_line_item,
     compress_receipt_image,
     compute_product_statistics,
-    extract_tags_for_line_item,
-    get_or_create_product,
+    create_classified_receipt_item,
+    find_receipt_transaction_candidates,
     infer_receipt_mime_type,
+    load_receipt_rule_context,
     match_receipt_to_transaction,
+    normalize_order_number,
+    normalize_receipt_currency,
     parse_receipt_with_llm,
     reconcile_unlinked_receipts,
 )
@@ -38,7 +39,7 @@ router = APIRouter(prefix="/receipts", tags=["Receipts & Itemized Tracking"])
 
 @router.get("", response_model=list[ReceiptRead])
 def list_receipts(
-    status: Optional[str] = Query(default=None, description="'unlinked', 'matched', or 'verified'"),
+    status: Optional[str] = Query(default=None, description="'unlinked', 'needs_review', 'matched', or 'verified'"),
     limit: int = Query(default=50, ge=1, le=200),
     db: Session = Depends(get_db),
 ):
@@ -56,86 +57,6 @@ def list_receipts(
     )
 
 
-def _create_classified_receipt_item(
-    db: Session,
-    *,
-    receipt: Receipt,
-    item_name: str,
-    brand: Optional[str],
-    quantity: float,
-    unit_price: float,
-    discount_amount: Optional[float],
-    total_price: float,
-    explicit_category: Optional[str],
-    explicit_domain: Optional[str],
-    explicit_product_type: Optional[str],
-    explicit_volume_ml: Optional[str],
-    explicit_tags: Optional[list[str]],
-    notes: Optional[str],
-    active_rules: list[CategorizationRule],
-    existing_tags: list[str],
-    extra_categories: Optional[list[str]] = None,
-) -> None:
-    """Resolve rules/Jev classification and persist one ReceiptItem and Product."""
-    clean_name = item_name.strip() or "Item"
-    clean_brand = brand.strip() if brand else None
-    cat, dom, ptype, vol, tags_list = classify_and_tag_receipt_item(
-        item_name=clean_name,
-        brand=clean_brand,
-        total_price=total_price,
-        merchant=receipt.merchant,
-        explicit_category=explicit_category,
-        explicit_domain=explicit_domain,
-        explicit_product_type=explicit_product_type,
-        explicit_volume_ml=explicit_volume_ml,
-        explicit_tags=explicit_tags,
-        active_rules=active_rules,
-        existing_tags=existing_tags,
-        extra_categories=extra_categories,
-    )
-    prod_id: Optional[int] = None
-    if total_price >= 0:
-        prod = get_or_create_product(
-            db=db,
-            item_name=clean_name,
-            brand=clean_brand,
-            category=cat,
-            domain=dom,
-            tags=tags_list,
-            volume_ml=vol,
-        )
-        prod_id = prod.id
-
-    db.add(
-        ReceiptItem(
-            receipt_id=receipt.id,
-            product_id=prod_id,
-            item_name=clean_name,
-            brand=clean_brand,
-            quantity=quantity,
-            unit_price=unit_price,
-            discount_amount=discount_amount,
-            total_price=total_price,
-            category=cat or "General",
-            domain=dom,
-            product_type=ptype,
-            tags=json.dumps(tags_list),
-            volume_ml=vol,
-            notes=notes,
-        )
-    )
-
-
-def _load_rule_context(db: Session) -> tuple[list[CategorizationRule], list[str], list[str]]:
-    """Fetch active priority-ordered rules, existing tag vocabulary, and custom Jev categories once per receipt."""
-    active_rules = db.scalars(
-        select(CategorizationRule)
-        .where(CategorizationRule.is_active == True)
-        .order_by(CategorizationRule.priority.asc(), CategorizationRule.id.asc())
-    ).all()
-    return list(active_rules), collect_existing_tags(db), get_extra_jev_categories(db)
-
-
 @router.post("", response_model=ReceiptRead, status_code=status.HTTP_201_CREATED)
 def create_receipt(
     payload: ReceiptCreate,
@@ -146,17 +67,18 @@ def create_receipt(
         receipt_date=payload.receipt_date,
         merchant=payload.merchant.strip(),
         total_amount=payload.total_amount,
-        currency=payload.currency,
+        currency=normalize_receipt_currency(payload.currency, fallback="NZD"),
         tax_amount=payload.tax_amount,
+        order_number=normalize_order_number(payload.order_number),
         status=payload.status,
         notes=payload.notes,
     )
     db.add(receipt)
     db.flush()
 
-    active_rules, existing_tags, extra_categories = _load_rule_context(db)
+    active_rules, existing_tags, extra_categories = load_receipt_rule_context(db)
     for item in payload.items:
-        _create_classified_receipt_item(
+        create_classified_receipt_item(
             db,
             receipt=receipt,
             item_name=item.item_name,
@@ -195,6 +117,12 @@ def _apply_parsed_receipt_fields(receipt: Receipt, parsed: dict[str, Any], db: S
     receipt.receipt_date = r_date
     receipt.merchant = str(parsed.get("merchant") or "Unknown Merchant").strip()[:150]
     receipt.total_amount = float(parsed.get("total_amount", 0.0) or 0.0)
+    receipt.currency = normalize_receipt_currency(
+        parsed.get("currency"), fallback=receipt.currency or "NZD"
+    )
+    order_num = normalize_order_number(parsed.get("order_number"))
+    if order_num:
+        receipt.order_number = order_num
     receipt.tax_amount = float(parsed["tax_amount"]) if parsed.get("tax_amount") is not None else None
     receipt.is_processed = True
     receipt.notes = None
@@ -202,10 +130,10 @@ def _apply_parsed_receipt_fields(receipt: Receipt, parsed: dict[str, Any], db: S
     receipt.items.clear()
     db.flush()
 
-    active_rules, existing_tags, extra_categories = _load_rule_context(db)
+    active_rules, existing_tags, extra_categories = load_receipt_rule_context(db)
     resolved_items = apply_receipt_discounts_with_jev(parsed.get("items", []))
     for it in resolved_items:
-        _create_classified_receipt_item(
+        create_classified_receipt_item(
             db,
             receipt=receipt,
             item_name=str(it.get("item_name") or "Item"),
@@ -336,9 +264,21 @@ def reprocess_receipt(
     receipt.image_mime_type = compressed_mime
     db.commit()
     db.refresh(receipt)
-    if receipt.status == "unlinked":
+    if receipt.status in ("unlinked", "needs_review"):
         match_receipt_to_transaction(receipt, db)
     return receipt
+
+
+@router.get("/{receipt_id}/candidates", response_model=list[TransactionCandidateRead])
+def list_receipt_candidates(
+    receipt_id: int,
+    db: Session = Depends(get_db),
+):
+    """Return top 5 sorted candidate expense transactions for linking to this receipt."""
+    receipt = db.get(Receipt, receipt_id)
+    if not receipt:
+        raise HTTPException(status_code=404, detail="Receipt not found")
+    return find_receipt_transaction_candidates(db, receipt, limit=5)
 
 
 @router.get("/statistics/products", response_model=ProductStatisticsResponse)
@@ -387,7 +327,7 @@ def link_receipt_to_transaction(
     transaction_id: int,
     db: Session = Depends(get_db),
 ):
-    """Explicitly link a receipt to a specific transaction."""
+    """Explicitly link a receipt to a specific transaction, guarding 1:1 uniqueness."""
     receipt = db.get(Receipt, receipt_id)
     if not receipt:
         raise HTTPException(status_code=404, detail="Receipt not found")
@@ -395,6 +335,18 @@ def link_receipt_to_transaction(
     tx = db.get(Transaction, transaction_id)
     if not tx:
         raise HTTPException(status_code=404, detail="Transaction not found")
+
+    already_linked = db.scalar(
+        select(Receipt).where(
+            Receipt.transaction_id == tx.id,
+            Receipt.id != receipt.id,
+        )
+    )
+    if already_linked is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Transaction {transaction_id} is already linked to receipt #{already_linked.id}.",
+        )
 
     receipt.transaction_id = tx.id
     receipt.status = "matched"

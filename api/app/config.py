@@ -1,6 +1,8 @@
 """Configuration management for Plutus API."""
 
+import json
 from pathlib import Path
+from typing import Optional
 from urllib.parse import quote_plus
 
 from pydantic import AliasChoices, Field, model_validator
@@ -20,6 +22,9 @@ class Settings(BaseSettings):
     mcp_token: str = ""
     mcp_token_file: str = ""
     webhook_secret: str = ""
+    webhook_secret_file: Optional[str] = None
+    dbs_account_map: str = ""
+    own_account_suffixes: str = ""
     environment: str = "development"
     timezone: str = "Pacific/Auckland"
     base_currency: str = "NZD"
@@ -76,6 +81,11 @@ class Settings(BaseSettings):
             if secret_path.is_file():
                 self.mcp_token = secret_path.read_text(encoding="utf-8").strip()
 
+        if not self.webhook_secret and self.webhook_secret_file:
+            secret_path = Path(self.webhook_secret_file)
+            if secret_path.is_file():
+                self.webhook_secret = secret_path.read_text(encoding="utf-8").strip()
+
         if self.db_password_file:
             secret_path = Path(self.db_password_file)
             if not secret_path.is_file():
@@ -93,6 +103,96 @@ class Settings(BaseSettings):
             )
 
         return self
+
+    @property
+    def resolved_mcp_token(self) -> str:
+        """Resolve MCP bearer token from Swarm secret file first, else env value."""
+        if self.mcp_token_file:
+            secret_path = Path(self.mcp_token_file)
+            if secret_path.is_file():
+                file_val = secret_path.read_text(encoding="utf-8").strip()
+                if file_val:
+                    return file_val
+        return (self.mcp_token or "").strip()
+
+    @property
+    def resolved_webhook_secret(self) -> str:
+        """Resolve webhook bearer secret from Swarm secret file first, else env value."""
+        if self.webhook_secret_file:
+            secret_path = Path(self.webhook_secret_file)
+            if secret_path.is_file():
+                file_val = secret_path.read_text(encoding="utf-8").strip()
+                if file_val:
+                    return file_val
+        return (self.webhook_secret or "").strip()
+
+    @property
+    def resolved_llm_base_url(self) -> str:
+        """Return configured Muninn/OpenAI-compatible base URL."""
+        return (self.llm_base_url or "").strip()
+
+    @property
+    def resolved_llm_api_key(self) -> str:
+        """Return configured Muninn/OpenAI-compatible API key."""
+        return (self.llm_api_key or "").strip()
+
+    @property
+    def resolved_llm_model(self) -> str:
+        """Return configured general LLM model name."""
+        return (self.llm_model or "").strip()
+
+    @property
+    def resolved_receipt_llm_model(self) -> str:
+        """Return configured receipt vision/parsing LLM model name."""
+        return (self.receipt_llm_model or "").strip()
+
+    def resolved_dbs_account_map(self) -> dict[str, int]:
+        """Parse PLUTUS_DBS_ACCOUNT_MAP JSON mapping account suffixes to Plutus account IDs."""
+        raw = (self.dbs_account_map or "").strip()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Malformed PLUTUS_DBS_ACCOUNT_MAP JSON: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(
+                "PLUTUS_DBS_ACCOUNT_MAP must be a JSON object mapping suffix strings to integer account IDs."
+            )
+        mapping: dict[str, int] = {}
+        for raw_key, raw_val in parsed.items():
+            key = str(raw_key).strip()
+            if not key:
+                raise ValueError("PLUTUS_DBS_ACCOUNT_MAP contains an empty account suffix key.")
+            if isinstance(raw_val, bool):
+                raise ValueError(f"Invalid boolean account ID for DBS suffix {key!r}.")
+            try:
+                acc_id = int(raw_val)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Invalid account ID {raw_val!r} for DBS suffix {key!r}; expected positive integer."
+                ) from exc
+            if acc_id <= 0:
+                raise ValueError(
+                    f"Account ID for DBS suffix {key!r} must be positive, got {acc_id}."
+                )
+            mapping[key] = acc_id
+        return mapping
+
+    def resolved_own_account_suffixes(self) -> set[str]:
+        """Parse PLUTUS_OWN_ACCOUNT_SUFFIXES (comma-separated or JSON array) into normalized suffixes."""
+        raw = (self.own_account_suffixes or "").strip()
+        if not raw:
+            return set()
+        if raw.startswith("["):
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Malformed PLUTUS_OWN_ACCOUNT_SUFFIXES JSON: {exc}") from exc
+            if not isinstance(parsed, list):
+                raise ValueError("PLUTUS_OWN_ACCOUNT_SUFFIXES JSON must be an array of strings.")
+            return {str(item).strip().lower() for item in parsed if str(item).strip()}
+        return {part.strip().lower() for part in raw.split(",") if part.strip()}
 
 
 settings = Settings()

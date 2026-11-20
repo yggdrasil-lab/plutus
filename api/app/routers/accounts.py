@@ -83,6 +83,10 @@ def update_account(
                 )
             setattr(account, field, val)
 
+    if "account_number_last4" in payload.model_fields_set:
+        raw_last4 = payload.account_number_last4
+        account.account_number_last4 = raw_last4.strip()[:64] if raw_last4 and raw_last4.strip() else None
+
     db.commit()
     db.refresh(account)
     return account

@@ -9,6 +9,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 import hashlib
 import json
+import re
 from typing import Optional, Protocol
 from zoneinfo import ZoneInfo
 
@@ -223,23 +224,117 @@ def _resolve_category_and_merchant(
     return merchant_name, resolved_cat, filtered_extra, rule_recurrence, matched_rule
 
 
+EXTERNAL_NOTE_PREFIXES = ("akahu:", "wise:", "btc:", "dbs:")
+_DBS_REF_TOKEN_RE = re.compile(r"(?:^|[\s|;])(dbs:[^\s|;]+)")
+
+
 def _cross_source_key(tx_date: date, amount: float | Decimal) -> tuple[date, Decimal]:
     """Build a normalized (date, 8dp amount) key for cross-source deduplication."""
     return (tx_date, Decimal(str(amount)).quantize(Decimal("0.00000001")))
 
 
-def ingest_normalized_transactions(
+def _amount_decimal_key(amount: float | Decimal) -> Decimal:
+    """Normalize transaction amount to 8 decimal places for exact comparison."""
+    return Decimal(str(amount)).quantize(Decimal("0.00000001"))
+
+
+def _extract_external_note_keys(notes: Optional[str]) -> list[str]:
+    """Extract canonical external-id keys from a Transaction.notes string."""
+    if not notes:
+        return []
+    stripped = notes.strip()
+    keys: list[str] = []
+    if stripped.startswith(("akahu:", "wise:", "btc:")):
+        keys.append(stripped)
+        return keys
+    for match in _DBS_REF_TOKEN_RE.finditer(stripped):
+        tok = match.group(1)
+        if tok not in keys:
+            keys.append(tok)
+    return keys
+
+
+def _is_dbs_alert_notes(notes: Optional[str]) -> bool:
+    """Return True if notes indicate a real-time DBS email alert source."""
+    if not notes:
+        return False
+    stripped = notes.strip()
+    return (
+        stripped == "dbs_email_alert"
+        or "dbs_email_alert" in stripped
+        or bool(_DBS_REF_TOKEN_RE.search(stripped))
+    )
+
+
+def _is_generic_dbs_merchant(merchant: Optional[str]) -> bool:
+    """Return True when a DBS statement merchant is generic placeholder text like 'Advice'."""
+    cleaned = (merchant or "").strip().lower()
+    if not cleaned:
+        return True
+    return cleaned.startswith("advice") or cleaned in {
+        "dbs transaction",
+        "bill payment",
+        "funds transfer",
+        "fast payment",
+        "unknown",
+    }
+
+
+def _find_dbs_cross_source_match(
+    item: NormalizedTx,
+    item_currency: str,
+    window_existing_txs: list[Transaction],
+    consumed_existing_ids: set[int],
+) -> Optional[Transaction]:
+    """Find a +/- 3-day cross-source match between DBS alerts and statement rows."""
+    incoming_is_dbs = _is_dbs_alert_notes(item.notes)
+    item_amt_key = _amount_decimal_key(item.amount)
+    candidates: list[tuple[int, int, Transaction]] = []
+
+    for tx in window_existing_txs:
+        if tx.id in consumed_existing_ids:
+            continue
+        if (tx.currency or "").strip().upper() != item_currency:
+            continue
+        if _amount_decimal_key(tx.amount) != item_amt_key:
+            continue
+        day_diff = abs((tx.transaction_date - item.transaction_date).days)
+        if day_diff > 3:
+            continue
+
+        tx_is_dbs = _is_dbs_alert_notes(tx.notes)
+        tx_is_other_api = bool(
+            tx.notes and tx.notes.strip().startswith(("akahu:", "wise:", "btc:"))
+        )
+        if incoming_is_dbs:
+            # Incoming DBS alert can match a non-alert statement/manual row (or legacy unref alert)
+            if tx_is_other_api or tx_is_dbs:
+                continue
+        else:
+            # Incoming statement row can match an existing DBS alert row
+            if not tx_is_dbs:
+                continue
+
+        candidates.append((day_diff, tx.id, tx))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda row: (row[0], row[1]))
+    return candidates[0][2]
+
+
+def ingest_normalized_transactions_detailed(
     db: Session,
     account: Account,
     items: list[NormalizedTx] | tuple[NormalizedTx, ...],
     *,
     skip_llm: bool = False,
-) -> tuple[int, int, list[Transaction]]:
-    """Deduplicate, categorize, persist, and reconcile normalized transactions."""
+) -> tuple[int, int, list[Transaction], list[Transaction]]:
+    """Deduplicate, categorize, persist, enrich, and reconcile normalized transactions."""
     if not items:
         account.last_synced_at = datetime.now(timezone.utc)
         db.commit()
-        return 0, 0, []
+        return 0, 0, [], []
 
     active_rules = db.scalars(
         select(CategorizationRule)
@@ -249,55 +344,60 @@ def ingest_normalized_transactions(
     existing_tags = collect_existing_tags(db) if not skip_llm else []
     extra_categories = get_extra_jev_categories(db) if not skip_llm else []
 
-    # Preload existing (date, amount) counts for this account so cross-source
-    # statement uploads do not duplicate API/email-synced rows with different merchant text.
+    # Preload existing (date, amount) counts for exact-date cross-source dedup AND
+    # a +/- 3-day window for DBS alert <-> statement settlement matching.
     tx_dates = {item.transaction_date for item in items}
-    existing_rows = db.execute(
-        select(Transaction.transaction_date, Transaction.amount).where(
-            Transaction.account_id == account.id,
-            Transaction.transaction_date.in_(tx_dates),
-        )
-    ).all()
-    existing_counts: Counter[tuple[date, Decimal]] = Counter(
-        _cross_source_key(row.transaction_date, row.amount) for row in existing_rows
-    )
-    batch_seen_counts: Counter[tuple[date, Decimal]] = Counter()
-    seen_hashes: set[str] = set()
-    seen_external_notes: set[str] = set()
-    existing_external_notes = set(
-        n
-        for n in db.scalars(
-            select(Transaction.notes).where(
-                Transaction.account_id == account.id,
-                Transaction.notes.isnot(None),
-            )
-        ).all()
-        if n and n.startswith(("akahu:", "wise:", "btc:"))
-    )
-
-    existing_btc_by_note = {
-        tx.notes: tx
-        for tx in db.scalars(
+    min_window_date = min(tx_dates) - timedelta(days=3)
+    max_window_date = max(tx_dates) + timedelta(days=3)
+    window_existing_txs = list(
+        db.scalars(
             select(Transaction).where(
                 Transaction.account_id == account.id,
-                Transaction.notes.like("btc:%"),
+                Transaction.transaction_date >= min_window_date,
+                Transaction.transaction_date <= max_window_date,
             )
         ).all()
-        if tx.notes
+    )
+    existing_counts: Counter[tuple[date, Decimal]] = Counter(
+        _cross_source_key(row.transaction_date, row.amount)
+        for row in window_existing_txs
+        if row.transaction_date in tx_dates
+    )
+    batch_seen_counts: Counter[tuple[date, Decimal]] = Counter()
+    consumed_existing_ids: set[int] = set()
+    seen_hashes: set[str] = set()
+    seen_external_notes: set[str] = set()
+
+    existing_external_notes: set[str] = set()
+    existing_tx_by_note: dict[str, Transaction] = {}
+    for tx in db.scalars(
+        select(Transaction).where(
+            Transaction.account_id == account.id,
+            Transaction.notes.isnot(None),
+        )
+    ).all():
+        for ext_key in _extract_external_note_keys(tx.notes):
+            existing_external_notes.add(ext_key)
+            existing_tx_by_note.setdefault(ext_key, tx)
+
+    existing_btc_by_note = {
+        key: tx
+        for key, tx in existing_tx_by_note.items()
+        if key.startswith("btc:")
     }
 
     created: list[Transaction] = []
+    matched_existing: list[Transaction] = []
     matched_tx_rules: list[tuple[Transaction, CategorizationRule]] = []
     skipped = 0
     reconcile_needed = False
 
     for item in items:
-        ext_note = (
-            item.notes
-            if (item.notes and item.notes.startswith(("akahu:", "wise:", "btc:")))
-            else None
-        )
+        item_ext_keys = _extract_external_note_keys(item.notes)
+        ext_note = item_ext_keys[0] if item_ext_keys else None
         if ext_note and (ext_note in existing_external_notes or ext_note in seen_external_notes):
+            if ext_note in existing_tx_by_note and ext_note not in seen_external_notes:
+                matched_existing.append(existing_tx_by_note[ext_note])
             if ext_note in existing_btc_by_note and ext_note not in seen_external_notes:
                 seen_external_notes.add(ext_note)
                 existing_tx = existing_btc_by_note[ext_note]
@@ -327,6 +427,72 @@ def ingest_normalized_transactions(
             skipped += 1
             continue
 
+        item_currency = (item.currency or account.currency or "NZD")[:3].upper()
+        dbs_match = _find_dbs_cross_source_match(
+            item,
+            item_currency,
+            window_existing_txs,
+            consumed_existing_ids,
+        )
+        if dbs_match is not None:
+            consumed_existing_ids.add(dbs_match.id)
+            matched_existing.append(dbs_match)
+            incoming_is_dbs = _is_dbs_alert_notes(item.notes)
+            if incoming_is_dbs:
+                if item.notes:
+                    if not dbs_match.notes:
+                        dbs_match.notes = item.notes
+                    elif item.notes not in dbs_match.notes:
+                        if item.notes.startswith("dbs:"):
+                            dbs_match.notes = f"{item.notes} | {dbs_match.notes}"
+                        else:
+                            dbs_match.notes = f"{dbs_match.notes} | {item.notes}"
+                    for k in _extract_external_note_keys(dbs_match.notes):
+                        existing_external_notes.add(k)
+                        seen_external_notes.add(k)
+                        existing_tx_by_note[k] = dbs_match
+
+                if _is_generic_dbs_merchant(dbs_match.merchant) and not _is_generic_dbs_merchant(item.merchant):
+                    merchant_name, tx_cat, rule_tags, rule_recurrence, matched_rule = _resolve_category_and_merchant(
+                        item,
+                        active_rules,
+                        skip_llm=skip_llm,
+                        existing_tags=existing_tags,
+                        extra_categories=extra_categories,
+                    )
+                    dbs_match.merchant = merchant_name
+                    if item.raw_description and item.raw_description not in (dbs_match.raw_description or ""):
+                        dbs_match.raw_description = (
+                            f"{dbs_match.raw_description} | {item.raw_description}"
+                            if dbs_match.raw_description
+                            else item.raw_description
+                        )
+                    if (dbs_match.category or "General") == "General" or tx_cat == "Transfers":
+                        dbs_match.category = tx_cat[:50]
+                    if rule_recurrence and not dbs_match.recurrence:
+                        dbs_match.recurrence = rule_recurrence
+                    existing_item_tags = parse_rule_tags(dbs_match.tags)
+                    merged_tags = normalize_tags([*existing_item_tags, *item.tags, *rule_tags])
+                    dbs_match.tags = json.dumps(merged_tags)
+                    if matched_rule is not None and matched_rule.loan_id is not None and dbs_match.loan_id is None:
+                        dbs_match.loan_id = matched_rule.loan_id
+                    if matched_rule is not None and matched_rule.counterpart_account_id is not None:
+                        matched_tx_rules.append((dbs_match, matched_rule))
+                elif item.category == "Transfers" and (dbs_match.category or "General") == "General":
+                    dbs_match.category = "Transfers"
+            else:
+                if _is_generic_dbs_merchant(dbs_match.merchant) and not _is_generic_dbs_merchant(item.merchant):
+                    dbs_match.merchant = item.merchant[:150]
+                if item.raw_description and not _is_generic_dbs_merchant(item.raw_description) and item.raw_description not in (dbs_match.raw_description or ""):
+                    dbs_match.raw_description = (
+                        f"{dbs_match.raw_description} | {item.raw_description}"
+                        if dbs_match.raw_description
+                        else item.raw_description
+                    )
+            reconcile_needed = True
+            skipped += 1
+            continue
+
         base_hash = generate_transaction_hash(
             tx_date=item.transaction_date,
             amount=item.amount,
@@ -340,6 +506,11 @@ def ingest_normalized_transactions(
 
         if hash_exists:
             if not ext_note:
+                existing_by_hash = db.scalar(
+                    select(Transaction).where(Transaction.raw_hash == base_hash)
+                )
+                if existing_by_hash is not None:
+                    matched_existing.append(existing_by_hash)
                 skipped += 1
                 continue
             raw_hash = hashlib.sha256(f"{base_hash}:{ext_note}".encode("utf-8")).hexdigest()
@@ -348,6 +519,11 @@ def ingest_normalized_transactions(
                 or db.scalar(select(Transaction.id).where(Transaction.raw_hash == raw_hash)) is not None
             )
             if salted_exists:
+                existing_by_hash = db.scalar(
+                    select(Transaction).where(Transaction.raw_hash == raw_hash)
+                )
+                if existing_by_hash is not None:
+                    matched_existing.append(existing_by_hash)
                 skipped += 1
                 continue
         else:
@@ -355,6 +531,19 @@ def ingest_normalized_transactions(
             cs_key = _cross_source_key(item.transaction_date, item.amount)
             batch_seen_counts[cs_key] += 1
             if batch_seen_counts[cs_key] <= existing_counts[cs_key]:
+                matching_exact = next(
+                    (
+                        tx
+                        for tx in window_existing_txs
+                        if tx.transaction_date == item.transaction_date
+                        and _amount_decimal_key(tx.amount) == _amount_decimal_key(item.amount)
+                        and tx.id not in consumed_existing_ids
+                    ),
+                    None,
+                )
+                if matching_exact is not None:
+                    consumed_existing_ids.add(matching_exact.id)
+                    matched_existing.append(matching_exact)
                 skipped += 1
                 continue
 
@@ -406,8 +595,10 @@ def ingest_normalized_transactions(
     db.commit()
     for tx in created:
         db.refresh(tx)
+    for tx in matched_existing:
+        db.refresh(tx)
 
-    if created:
+    if created or reconcile_needed:
         reconcile_unlinked_receipts(db)
         reconcile_transfers(db)
         if matched_tx_rules:
@@ -420,10 +611,27 @@ def ingest_normalized_transactions(
                 db.commit()
                 for tx in created:
                     db.refresh(tx)
-    elif reconcile_needed:
-        reconcile_transfers(db)
+                for tx in matched_existing:
+                    db.refresh(tx)
 
-    return len(created), skipped, created
+    return len(created), skipped, created, matched_existing
+
+
+def ingest_normalized_transactions(
+    db: Session,
+    account: Account,
+    items: list[NormalizedTx] | tuple[NormalizedTx, ...],
+    *,
+    skip_llm: bool = False,
+) -> tuple[int, int, list[Transaction]]:
+    """Deduplicate, categorize, persist, and reconcile normalized transactions."""
+    created_count, skipped_count, created, _ = ingest_normalized_transactions_detailed(
+        db,
+        account,
+        items,
+        skip_llm=skip_llm,
+    )
+    return created_count, skipped_count, created
 
 
 def upsert_account_snapshot(

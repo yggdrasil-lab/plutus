@@ -71,6 +71,7 @@ class AccountBase(BaseModel):
     currency: str = Field(default="NZD", max_length=3)
     expected_annual_return: float = Field(default=0.0, ge=0.0, le=1.0)
     is_active: bool = True
+    account_number_last4: Optional[str] = Field(default=None, max_length=64)
 
     @field_validator("account_type", mode="before")
     @classmethod
@@ -100,6 +101,7 @@ class AccountUpdate(BaseModel):
     institution: Optional[str] = Field(default=None, max_length=100)
     expected_annual_return: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     is_active: Optional[bool] = None
+    account_number_last4: Optional[str] = Field(default=None, max_length=64)
 
     @field_validator("name", "institution")
     @classmethod
@@ -808,6 +810,7 @@ class ReceiptBase(BaseModel):
     total_amount: float = Field(..., ge=0.0)
     currency: str = Field(default="NZD", max_length=3)
     tax_amount: Optional[float] = Field(default=None, ge=0.0)
+    order_number: Optional[str] = Field(default=None, max_length=128)
     status: str = Field(default="unlinked", max_length=30)
     notes: Optional[str] = None
 
@@ -819,6 +822,7 @@ class ReceiptCreate(ReceiptBase):
 class ReceiptRead(ReceiptBase):
     id: int
     transaction_id: Optional[int] = None
+    source_email_message_id: Optional[str] = None
     image_path: Optional[str] = None
     image_mime_type: Optional[str] = None
     image_filename: Optional[str] = None
@@ -831,6 +835,22 @@ class ReceiptRead(ReceiptBase):
 
     class Config:
         from_attributes = True
+
+
+class TransactionCandidateRead(BaseModel):
+    transaction_id: int
+    transaction_date: date
+    merchant: str
+    raw_description: Optional[str] = None
+    amount: float
+    currency: str
+    account_id: int
+    account_name: Optional[str] = None
+    original_amount: Optional[float] = None
+    original_currency: Optional[str] = None
+    estimated_receipt_amount: Optional[float] = None
+    confidence: float
+    match_reason: str
 
 
 class ProductStatisticItem(BaseModel):
@@ -958,6 +978,68 @@ class DbsAlertResult(BaseModel):
     status: str
     transaction: Optional[TransactionRead] = None
     duplicate: bool = False
+
+
+VALID_EMAIL_ROUTE_TARGETS = {
+    "plutus_dbs_alert",
+    "plutus_purchase_receipt",
+    "plutus_bank_statement",
+}
+
+
+class EmailAttachmentPayload(BaseModel):
+    filename: Optional[str] = Field(default=None, max_length=255)
+    content_type: Optional[str] = Field(default=None, max_length=128)
+    size_bytes: Optional[int] = Field(default=None, ge=0)
+    sha256: Optional[str] = Field(default=None, max_length=128)
+    content_base64: Optional[str] = None
+
+
+class InboundEmailDispatchPayload(BaseModel):
+    """Unified inbound financial email payload routed from Iris."""
+
+    email_id: Optional[int] = None
+    message_id: str = Field(..., min_length=1, max_length=512)
+    route_target: str = Field(..., min_length=1, max_length=64)
+    from_address: Optional[str] = Field(default=None, max_length=255)
+    to_address: Optional[str] = Field(default=None, max_length=255)
+    subject: Optional[str] = Field(default="", max_length=500)
+    received_at: Optional[datetime] = None
+    text_body: Optional[str] = None
+    html_excerpt: Optional[str] = None
+    raw_excerpt: Optional[str] = None
+    jev_verdict: Optional[Any] = None
+    attachments: list[EmailAttachmentPayload] = Field(default_factory=list)
+
+    @field_validator("message_id", mode="before")
+    @classmethod
+    def validate_message_id(cls, v: Any) -> str:
+        cleaned = str(v or "").strip()
+        if not cleaned:
+            raise ValueError("message_id is required.")
+        return cleaned
+
+    @field_validator("route_target", mode="before")
+    @classmethod
+    def validate_route_target(cls, v: Any) -> str:
+        cleaned = str(v or "").strip().lower()
+        if cleaned not in VALID_EMAIL_ROUTE_TARGETS:
+            raise ValueError(
+                f"Unsupported route_target '{v}'. Must be one of: {', '.join(sorted(VALID_EMAIL_ROUTE_TARGETS))}."
+            )
+        return cleaned
+
+
+class InboundEmailDispatchResult(BaseModel):
+    status: str
+    route_target: str
+    message_id: str
+    duplicate: bool = False
+    consumer_ref: Optional[str] = None
+    transaction_id: Optional[int] = None
+    receipt_id: Optional[int] = None
+    receipt_ids: list[int] = Field(default_factory=list)
+    error_detail: Optional[str] = None
 
 
 VALID_LOAN_TYPES = {"borrowed", "lent"}

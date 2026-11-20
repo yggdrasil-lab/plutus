@@ -41,6 +41,7 @@ class Account(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     external_provider: Mapped[Optional[str]] = mapped_column(String(30), nullable=True, index=True)
     external_account_id: Mapped[Optional[str]] = mapped_column(String(150), nullable=True, index=True)
+    account_number_last4: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     last_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
@@ -312,7 +313,9 @@ class Receipt(Base):
     total_amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
     currency: Mapped[str] = mapped_column(String(3), nullable=False, default="NZD")
     tax_amount: Mapped[Optional[float]] = mapped_column(Numeric(12, 2), nullable=True)
-    status: Mapped[str] = mapped_column(String(30), nullable=False, default="unlinked")  # unlinked, matched, verified
+    order_number: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
+    source_email_message_id: Mapped[Optional[str]] = mapped_column(String(512), nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="unlinked")  # unlinked, needs_review, matched, verified
     image_path: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     image_data: Mapped[Optional[bytes]] = mapped_column(LargeBinary, nullable=True)
     image_mime_type: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
@@ -422,4 +425,32 @@ class Loan(Base):
         "TransactionSplit",
         back_populates="loan",
         foreign_keys="TransactionSplit.loan_id",
+    )
+
+
+class IngestedEmail(Base):
+    """Audit and idempotency record for inbound emails routed from Iris."""
+
+    __tablename__ = "ingested_emails"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    message_id: Mapped[str] = mapped_column(String(512), unique=True, nullable=False, index=True)
+    iris_email_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    route_target: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    consumer_ref: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    transaction_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        ForeignKey("transactions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    receipt_ids_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    error_detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+    transaction: Mapped[Optional["Transaction"]] = relationship(
+        "Transaction",
+        foreign_keys=[transaction_id],
     )
