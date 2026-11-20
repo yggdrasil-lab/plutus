@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.models import Loan, Transaction, TransactionSplit
 from app.services.fx_service import to_nzd_amount
+from app.services.split_utils import resolve_signed_split_amount
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,9 @@ def load_loans_with_transactions(db: Session, *, active_only: bool = True) -> li
             joinedload(Loan.split_entries)
             .joinedload(TransactionSplit.transaction)
             .joinedload(Transaction.account),
+            joinedload(Loan.split_entries)
+            .joinedload(TransactionSplit.transaction)
+            .joinedload(Transaction.splits),
         )
         .order_by(Loan.start_date.asc(), Loan.id.asc())
     )
@@ -61,6 +65,9 @@ def load_loan_with_transactions(db: Session, loan_id: int) -> Optional[Loan]:
             joinedload(Loan.split_entries)
             .joinedload(TransactionSplit.transaction)
             .joinedload(Transaction.account),
+            joinedload(Loan.split_entries)
+            .joinedload(TransactionSplit.transaction)
+            .joinedload(Transaction.splits),
         )
         .where(Loan.id == loan_id)
     )
@@ -156,11 +163,15 @@ def _build_loan_ledger_items(
         tx = split.transaction
         if tx is None:
             continue
-        sign = 1.0 if float(tx.amount) >= 0 else -1.0
+        tx_splits = getattr(tx, "splits", None) or [split]
+        signed_split = round(
+            resolve_signed_split_amount(split, tx_splits, float(tx.amount)),
+            2,
+        )
         items.append(
             _LoanLedgerItem(
                 tx=tx,
-                signed_amount=round(sign * abs(float(split.amount)), 2),
+                signed_amount=signed_split,
                 category=split.category,
                 split_id=split.id,
                 notes=split.notes,
@@ -168,6 +179,20 @@ def _build_loan_ledger_items(
             )
         )
     return items
+
+
+def _item_applied_amount(item: _LoanLedgerItem, loan_currency: str) -> float:
+    """Resolve the currency-normalized principal/payment magnitude for a ledger item."""
+    raw_override = (
+        abs(item.signed_amount)
+        if item.split_id is not None
+        else (
+            abs(float(item.loan_payment_amount))
+            if item.loan_payment_amount is not None
+            else None
+        )
+    )
+    return _payment_in_loan_currency(item.tx, loan_currency, raw_amount=raw_override)
 
 
 def compute_loan_status(
@@ -200,52 +225,61 @@ def compute_loan_status(
     repayment_items = inflows if loan_type == "lent" else outflows
     disbursement_items = outflows if loan_type == "lent" else []
 
-    balance = principal
     payments_made = 0
     interest_paid_total = 0.0
     total_paid = 0.0
     repayment_entries: list[dict[str, object]] = []
+    disbursement_entries: list[dict[str, object]] = []
 
-    for item in repayment_items:
-        raw_override = (
-            abs(item.signed_amount)
-            if item.split_id is not None
-            else (
-                abs(float(item.loan_payment_amount))
-                if item.loan_payment_amount is not None
-                else None
-            )
-        )
-        applied = _payment_in_loan_currency(
-            item.tx,
-            loan_currency,
-            raw_amount=raw_override,
-        )
-        interest = balance * monthly_rate if annual_rate > 0 else 0.0
+    def _apply_repayment(item: _LoanLedgerItem, current_balance: float) -> float:
+        nonlocal interest_paid_total, total_paid, payments_made
+        applied = _item_applied_amount(item, loan_currency)
+        interest = current_balance * monthly_rate if annual_rate > 0 else 0.0
         principal_part = max(0.0, applied - interest)
-        balance = max(0.0, balance - principal_part)
-        if balance <= 0.01:
-            balance = 0.0
+        new_balance = max(0.0, current_balance - principal_part)
+        if new_balance <= 0.01:
+            new_balance = 0.0
         interest_paid_total += interest
         total_paid += applied
         payments_made += 1
         repayment_entries.append(
             _serialize_loan_entry(item, applied_amount=applied, entry_type="repayment")
         )
+        return new_balance
+
+    if loan_type == "lent" and disbursement_items:
+        events: list[tuple[bool, _LoanLedgerItem]] = [
+            *((True, item) for item in disbursement_items),
+            *((False, item) for item in repayment_items),
+        ]
+        events.sort(
+            key=lambda pair: (
+                pair[1].tx.transaction_date,
+                pair[1].tx.id or 0,
+                pair[1].split_id or 0,
+                0 if pair[0] else 1,
+            )
+        )
+        balance = 0.0
+        disbursement_total = 0.0
+        for is_disbursement, item in events:
+            if is_disbursement:
+                applied = _item_applied_amount(item, loan_currency)
+                balance += applied
+                disbursement_total += applied
+                disbursement_entries.append(
+                    _serialize_loan_entry(item, applied_amount=applied, entry_type="disbursement")
+                )
+            else:
+                balance = _apply_repayment(item, balance)
+        principal = round(disbursement_total, 2)
+    else:
+        balance = principal
+        for item in repayment_items:
+            balance = _apply_repayment(item, balance)
 
     linked_payments = list(reversed(repayment_entries))
-    disbursements = [
-        _serialize_loan_entry(
-            item,
-            applied_amount=_payment_in_loan_currency(
-                item.tx,
-                loan_currency,
-                raw_amount=abs(item.signed_amount) if item.split_id is not None else None,
-            ),
-            entry_type="disbursement",
-        )
-        for item in reversed(disbursement_items)
-    ]
+    disbursements = list(reversed(disbursement_entries))
 
     remaining_principal = round(balance, 2)
     principal_paid = round(max(0.0, principal - remaining_principal), 2)

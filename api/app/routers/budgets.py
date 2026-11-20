@@ -47,6 +47,7 @@ from app.services.recurrence_service import (
     get_period_amortized_recurrences,
     is_recurrence_excluded_from_period,
 )
+from app.services.split_utils import resolve_signed_split_amount
 
 router = APIRouter(prefix="/budgets", tags=["Budgets & Spending Awareness"])
 
@@ -486,21 +487,23 @@ def get_spending_breakdown(
         splits = getattr(tx, "splits", None) or []
 
         if splits:
-            if amt < 0:
-                if is_recurrence_excluded_from_period(effective_period, tx.recurrence):
+            recurrence_excluded = is_recurrence_excluded_from_period(effective_period, tx.recurrence)
+            for s in splits:
+                signed_amt = resolve_signed_split_amount(s, splits, amt)
+                s_cat = (s.category or cat).strip() or "General"
+                s_lower = s_cat.lower()
+                s_nzd = round(
+                    to_nzd_amount(abs(signed_amt), tx.currency, tx.exchange_rate),
+                    2,
+                )
+                if s_lower in TRANSFER_CATEGORIES:
+                    total_transfers += s_nzd
+                    _accumulate_category(category_spend_map, "Transfers", s_nzd, is_transfer=True)
                     continue
-                for s in splits:
-                    s_cat = (s.category or cat).strip() or "General"
-                    s_lower = s_cat.lower()
-                    s_nzd = round(
-                        to_nzd_amount(abs(float(s.amount)), tx.currency, tx.exchange_rate),
-                        2,
-                    )
-                    if s_lower in TRANSFER_CATEGORIES:
-                        total_transfers += s_nzd
-                        _accumulate_category(category_spend_map, "Transfers", s_nzd, is_transfer=True)
-                        continue
-                    if s.loan is not None and (s.loan.loan_type or "").strip().lower() == "lent":
+                if s.loan is not None and (s.loan.loan_type or "").strip().lower() == "lent":
+                    continue
+                if signed_amt < 0:
+                    if recurrence_excluded:
                         continue
                     effective_cat = get_root_category(s_cat, parent_map) if rollup_base else s_cat
                     effective_lower = effective_cat.lower()
@@ -511,20 +514,7 @@ def get_spending_breakdown(
                         continue
                     total_spend += s_nzd
                     _accumulate_category(category_spend_map, effective_cat, s_nzd)
-            elif amt > 0:
-                for s in splits:
-                    s_cat = (s.category or cat).strip() or "General"
-                    s_lower = s_cat.lower()
-                    s_nzd = round(
-                        to_nzd_amount(abs(float(s.amount)), tx.currency, tx.exchange_rate),
-                        2,
-                    )
-                    if s_lower in TRANSFER_CATEGORIES:
-                        total_transfers += s_nzd
-                        _accumulate_category(category_spend_map, "Transfers", s_nzd, is_transfer=True)
-                        continue
-                    if s.loan is not None and (s.loan.loan_type or "").strip().lower() == "lent":
-                        continue
+                elif signed_amt > 0:
                     total_income += s_nzd
             continue
 
