@@ -394,6 +394,7 @@ def ingest_normalized_transactions(
             fee_amount=item.fee_amount,
             tags=json.dumps(normalize_tags([*item.tags, *rule_tags])),
             recurrence=rule_recurrence,
+            loan_id=matched_rule.loan_id if matched_rule is not None else None,
             notes=item.notes,
         )
         db.add(tx)

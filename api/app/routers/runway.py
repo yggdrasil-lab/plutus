@@ -4,11 +4,9 @@ from datetime import date
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.models import Loan
 from app.schemas import (
     RunwayAiSynthesisRead,
     RunwayResponse,
@@ -25,7 +23,7 @@ from app.services.burn_service import (
     resolve_tier_labels,
 )
 from app.services.llm_synthesizer import synthesize_runway_scenario_llm
-from app.services.loan_service import summarize_loans
+from app.services.loan_service import load_loans_with_transactions, summarize_loans
 from app.services.runway import (
     calculate_compounding_runway,
     calculate_emergency_runway,
@@ -80,7 +78,7 @@ def get_current_runway(
     time_banked = calculate_time_banked(target_budget, this_week_spend)
     locked_weeks = round(locked_bal / weekly_burn, 1) if weekly_burn > 0 else 0.0
 
-    loans = db.scalars(select(Loan).where(Loan.is_active == True)).all()
+    loans = load_loans_with_transactions(db, active_only=True)
     loan_summary = summarize_loans(loans, today)
     total_liabilities = float(loan_summary["total_liabilities"])
     net_worth = round(total_liquid + locked_bal - total_liabilities, 2)
@@ -129,7 +127,7 @@ def simulate_runway_scenario(
 
     baseline_liquid = balances["cash"] + balances["growth"]
     locked_bal = balances["locked"]
-    loans = db.scalars(select(Loan).where(Loan.is_active == True)).all()
+    loans = load_loans_with_transactions(db, active_only=True)
     loan_summary = summarize_loans(loans, today)
     total_liabilities = float(loan_summary["total_liabilities"])
     loan_weekly_relief = float(loan_summary["total_weekly_payment"])

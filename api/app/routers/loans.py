@@ -2,13 +2,17 @@
 
 from datetime import date
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.models import Loan
 from app.schemas import LoanCreate, LoanRead, LoansSummaryResponse, LoanUpdate
-from app.services.loan_service import compute_loan_status, summarize_loans
+from app.services.loan_service import (
+    compute_loan_status,
+    load_loan_with_transactions,
+    load_loans_with_transactions,
+    summarize_loans,
+)
 
 router = APIRouter(prefix="/loans", tags=["Loans & Financing"])
 
@@ -16,7 +20,7 @@ router = APIRouter(prefix="/loans", tags=["Loans & Financing"])
 @router.get("", response_model=LoansSummaryResponse)
 def list_loans(db: Session = Depends(get_db)):
     """List all active loans with live payment countdown, remaining principal, and net worth impact."""
-    loans = db.scalars(select(Loan).order_by(Loan.start_date.asc(), Loan.id.asc())).all()
+    loans = load_loans_with_transactions(db, active_only=True)
     return summarize_loans(loans, date.today())
 
 
@@ -38,8 +42,8 @@ def create_loan(payload: LoanCreate, db: Session = Depends(get_db)):
     )
     db.add(loan)
     db.commit()
-    db.refresh(loan)
-    return compute_loan_status(loan, date.today())
+    loaded = load_loan_with_transactions(db, loan.id)
+    return compute_loan_status(loaded or loan, date.today())
 
 
 @router.patch("/{loan_id}", response_model=LoanRead)
@@ -68,8 +72,8 @@ def update_loan(loan_id: int, payload: LoanUpdate, db: Session = Depends(get_db)
             setattr(loan, field, val)
 
     db.commit()
-    db.refresh(loan)
-    return compute_loan_status(loan, date.today())
+    loaded = load_loan_with_transactions(db, loan.id)
+    return compute_loan_status(loaded or loan, date.today())
 
 
 @router.delete("/{loan_id}", status_code=status.HTTP_204_NO_CONTENT)
