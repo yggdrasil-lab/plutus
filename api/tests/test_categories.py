@@ -131,6 +131,33 @@ class TestCategoriesRouterAndHierarchy(unittest.TestCase):
         self.assertTrue(cats["General"]["is_system"])
         self.assertTrue(cats["Transfers"]["is_system"])
         self.assertTrue(cats["Income"]["is_system"])
+        self.assertTrue(cats["Debt & Loans"]["is_system"])
+
+        # Debt & Loans is protected as a system category yet still exposed in GET /runway categories
+        debt_id = cats["Debt & Loans"]["id"]
+        food_id = cats["Food"]["id"]
+        self.assertEqual(
+            self.client.patch(f"/categories/{debt_id}", json={"name": "Debts"}).status_code,
+            400,
+        )
+        self.assertEqual(
+            self.client.patch(f"/categories/{debt_id}", json={"parent_id": food_id}).status_code,
+            400,
+        )
+        self.assertEqual(
+            self.client.patch(f"/categories/{debt_id}", json={"is_active": False}).status_code,
+            400,
+        )
+        self.assertEqual(
+            self.client.delete(f"/categories/{debt_id}").status_code,
+            400,
+        )
+
+        runway_cats = self.client.get("/runway").json()["categories"]
+        self.assertIn("Debt & Loans", runway_cats)
+        self.assertNotIn("General", runway_cats)
+        self.assertNotIn("Transfers", runway_cats)
+        self.assertNotIn("Income", runway_cats)
 
     def test_create_category_validation_and_duplicate_guards(self):
         cats = {c["name"]: c for c in self.client.get("/categories").json()}

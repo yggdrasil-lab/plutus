@@ -30,6 +30,7 @@ def _hydrate_rule(rule: CategorizationRule) -> CategorizationRule:
         rule.counterpart_account.name if rule.counterpart_account else None
     )
     rule.loan_name = rule.loan.name if rule.loan else None
+    rule.loan_type = rule.loan.loan_type if rule.loan else None
     return rule
 
 

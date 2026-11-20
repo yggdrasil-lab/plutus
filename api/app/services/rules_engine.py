@@ -176,6 +176,7 @@ def _apply_rule_to_record(
         and record.loan_id != matched_rule.loan_id
     ):
         record.loan_id = matched_rule.loan_id
+        record.loan_payment_amount = None
         changed = True
     return changed
 

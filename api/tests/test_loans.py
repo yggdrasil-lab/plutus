@@ -288,3 +288,322 @@ def test_loans_transaction_driven_linking_rules_payoff_and_account_patch():
         assert paid_off_loan["weekly_payment_equivalent"] == 0.0
     finally:
         app.dependency_overrides.clear()
+
+
+def test_two_way_lent_loan_partial_repayment_and_budget_purity():
+    client, TestingSessionLocal = _build_test_client()
+
+    try:
+        today = date.today()
+        with TestingSessionLocal() as db:
+            acc = Account(
+                name="ANZ Checking",
+                institution="ANZ",
+                account_type="checking",
+                tier="cash",
+                currency="NZD",
+            )
+            db.add(acc)
+            db.flush()
+            db.add(
+                AssetSnapshot(
+                    account_id=acc.id,
+                    snapshot_date=today,
+                    balance=50000.0,
+                    currency="NZD",
+                    exchange_rate=1.0,
+                    balance_nzd=50000.0,
+                    source="manual",
+                )
+            )
+            db.commit()
+            db.refresh(acc)
+
+        # Validation: borrowed loan requires term_months >= 1 and monthly_payment > 0
+        bad_borrowed_term = client.post(
+            "/loans",
+            json={
+                "name": "Bad Borrowed",
+                "lender": "Bank",
+                "loan_type": "borrowed",
+                "principal_amount": 5000.0,
+                "annual_interest_rate": 0.05,
+                "term_months": 0,
+                "monthly_payment": 200.0,
+                "start_date": today.isoformat(),
+            },
+        )
+        assert bad_borrowed_term.status_code == 422
+
+        bad_borrowed_pmt = client.post(
+            "/loans",
+            json={
+                "name": "Bad Borrowed Pmt",
+                "lender": "Bank",
+                "loan_type": "borrowed",
+                "principal_amount": 5000.0,
+                "annual_interest_rate": 0.05,
+                "term_months": 12,
+                "monthly_payment": 0.0,
+                "start_date": today.isoformat(),
+            },
+        )
+        assert bad_borrowed_pmt.status_code == 422
+
+        # Create lent receivable ($10,000, flexible open term=0, payment=0, 0% interest)
+        lent_res = client.post(
+            "/loans",
+            json={
+                "name": "Family Bridge Loan",
+                "lender": "Sibling",
+                "loan_type": "LENT",
+                "principal_amount": 10000.0,
+                "annual_interest_rate": 0.0,
+                "term_months": 0,
+                "monthly_payment": 0.0,
+                "start_date": today.isoformat(),
+            },
+        )
+        assert lent_res.status_code == 201
+        lent_loan = lent_res.json()
+        lent_id = lent_loan["id"]
+        assert lent_loan["loan_type"] == "lent"
+        assert lent_loan["remaining_principal"] == 10000.0
+        assert lent_loan["payments_remaining"] == 0
+        assert lent_loan["next_payment_date"] is None
+        assert lent_loan["is_payment_due"] is False
+        assert lent_loan["payoff_date"] is None
+        assert lent_loan["net_worth_impact"] == 0.0
+
+        # Cannot switch open-term lent loan to borrowed without valid term & monthly_payment
+        bad_switch = client.patch(f"/loans/{lent_id}", json={"loan_type": "borrowed"})
+        assert bad_switch.status_code == 422
+
+        # Create second borrowed loan for switch-clearing & partial repayment tests
+        borrowed_res = client.post(
+            "/loans",
+            json={
+                "name": "Car Finance",
+                "lender": "Toyota",
+                "loan_type": "borrowed",
+                "principal_amount": 5000.0,
+                "annual_interest_rate": 0.0,
+                "term_months": 10,
+                "monthly_payment": 500.0,
+                "start_date": today.isoformat(),
+            },
+        )
+        assert borrowed_res.status_code == 201
+        borrowed_id = borrowed_res.json()["id"]
+
+        # Create normal grocery spend ($100) so burn rate baseline is known
+        grocery_tx = client.post(
+            "/transactions",
+            json={
+                "transaction_date": today.isoformat(),
+                "account_id": acc.id,
+                "amount": -100.0,
+                "currency": "NZD",
+                "merchant": "Countdown",
+                "category": "Groceries",
+            },
+        ).json()
+
+        # 1. Link -$10,000 disbursement outflow to lent loan
+        disb_tx = client.post(
+            "/transactions",
+            json={
+                "transaction_date": today.isoformat(),
+                "account_id": acc.id,
+                "amount": -10000.0,
+                "currency": "NZD",
+                "merchant": "Transfer to Sibling",
+                "category": "Debt & Loans",
+            },
+        ).json()
+
+        # Validation: setting loan_payment_amount while unlinked (loan_id is None) returns 422
+        unlinked_override = client.patch(
+            f"/transactions/{disb_tx['id']}",
+            json={"loan_payment_amount": 500.0},
+        )
+        assert unlinked_override.status_code == 422
+
+        link_disb = client.patch(
+            f"/transactions/{disb_tx['id']}",
+            json={"loan_id": lent_id},
+        )
+        assert link_disb.status_code == 200
+        assert link_disb.json()["loan_type"] == "lent"
+
+        # 2. Mixed inflow +$5,020 with loan_payment_amount=5000 ($20 ride-along income)
+        mixed_day = today + timedelta(days=1)
+        mixed_tx = client.post(
+            "/transactions",
+            json={
+                "transaction_date": mixed_day.isoformat(),
+                "account_id": acc.id,
+                "amount": 5020.0,
+                "currency": "NZD",
+                "merchant": "Sibling Repayment + Split",
+                "category": "Debt & Loans",
+            },
+        ).json()
+
+        # Validation: loan_payment_amount > abs(amount) -> 422; <= 0 -> 422
+        too_high = client.patch(
+            f"/transactions/{mixed_tx['id']}",
+            json={"loan_id": lent_id, "loan_payment_amount": 6000.0},
+        )
+        assert too_high.status_code == 422
+        non_positive = client.patch(
+            f"/transactions/{mixed_tx['id']}",
+            json={"loan_id": lent_id, "loan_payment_amount": 0.0},
+        )
+        assert non_positive.status_code == 422
+
+        link_mixed = client.patch(
+            f"/transactions/{mixed_tx['id']}",
+            json={"loan_id": lent_id, "loan_payment_amount": 5000.0},
+        )
+        assert link_mixed.status_code == 200
+        assert link_mixed.json()["loan_payment_amount"] == 5000.0
+        assert link_mixed.json()["loan_type"] == "lent"
+
+        # 3. Pure repayment inflow +$1,000 (no override)
+        repay_day = today + timedelta(days=2)
+        repay_tx = client.post(
+            "/transactions",
+            json={
+                "transaction_date": repay_day.isoformat(),
+                "account_id": acc.id,
+                "amount": 1000.0,
+                "currency": "NZD",
+                "merchant": "Sibling Second Payment",
+                "category": "Debt & Loans",
+            },
+        ).json()
+        assert client.patch(
+            f"/transactions/{repay_tx['id']}",
+            json={"loan_id": lent_id},
+        ).status_code == 200
+
+        # Verify GET /loans portfolio summary and lent loan status
+        summary = client.get("/loans").json()
+        assert summary["total_liabilities"] == 5000.0
+        assert summary["total_receivables"] == 4000.0
+
+        lent_status = next(item for item in summary["loans"] if item["id"] == lent_id)
+        assert lent_status["remaining_principal"] == 4000.0
+        assert lent_status["principal_paid"] == 6000.0
+        assert lent_status["total_paid_amount"] == 6000.0
+        assert lent_status["payments_made"] == 2
+        assert lent_status["payoff_date"] is None
+        assert lent_status["net_worth_impact"] == 0.0
+        assert len(lent_status["disbursements"]) == 1
+        assert lent_status["disbursements"][0]["id"] == disb_tx["id"]
+        assert lent_status["disbursements"][0]["entry_type"] == "disbursement"
+        assert [p["id"] for p in lent_status["linked_payments"]] == [repay_tx["id"], mixed_tx["id"]]
+        assert lent_status["linked_payments"][0]["applied_amount"] == 1000.0
+        assert lent_status["linked_payments"][0]["entry_type"] == "repayment"
+        assert lent_status["linked_payments"][1]["applied_amount"] == 5000.0
+        assert lent_status["linked_payments"][1]["loan_payment_amount"] == 5000.0
+
+        # Verify Budget Breakdown & Runway purity:
+        # - -$10,000 disbursement is NOT in total_spend or weekly_burn_rate (only $100 Groceries counts)
+        # - +$5,020 with loan_payment_amount=5000 adds only $20.00 to total_income; +$1,000 adds $0.00
+        # - runway.breakdown.total_liabilities = 5000.0 (only borrowed), net_worth = 50000 - 5000 = 45000
+        bd = client.get("/budgets/breakdown?period=all").json()
+        assert bd["total_spend"] == 100.0
+        assert bd["total_income"] == 20.0
+        assert bd["net_savings"] == -80.0
+
+        runway = client.get("/runway").json()
+        assert runway["breakdown"]["total_liabilities"] == 5000.0
+        assert runway["breakdown"]["net_worth"] == 45000.0
+        # 4w variable burn = $100 / 4 = $25/wk (the -$10k disbursement did NOT inflate burn)
+        assert runway["breakdown"]["weekly_burn_rate"] == 25.0
+
+        # Verify rule loan_type hydration
+        rule_res = client.post(
+            "/rules",
+            json={
+                "name": "Sibling Loan Rule",
+                "description_pattern": "SIBLING",
+                "target_category": "Debt & Loans",
+                "loan_id": lent_id,
+                "apply_retroactively": False,
+            },
+        )
+        assert rule_res.status_code == 201
+        assert rule_res.json()["loan_type"] == "lent"
+
+        # Switching loan_id to another loan without loan_payment_amount clears loan_payment_amount
+        # First test on a borrowed outflow with loan_payment_amount
+        part_out = client.post(
+            "/transactions",
+            json={
+                "transaction_date": repay_day.isoformat(),
+                "account_id": acc.id,
+                "amount": -800.0,
+                "currency": "NZD",
+                "merchant": "Split Car + Groceries",
+                "category": "Debt & Loans",
+            },
+        ).json()
+        patched_borrowed = client.patch(
+            f"/transactions/{part_out['id']}",
+            json={"loan_id": borrowed_id, "loan_payment_amount": 500.0},
+        )
+        assert patched_borrowed.status_code == 200
+        assert patched_borrowed.json()["loan_payment_amount"] == 500.0
+        assert client.get("/loans").json()["total_liabilities"] == 4500.0
+
+        # Switch to lent_id without specifying loan_payment_amount -> clears override to None
+        switched = client.patch(
+            f"/transactions/{part_out['id']}",
+            json={"loan_id": lent_id},
+        )
+        assert switched.status_code == 200
+        assert switched.json()["loan_payment_amount"] is None
+
+        # Clear loan_id on mixed_tx -> clears loan_payment_amount to None
+        unlinked_mixed = client.patch(
+            f"/transactions/{mixed_tx['id']}",
+            json={"loan_id": None},
+        )
+        assert unlinked_mixed.status_code == 200
+        assert unlinked_mixed.json()["loan_id"] is None
+        assert unlinked_mixed.json()["loan_type"] is None
+        assert unlinked_mixed.json()["loan_payment_amount"] is None
+
+        # Re-link mixed_tx and pay off remaining $4,000
+        assert client.patch(
+            f"/transactions/{mixed_tx['id']}",
+            json={"loan_id": lent_id, "loan_payment_amount": 5000.0},
+        ).status_code == 200
+        final_day = today + timedelta(days=3)
+        final_tx = client.post(
+            "/transactions",
+            json={
+                "transaction_date": final_day.isoformat(),
+                "account_id": acc.id,
+                "amount": 4000.0,
+                "currency": "NZD",
+                "merchant": "Sibling Final Payoff",
+                "category": "Debt & Loans",
+            },
+        ).json()
+        assert client.patch(
+            f"/transactions/{final_tx['id']}",
+            json={"loan_id": lent_id},
+        ).status_code == 200
+
+        final_summary = client.get("/loans").json()
+        assert final_summary["total_receivables"] == 0.0
+        final_lent = next(item for item in final_summary["loans"] if item["id"] == lent_id)
+        assert final_lent["remaining_principal"] == 0.0
+        assert final_lent["payoff_date"] == final_day.isoformat()
+        assert grocery_tx["id"] is not None
+    finally:
+        app.dependency_overrides.clear()

@@ -462,7 +462,10 @@ def get_spending_breakdown(
     is_monthly_period = effective_period in ("month", "last_month")
     amortized_recurrences = get_period_amortized_recurrences(effective_period)
 
-    stmt = select(Transaction).options(joinedload(Transaction.receipt).joinedload(Receipt.items))
+    stmt = select(Transaction).options(
+        joinedload(Transaction.receipt).joinedload(Receipt.items),
+        joinedload(Transaction.loan),
+    )
     if start_date:
         stmt = stmt.where(Transaction.transaction_date >= start_date)
     if end_date:
@@ -479,6 +482,9 @@ def get_spending_breakdown(
         cat = tx.category or "General"
         cat_lower = cat.lower()
         amt_nzd = to_nzd_amount(amt, tx.currency, tx.exchange_rate)
+        is_lent_loan = (
+            tx.loan is not None and (tx.loan.loan_type or "").strip().lower() == "lent"
+        )
 
         if cat_lower in TRANSFER_CATEGORIES:
             total_transfers += amt_nzd
@@ -486,6 +492,8 @@ def get_spending_breakdown(
             continue
 
         if amt < 0:
+            if is_lent_loan:
+                continue
             if is_recurrence_excluded_from_period(effective_period, tx.recurrence):
                 continue
 
@@ -501,7 +509,19 @@ def get_spending_breakdown(
                 total_spend += item_nzd
                 _accumulate_category(category_spend_map, effective_cat, item_nzd)
         elif amt > 0:
-            total_income += amt_nzd
+            if is_lent_loan:
+                if tx.loan_payment_amount is not None:
+                    tx_currency = (tx.currency or "NZD").strip().upper()
+                    repayment_nzd = (
+                        to_nzd_amount(float(tx.loan_payment_amount), tx.currency, tx.exchange_rate)
+                        if tx_currency != "NZD"
+                        else float(tx.loan_payment_amount)
+                    )
+                else:
+                    repayment_nzd = amt_nzd
+                total_income += max(0.0, amt_nzd - repayment_nzd)
+            else:
+                total_income += amt_nzd
 
     if amortized_recurrences:
         for rec_tx, weekly_nzd in get_active_recurring_commitments(db, ref_date):

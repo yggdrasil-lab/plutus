@@ -63,6 +63,7 @@ def hydrate_transaction(tx: Transaction) -> Transaction:
         tx.counterpart_account.name if tx.counterpart_account else None
     )
     tx.loan_name = tx.loan.name if tx.loan else None
+    tx.loan_type = tx.loan.loan_type if tx.loan else None
     linked = tx.linked_transaction
     if linked is not None:
         tx.linked_account_name = linked.account.name if linked.account else None
@@ -391,9 +392,35 @@ def update_transaction(
     if "recurrence" in payload.model_fields_set:
         tx.recurrence = payload.recurrence
 
+    old_loan_id = tx.loan_id
     if "loan_id" in payload.model_fields_set:
         if payload.loan_id is not None and db.get(Loan, payload.loan_id) is None:
             raise HTTPException(status_code=404, detail="Loan not found")
+        effective_loan_id = payload.loan_id
+    else:
+        effective_loan_id = old_loan_id
+
+    if "loan_payment_amount" in payload.model_fields_set:
+        if payload.loan_payment_amount is not None:
+            if effective_loan_id is None:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="loan_payment_amount requires an active loan_id.",
+                )
+            if float(payload.loan_payment_amount) > abs(float(tx.amount)):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="loan_payment_amount cannot exceed the transaction amount.",
+                )
+            tx.loan_payment_amount = float(payload.loan_payment_amount)
+        else:
+            tx.loan_payment_amount = None
+    elif "loan_id" in payload.model_fields_set and (
+        payload.loan_id is None or payload.loan_id != old_loan_id
+    ):
+        tx.loan_payment_amount = None
+
+    if "loan_id" in payload.model_fields_set:
         tx.loan_id = payload.loan_id
 
     db.commit()
