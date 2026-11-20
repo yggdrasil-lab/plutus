@@ -24,6 +24,7 @@ jobs:
         env:
           PLUTUS_MCP_TOKEN: ${{ secrets.PLUTUS_MCP_TOKEN }}
           PLUTUS_DB_PASSWORD: ${{ secrets.PLUTUS_DB_PASSWORD }}
+          PLUTUS_WEBHOOK_SECRET: ${{ secrets.PLUTUS_WEBHOOK_SECRET }}
         run: |
           if [ -z "${PLUTUS_MCP_TOKEN}" ]; then
             echo "Error: PLUTUS_MCP_TOKEN secret is required" >&2
@@ -33,10 +34,15 @@ jobs:
             echo "Error: PLUTUS_DB_PASSWORD secret is required" >&2
             exit 1
           fi
+          if [ -z "${PLUTUS_WEBHOOK_SECRET}" ]; then
+            echo "Error: PLUTUS_WEBHOOK_SECRET secret is required" >&2
+            exit 1
+          fi
           curl -fsSL https://raw.githubusercontent.com/yggdrasil-lab/yggdrasil-os/main/deploy/ensure_secret.sh -o /tmp/ensure_secret.sh
           chmod +x /tmp/ensure_secret.sh
           echo "PLUTUS_MCP_TOKEN_NAME=$(echo "$PLUTUS_MCP_TOKEN" | /tmp/ensure_secret.sh plutus_mcp_token)" >> $GITHUB_ENV
           echo "PLUTUS_DB_PASSWORD_NAME=$(printf '%s' "$PLUTUS_DB_PASSWORD" | /tmp/ensure_secret.sh plutus_db_password)" >> $GITHUB_ENV
+          echo "PLUTUS_WEBHOOK_SECRET_NAME=$(printf '%s' "$PLUTUS_WEBHOOK_SECRET" | /tmp/ensure_secret.sh plutus_webhook_secret)" >> $GITHUB_ENV
 
       - name: Prepare host data directory
         env:
@@ -51,6 +57,9 @@ jobs:
           REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
           PLUTUS_MCP_TOKEN: ${{ secrets.PLUTUS_MCP_TOKEN }}
           PLUTUS_DB_PASSWORD: ${{ secrets.PLUTUS_DB_PASSWORD }}
+          PLUTUS_WEBHOOK_SECRET: ${{ secrets.PLUTUS_WEBHOOK_SECRET }}
+          PLUTUS_DBS_ACCOUNT_MAP: ${{ vars.PLUTUS_DBS_ACCOUNT_MAP }}
+          PLUTUS_OWN_ACCOUNT_SUFFIXES: ${{ vars.PLUTUS_OWN_ACCOUNT_SUFFIXES }}
           MUNINN_MASTER_KEY: ${{ secrets.MUNINN_MASTER_KEY }}
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_CHANNEL_WEALTH_ID: ${{ vars.DISCORD_CHANNEL_WEALTH_ID }}
@@ -62,6 +71,9 @@ jobs:
           [ -z "$REGISTRY_PREFIX" ] && MISSING="$MISSING REGISTRY_PREFIX"
           [ -z "$PLUTUS_MCP_TOKEN" ] && MISSING="$MISSING PLUTUS_MCP_TOKEN"
           [ -z "$PLUTUS_DB_PASSWORD" ] && MISSING="$MISSING PLUTUS_DB_PASSWORD"
+          [ -z "$PLUTUS_WEBHOOK_SECRET" ] && MISSING="$MISSING PLUTUS_WEBHOOK_SECRET"
+          [ -z "$PLUTUS_DBS_ACCOUNT_MAP" ] && MISSING="$MISSING PLUTUS_DBS_ACCOUNT_MAP"
+          [ -z "$PLUTUS_OWN_ACCOUNT_SUFFIXES" ] && MISSING="$MISSING PLUTUS_OWN_ACCOUNT_SUFFIXES"
           [ -z "$MUNINN_MASTER_KEY" ] && MISSING="$MISSING MUNINN_MASTER_KEY"
           [ -z "$DISCORD_BOT_TOKEN" ] && MISSING="$MISSING DISCORD_BOT_TOKEN"
           [ -z "$DISCORD_CHANNEL_WEALTH_ID" ] && MISSING="$MISSING DISCORD_CHANNEL_WEALTH_ID"
@@ -77,6 +89,8 @@ jobs:
           REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
           DOMAIN_NAME: ${{ vars.DOMAIN_NAME }}
           PLUTUS_DB_MOUNT_PATH: ${{ vars.PLUTUS_DB_MOUNT_PATH || '/opt/plutus/data' }}
+          PLUTUS_DBS_ACCOUNT_MAP: ${{ vars.PLUTUS_DBS_ACCOUNT_MAP }}
+          PLUTUS_OWN_ACCOUNT_SUFFIXES: ${{ vars.PLUTUS_OWN_ACCOUNT_SUFFIXES }}
           PLUTUS_LLM_BASE_URL: ${{ vars.PLUTUS_LLM_BASE_URL || 'http://muninn:4000/v1' }}
           PLUTUS_LLM_API_KEY: ${{ secrets.MUNINN_MASTER_KEY }}
           PLUTUS_LLM_MODEL: ${{ vars.PLUTUS_LLM_MODEL || 'app-synthesize' }}

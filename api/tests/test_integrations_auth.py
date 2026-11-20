@@ -65,6 +65,29 @@ class TestIntegrationsAuth(unittest.TestCase):
                 )
             self.assertEqual(ctx2.exception.status_code, 401)
 
+    def test_verify_integration_token_accepts_webhook_secret_file(self):
+        with tempfile.NamedTemporaryFile("w", delete=False) as tmp:
+            tmp.write("webhook-file-secret\n")
+            tmp_path = tmp.name
+        try:
+            prod_settings = Settings(
+                environment="production",
+                mcp_token="",
+                webhook_secret="",
+                webhook_secret_file=tmp_path,
+            )
+            with patch("app.routers.integrations.settings", prod_settings):
+                self.assertTrue(
+                    verify_integration_token(
+                        authorization="Bearer webhook-file-secret",
+                        secret=None,
+                        x_authentik_username=None,
+                        x_authentik_email=None,
+                    )
+                )
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -93,6 +93,35 @@ class TestDatabaseConfig(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "empty"):
                     Settings()
 
+    def test_webhook_secret_file_and_dbs_config_parsers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            secret_file = Path(tmp_dir) / "plutus_webhook_secret"
+            secret_file.write_text("iris-hook-secret\n", encoding="utf-8")
+            loaded = Settings(
+                webhook_secret="env-fallback",
+                webhook_secret_file=str(secret_file),
+                dbs_account_map='{"1111": 4, "2222": 6}',
+                own_account_suffixes="1111, 2222, 3333",
+            )
+            self.assertEqual(loaded.resolved_webhook_secret, "iris-hook-secret")
+            self.assertEqual(loaded.resolved_dbs_account_map(), {"1111": 4, "2222": 6})
+            self.assertEqual(loaded.resolved_own_account_suffixes(), {"1111", "2222", "3333"})
+
+            fallback = Settings(webhook_secret="env-only", webhook_secret_file=str(Path(tmp_dir) / "missing"))
+            self.assertEqual(fallback.resolved_webhook_secret, "env-only")
+
+            bad_json = Settings(dbs_account_map="{bad-json")
+            with self.assertRaises(ValueError):
+                bad_json.resolved_dbs_account_map()
+
+            bad_type = Settings(dbs_account_map='{"1111": "not-an-int"}')
+            with self.assertRaises(ValueError):
+                bad_type.resolved_dbs_account_map()
+
+            bad_bool = Settings(dbs_account_map='{"1111": true}')
+            with self.assertRaises(ValueError):
+                bad_bool.resolved_dbs_account_map()
+
 
 if __name__ == "__main__":
     unittest.main()

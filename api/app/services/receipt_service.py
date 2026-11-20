@@ -1,7 +1,9 @@
 """Service for receipt parsing, line item extraction, cross-domain tagging, and reconciliation."""
 
 import base64
-from datetime import date, datetime, timedelta
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
+from html.parser import HTMLParser
 import io
 import json
 import logging
@@ -9,15 +11,29 @@ import mimetypes
 import re
 from typing import Any, Optional
 import urllib.request
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.config import settings
 from app.models import CategorizationRule, Product, Receipt, ReceiptItem, Transaction
-from app.schemas import PricePoint, ProductRead, ProductStatisticItem, ProductStatisticsResponse
+from app.schemas import (
+    InboundEmailDispatchPayload,
+    PricePoint,
+    ProductRead,
+    ProductStatisticItem,
+    ProductStatisticsResponse,
+    TransactionCandidateRead,
+)
 from app.services.category_taxonomy import get_canonical_category_names
-from app.services.jev_client import call_jev, classify_transaction_jev_with_tags
+from app.services.connectors import ConnectorUpstreamError
+from app.services.email_utils import (
+    extract_and_strip_forwarded_header,
+    strip_invisible_unicode,
+)
+from app.services.fx_service import get_exchange_rate
+from app.services.jev_client import call_jev, classify_transaction_jev_with_tags, get_extra_jev_categories
 from app.services.rules_engine import (
     collect_existing_tags,
     match_receipt_item_rule,
@@ -27,6 +43,53 @@ from app.services.rules_engine import (
 )
 
 logger = logging.getLogger(__name__)
+
+MIN_RECEIPT_ATTACHMENT_BYTES = 15 * 1024
+_TRACKING_URL_RE = re.compile(r"https?://\S{40,}", re.IGNORECASE)
+_INVISIBLE_FORMAT_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff\u00ad\u034f]")
+_ORIG_FX_DESC_RE = re.compile(
+    r"\bof\s+([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s+([A-Z]{3})\b",
+    re.IGNORECASE,
+)
+_MONTH_CODES = frozenset(
+    {"JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"}
+)
+_MERCHANT_STOPWORDS = frozenset(
+    {
+        "the",
+        "pty",
+        "ltd",
+        "inc",
+        "limited",
+        "co",
+        "corp",
+        "llc",
+        "card",
+        "transaction",
+        "issued",
+        "by",
+        "payment",
+        "purchase",
+        "pos",
+        "eftpos",
+        "online",
+        "store",
+        "shop",
+        "marketplace",
+        "com",
+        "www",
+        "nz",
+        "au",
+        "sg",
+        "us",
+        "uk",
+        "at",
+        "to",
+        "of",
+        "in",
+        "on",
+    }
+)
 
 try:
     from pillow_heif import register_heif_opener
@@ -40,12 +103,14 @@ _RECEIPT_CATEGORY_OPTIONS = " | ".join(
 )
 
 RECEIPT_PARSING_PROMPT = f"""You are a specialized receipt parsing engine.
-Extract the merchant name, receipt date (YYYY-MM-DD), total amount, tax amount (if any), and itemized line items from this receipt.
+Extract the merchant name, receipt date (YYYY-MM-DD), 3-letter ISO currency code (e.g. NZD, AUD, USD, SGD, EUR, GBP, JPY, MYR), order number (if any), total amount, tax amount (if any), and itemized line items from this receipt.
 
 Respond STRICTLY with valid JSON following this exact schema:
 {{
   "merchant": "Merchant Name",
   "receipt_date": "YYYY-MM-DD",
+  "currency": "NZD",
+  "order_number": "Order number or null",
   "total_amount": 0.00,
   "tax_amount": 0.00,
   "items": [
@@ -59,6 +124,37 @@ Respond STRICTLY with valid JSON following this exact schema:
       "domain": "02-skin | 01-health | 20-home | general",
       "product_type": "serum | cleanser | sunscreen | protein | creatine | null",
       "volume_ml": "e.g. 30ml, 1kg, 60 caps or null"
+    }}
+  ]
+}}"""
+
+MULTI_ORDER_EMAIL_RECEIPT_PROMPT = f"""You are a specialized e-commerce and purchase receipt extraction engine.
+An email may contain ONE or MULTIPLE distinct orders or shipments (for example, split Amazon orders with separate order numbers and totals).
+Extract EVERY distinct purchase order in the email as its own entry inside `orders`.
+
+Respond STRICTLY with valid JSON following this exact schema:
+{{
+  "orders": [
+    {{
+      "order_number": "Order ID or null",
+      "merchant": "Merchant Name",
+      "receipt_date": "YYYY-MM-DD",
+      "currency": "NZD | AUD | USD | SGD | EUR | GBP | JPY | MYR",
+      "total_amount": 0.00,
+      "tax_amount": 0.00,
+      "items": [
+        {{
+          "item_name": "Full Product Name (max 200 chars)",
+          "brand": "Brand or null",
+          "quantity": 1.0,
+          "unit_price": 0.00,
+          "total_price": 0.00,
+          "category": "{_RECEIPT_CATEGORY_OPTIONS}",
+          "domain": "02-skin | 01-health | 20-home | general",
+          "product_type": "serum | cleanser | sunscreen | protein | creatine | null",
+          "volume_ml": "e.g. 30ml, 1kg, 60 caps or null"
+        }}
+      ]
     }}
   ]
 }}"""
@@ -528,19 +624,30 @@ def extract_pdf_text(content: bytes) -> str:
         return ""
 
 
-def _invoke_receipt_llm(messages: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+def _invoke_receipt_llm(
+    messages: list[dict[str, Any]],
+    *,
+    raise_on_error: bool = False,
+) -> Optional[dict[str, Any]]:
     """Call Muninn LLM gateway with configured receipt vision model and parse JSON."""
-    if not settings.llm_api_key and not settings.llm_base_url:
+    base_url = settings.resolved_llm_base_url
+    api_key = settings.resolved_llm_api_key
+    model = settings.resolved_receipt_llm_model
+    if not api_key and not base_url:
+        if raise_on_error:
+            raise ValueError("Receipt LLM endpoint is not configured.")
         return None
+    if raise_on_error and not api_key:
+        raise ValueError("Receipt LLM API key is not configured.")
 
-    url = f"{settings.llm_base_url.rstrip('/')}/chat/completions"
+    url = f"{base_url.rstrip('/')}/chat/completions"
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {settings.llm_api_key or 'no-key'}",
+        "Authorization": f"Bearer {api_key or 'no-key'}",
         "User-Agent": "Yggdrasil-Plutus/1.0",
     }
     payload = {
-        "model": settings.receipt_llm_model,
+        "model": model,
         "messages": messages,
         "temperature": 0.1,
     }
@@ -558,8 +665,15 @@ def _invoke_receipt_llm(messages: list[dict[str, Any]]) -> Optional[dict[str, An
             if content.startswith("```"):
                 content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
             return json.loads(content)
+    except json.JSONDecodeError as e:
+        logger.warning("LLM receipt JSON decode failed (%s): %s", model, e)
+        if raise_on_error:
+            raise ValueError(f"Receipt LLM returned invalid JSON: {e}") from e
+        return None
     except Exception as e:
-        logger.warning("LLM receipt parsing failed (%s): %s", settings.receipt_llm_model, e)
+        logger.warning("LLM receipt parsing failed (%s): %s", model, e)
+        if raise_on_error:
+            raise ConnectorUpstreamError(f"Receipt LLM request failed ({model}): {e}") from e
         return None
 
 
@@ -572,6 +686,21 @@ def parse_receipt_text_with_llm(raw_text: str) -> Optional[dict[str, Any]]:
         }
     ]
     return _invoke_receipt_llm(messages)
+
+
+def parse_receipt_orders_text_with_llm(
+    raw_text: str,
+    *,
+    raise_on_error: bool = True,
+) -> Optional[dict[str, Any]]:
+    """Invoke receipt LLM to extract one or multiple structured orders from email/document text."""
+    messages = [
+        {
+            "role": "user",
+            "content": f"{MULTI_ORDER_EMAIL_RECEIPT_PROMPT}\n\nEmail / Receipt content:\n{raw_text}",
+        }
+    ]
+    return _invoke_receipt_llm(messages, raise_on_error=raise_on_error)
 
 
 def parse_receipt_with_llm(
@@ -608,6 +737,270 @@ def parse_receipt_with_llm(
     if not raw_text.strip():
         return None
     return parse_receipt_text_with_llm(raw_text)
+
+
+class _ReceiptHTMLSanitizer(HTMLParser):
+    """Sanitize HTML purchase receipts while preserving aria-label prices and img alt titles."""
+
+    _SKIP_TAGS = {"script", "style", "noscript", "head", "title"}
+    _BLOCK_TAGS = {
+        "p",
+        "div",
+        "tr",
+        "li",
+        "br",
+        "hr",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "table",
+        "section",
+        "article",
+        "header",
+        "footer",
+        "blockquote",
+    }
+    _NOISE_ALT_VALUES = frozenset({"logo", "spacer", "pixel", "icon", "image", "banner"})
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._skip = 0
+        self._chunks: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        lower = tag.lower()
+        if lower in self._SKIP_TAGS:
+            self._skip += 1
+            return
+        if self._skip > 0:
+            return
+
+        attr_map = {k.lower(): (v or "").strip() for k, v in attrs}
+        aria_label = attr_map.get("aria-label")
+        if aria_label and len(aria_label) >= 2 and aria_label.lower() not in {"close", "menu", "logo"}:
+            self._chunks.append(f" [aria: {aria_label}] ")
+
+        if lower == "img":
+            alt_text = attr_map.get("alt")
+            if alt_text and len(alt_text) >= 4 and alt_text.lower() not in self._NOISE_ALT_VALUES:
+                self._chunks.append(f" [item: {alt_text}] ")
+
+        if lower in self._BLOCK_TAGS:
+            self._chunks.append("\n")
+        elif lower in ("td", "th", "span"):
+            self._chunks.append(" ")
+
+    def handle_endtag(self, tag: str) -> None:
+        lower = tag.lower()
+        if lower in self._SKIP_TAGS:
+            if self._skip > 0:
+                self._skip -= 1
+            return
+        if self._skip == 0:
+            if lower in self._BLOCK_TAGS:
+                self._chunks.append("\n")
+            elif lower in ("td", "th", "span"):
+                self._chunks.append(" ")
+
+    def handle_data(self, data: str) -> None:
+        if self._skip == 0 and data:
+            self._chunks.append(data)
+
+    def get_text(self) -> str:
+        raw = "".join(self._chunks)
+        return _clean_receipt_text_lines(raw)
+
+
+def _clean_receipt_text_lines(raw: str) -> str:
+    """Normalize whitespace, strip invisible spacers and long tracking URLs from text."""
+    cleaned = strip_invisible_unicode(raw)
+    cleaned = _TRACKING_URL_RE.sub("", cleaned)
+    lines = [re.sub(r"[ \t\r\f\v]+", " ", line).strip() for line in cleaned.splitlines()]
+    return "\n".join(line for line in lines if line)
+
+
+def sanitize_receipt_email_content(
+    *,
+    subject: str,
+    from_address: Optional[str],
+    received_at: Optional[datetime],
+    text_body: Optional[str],
+    html_excerpt: Optional[str],
+    raw_excerpt: Optional[str],
+) -> tuple[str, date]:
+    """Sanitize forwarded receipt email HTML/text and return (prompt_text, fallback_date)."""
+    local_tz = ZoneInfo(settings.timezone)
+
+    html_clean = ""
+    if html_excerpt and html_excerpt.strip():
+        parser = _ReceiptHTMLSanitizer()
+        parser.feed(html_excerpt)
+        parser.close()
+        html_clean = parser.get_text()
+
+    raw_source_for_fwd = (text_body or raw_excerpt or "").strip() or html_clean
+    clean_subject, stripped_text, ref_local_dt = extract_and_strip_forwarded_header(
+        subject or "", raw_source_for_fwd, received_at, target_tz=local_tz
+    )
+    fallback_date = ref_local_dt.date()
+
+    if html_clean:
+        _, stripped_html, ref_html_dt = extract_and_strip_forwarded_header(
+            subject or "", html_clean, received_at, target_tz=local_tz
+        )
+        if not (text_body or raw_excerpt or "").strip():
+            fallback_date = ref_html_dt.date()
+        html_clean = _clean_receipt_text_lines(stripped_html)
+
+    text_clean = _clean_receipt_text_lines(stripped_text)
+    if html_clean and len(html_clean) >= 60:
+        body_section = html_clean
+    elif text_clean:
+        body_section = text_clean
+    elif html_clean:
+        body_section = html_clean
+    elif raw_excerpt:
+        body_section = _clean_receipt_text_lines(raw_excerpt)
+    else:
+        body_section = ""
+
+    header_lines: list[str] = []
+    if clean_subject:
+        header_lines.append(f"Subject: {clean_subject}")
+    if from_address:
+        header_lines.append(f"From: {from_address.strip()}")
+    header_lines.append(f"Email Date: {fallback_date.isoformat()}")
+
+    if not body_section:
+        return "", fallback_date
+
+    combined = "\n".join(header_lines) + "\n\n" + body_section
+    return combined[:48000], fallback_date
+
+
+def normalize_receipt_currency(raw_currency: Any, *, fallback: str = "NZD") -> str:
+    """Normalize a parsed currency string to a 3-letter uppercase ISO currency code."""
+    fb = (fallback or "NZD").strip().upper()[:3]
+    if not fb or len(fb) != 3 or not fb.isalpha():
+        fb = "NZD"
+    if raw_currency is None:
+        return fb
+    cleaned = str(raw_currency).strip().upper()
+    if cleaned in ("S$", "SG$"):
+        return "SGD"
+    if cleaned in ("NZ$",):
+        return "NZD"
+    if cleaned in ("AU$", "A$"):
+        return "AUD"
+    if cleaned in ("US$",):
+        return "USD"
+    m = re.search(r"\b([A-Z]{3})\b", cleaned)
+    if m:
+        return m.group(1)
+    return fb
+
+
+def normalize_order_number(raw_order: Any) -> Optional[str]:
+    """Normalize an optional purchase order identifier."""
+    if raw_order is None:
+        return None
+    cleaned = str(raw_order).strip()
+    if not cleaned or cleaned.lower() in ("null", "none", "n/a"):
+        return None
+    return cleaned[:128]
+
+
+def _normalize_merchant_key(merchant: str) -> str:
+    """Normalize merchant names for semantic receipt deduplication."""
+    tokens = [
+        tok
+        for tok in re.findall(r"[a-z0-9]+", (merchant or "").lower())
+        if tok not in _MERCHANT_STOPWORDS
+    ]
+    return " ".join(tokens) or re.sub(r"[^a-z0-9]+", " ", (merchant or "").lower()).strip()
+
+
+def load_receipt_rule_context(db: Session) -> tuple[list[CategorizationRule], list[str], list[str]]:
+    """Fetch active priority-ordered rules, existing tag vocabulary, and custom Jev categories."""
+    active_rules = db.scalars(
+        select(CategorizationRule)
+        .where(CategorizationRule.is_active == True)
+        .order_by(CategorizationRule.priority.asc(), CategorizationRule.id.asc())
+    ).all()
+    return list(active_rules), collect_existing_tags(db), get_extra_jev_categories(db)
+
+
+def create_classified_receipt_item(
+    db: Session,
+    *,
+    receipt: Receipt,
+    item_name: str,
+    brand: Optional[str],
+    quantity: float,
+    unit_price: float,
+    discount_amount: Optional[float],
+    total_price: float,
+    explicit_category: Optional[str],
+    explicit_domain: Optional[str],
+    explicit_product_type: Optional[str],
+    explicit_volume_ml: Optional[str],
+    explicit_tags: Optional[list[str]],
+    notes: Optional[str],
+    active_rules: list[CategorizationRule],
+    existing_tags: list[str],
+    extra_categories: Optional[list[str]] = None,
+) -> None:
+    """Resolve rules/Jev classification and persist one ReceiptItem and Product."""
+    clean_name = (item_name.strip() or "Item")[:200]
+    clean_brand = brand.strip()[:100] if brand and brand.strip() else None
+    cat, dom, ptype, vol, tags_list = classify_and_tag_receipt_item(
+        item_name=clean_name,
+        brand=clean_brand,
+        total_price=total_price,
+        merchant=receipt.merchant,
+        explicit_category=explicit_category,
+        explicit_domain=explicit_domain,
+        explicit_product_type=explicit_product_type,
+        explicit_volume_ml=explicit_volume_ml,
+        explicit_tags=explicit_tags,
+        active_rules=active_rules,
+        existing_tags=existing_tags,
+        extra_categories=extra_categories,
+    )
+    prod_id: Optional[int] = None
+    if total_price >= 0:
+        prod = get_or_create_product(
+            db=db,
+            item_name=clean_name,
+            brand=clean_brand,
+            category=cat,
+            domain=dom,
+            tags=tags_list,
+            volume_ml=vol,
+        )
+        prod_id = prod.id
+
+    db.add(
+        ReceiptItem(
+            receipt_id=receipt.id,
+            product_id=prod_id,
+            item_name=clean_name,
+            brand=clean_brand,
+            quantity=quantity,
+            unit_price=unit_price,
+            discount_amount=discount_amount,
+            total_price=total_price,
+            category=(cat or "General")[:50],
+            domain=dom[:50] if dom else None,
+            product_type=ptype[:50] if ptype else None,
+            tags=json.dumps(tags_list),
+            volume_ml=vol[:50] if vol else None,
+            notes=notes,
+        )
+    )
 
 
 def _match_discount_target_heuristic(
@@ -717,54 +1110,329 @@ def apply_receipt_discounts_with_jev(items: list[dict[str, Any]]) -> list[dict[s
     return positive_items + unmatched_discounts
 
 
-def match_receipt_to_transaction(receipt: Receipt, db: Session) -> Optional[Transaction]:
-    """Finds a matching transaction for a receipt based on amount, date proximity (+/- 3 days), and merchant similarity."""
+@dataclass(frozen=True)
+class _ScoredCandidate:
+    """Internal candidate match score between a Receipt and an expense Transaction."""
+
+    tx: Transaction
+    tier_rank: int
+    match_reason: str
+    confidence: float
+    has_merchant_overlap: bool
+    sim_score: float
+    date_diff: int
+    amt_diff: float
+    original_amount: Optional[float] = None
+    original_currency: Optional[str] = None
+    estimated_receipt_amount: Optional[float] = None
+
+
+def parse_original_fx_from_description(raw_description: Optional[str]) -> Optional[tuple[float, str]]:
+    """Extract original foreign currency amount and ISO code from bank/Wise raw_description."""
+    if not raw_description:
+        return None
+    for match in _ORIG_FX_DESC_RE.finditer(raw_description):
+        amt_str, code = match.groups()
+        upper_code = code.upper()
+        if upper_code in _MONTH_CODES:
+            continue
+        try:
+            amt_val = float(amt_str.replace(",", ""))
+        except ValueError:
+            continue
+        if amt_val > 0:
+            return amt_val, upper_code
+    return None
+
+
+def _merchant_tokens(text: str) -> set[str]:
+    """Extract normalized alphanumeric merchant tokens excluding generic filler words."""
+    return {
+        tok
+        for tok in re.findall(r"[a-z0-9]+", (text or "").lower())
+        if len(tok) >= 2 and tok not in _MERCHANT_STOPWORDS
+    }
+
+
+def _merchant_similarity(
+    receipt_merchant: str,
+    tx_merchant: str,
+    tx_raw_desc: Optional[str],
+) -> tuple[bool, float]:
+    """Compute (has_positive_overlap, similarity_score) between receipt and transaction merchant."""
+    r_tokens = _merchant_tokens(receipt_merchant)
+    tx_tokens = _merchant_tokens(tx_merchant) | _merchant_tokens(tx_raw_desc or "")
+
+    r_compact = re.sub(r"[^a-z0-9]", "", (receipt_merchant or "").lower())
+    tx_m_compact = re.sub(r"[^a-z0-9]", "", (tx_merchant or "").lower())
+    tx_d_compact = re.sub(r"[^a-z0-9]", "", (tx_raw_desc or "").lower())
+
+    substring_hit = False
+    if len(r_compact) >= 4:
+        substring_hit = (
+            r_compact in tx_m_compact
+            or r_compact in tx_d_compact
+            or (len(tx_m_compact) >= 4 and tx_m_compact in r_compact)
+        )
+
+    overlap = len(r_tokens & tx_tokens)
+    has_overlap = overlap > 0 or substring_hit
+    if not r_tokens and not substring_hit:
+        return False, 0.0
+    union_size = len(r_tokens | tx_tokens) or 1
+    jaccard = overlap / union_size
+    score = max(jaccard, 0.6 if substring_hit else 0.0)
+    return has_overlap, round(score, 4)
+
+
+def _resolve_tx_to_receipt_fx_rate(
+    db: Session,
+    tx: Transaction,
+    receipt_currency: str,
+) -> Optional[float]:
+    """Resolve conversion rate from tx.currency to receipt_currency via stored or cached FX rates."""
+    tx_curr = (tx.currency or "NZD").strip().upper()
+    rec_curr = (receipt_currency or "NZD").strip().upper()
+    if tx_curr == rec_curr:
+        return 1.0
+    if rec_curr == "NZD" and tx.exchange_rate is not None and float(tx.exchange_rate) > 0:
+        return float(tx.exchange_rate)
+    fx_res = get_exchange_rate(
+        db,
+        rate_date=tx.transaction_date,
+        from_currency=tx_curr,
+        to_currency=rec_curr,
+    )
+    if fx_res is not None and fx_res[0] > 0:
+        return float(fx_res[0])
+    return None
+
+
+def _evaluate_receipt_candidates(
+    db: Session,
+    receipt: Receipt,
+) -> list[_ScoredCandidate]:
+    """Score unlinked expense transactions within the receipt date window."""
     target_amt = float(receipt.total_amount)
     r_date = receipt.receipt_date
-    date_min = r_date - timedelta(days=3)
-    date_max = r_date + timedelta(days=3)
+    rec_curr = (receipt.currency or "NZD").strip().upper()
 
-    # Search transactions with negative amount matching receipt total
+    if receipt.order_number or receipt.source_email_message_id:
+        date_min = r_date - timedelta(days=3)
+        date_max = r_date + timedelta(days=21)
+    else:
+        date_min = r_date - timedelta(days=1)
+        date_max = r_date + timedelta(days=7)
+
+    linked_tx_subq = select(Receipt.transaction_id).where(
+        Receipt.transaction_id.isnot(None),
+        Receipt.id != receipt.id,
+    )
     stmt = (
         select(Transaction)
+        .options(joinedload(Transaction.account))
+        .where(Transaction.amount < 0)
         .where(Transaction.transaction_date >= date_min)
         .where(Transaction.transaction_date <= date_max)
+        .where(~Transaction.id.in_(linked_tx_subq))
     )
     txs = db.scalars(stmt).all()
 
-    best_match: Optional[Transaction] = None
+    candidates: list[_ScoredCandidate] = []
     for tx in txs:
+        tx_curr = (tx.currency or "NZD").strip().upper()
         tx_amt = abs(float(tx.amount))
-        # Amount match within 5 cents (handles rounding / small tax variations)
-        if abs(tx_amt - target_amt) <= 0.05:
-            # Check merchant similarity
-            r_merch = receipt.merchant.strip().lower()
-            tx_merch = tx.merchant.strip().lower()
-            tx_desc = (tx.raw_description or "").strip().lower()
+        date_diff = abs((tx.transaction_date - r_date).days)
+        has_overlap, sim_score = _merchant_similarity(
+            receipt.merchant,
+            tx.merchant,
+            tx.raw_description,
+        )
+        orig_fx = parse_original_fx_from_description(tx.raw_description)
+        orig_amt, orig_curr = orig_fx if orig_fx else (None, None)
 
-            if (
-                r_merch in tx_merch
-                or tx_merch in r_merch
-                or r_merch in tx_desc
-                or any(w in tx_merch for w in r_merch.split() if len(w) > 3)
-            ):
-                best_match = tx
-                break
-            elif not best_match:
-                best_match = tx
+        if tx_curr == rec_curr and abs(tx_amt - target_amt) <= 0.05:
+            amt_diff = abs(tx_amt - target_amt)
+            base_conf = 0.96 if has_overlap else 0.78
+            conf = round(
+                max(0.50, min(0.99, base_conf - 0.01 * min(date_diff, 14) - 0.5 * amt_diff)),
+                2,
+            )
+            candidates.append(
+                _ScoredCandidate(
+                    tx=tx,
+                    tier_rank=3,
+                    match_reason="exact_same_currency",
+                    confidence=conf,
+                    has_merchant_overlap=has_overlap,
+                    sim_score=sim_score,
+                    date_diff=date_diff,
+                    amt_diff=amt_diff,
+                    original_amount=orig_amt,
+                    original_currency=orig_curr,
+                    estimated_receipt_amount=round(tx_amt, 2),
+                )
+            )
+            continue
 
-    if best_match:
-        receipt.transaction_id = best_match.id
+        if (
+            orig_curr == rec_curr
+            and orig_amt is not None
+            and abs(orig_amt - target_amt) <= 0.05
+        ):
+            amt_diff = abs(orig_amt - target_amt)
+            base_conf = 0.93 if has_overlap else 0.65
+            conf = round(
+                max(0.45, min(0.98, base_conf - 0.008 * min(date_diff, 14) - 0.5 * amt_diff)),
+                2,
+            )
+            candidates.append(
+                _ScoredCandidate(
+                    tx=tx,
+                    tier_rank=2,
+                    match_reason="original_fx_description",
+                    confidence=conf,
+                    has_merchant_overlap=has_overlap,
+                    sim_score=sim_score,
+                    date_diff=date_diff,
+                    amt_diff=amt_diff,
+                    original_amount=orig_amt,
+                    original_currency=orig_curr,
+                    estimated_receipt_amount=round(orig_amt, 2),
+                )
+            )
+            continue
+
+        if tx_curr != rec_curr and target_amt > 0:
+            rate = _resolve_tx_to_receipt_fx_rate(db, tx, rec_curr)
+            if rate is not None and rate > 0:
+                est_amt = round(tx_amt * rate, 2)
+                rel_err = abs(est_amt - target_amt) / target_amt
+                if rel_err <= 0.05:
+                    base_conf = 0.85 if has_overlap else 0.68
+                    conf = round(
+                        max(
+                            0.40,
+                            min(0.89, base_conf - rel_err * 3.0 - 0.005 * min(date_diff, 14)),
+                        ),
+                        2,
+                    )
+                    candidates.append(
+                        _ScoredCandidate(
+                            tx=tx,
+                            tier_rank=1,
+                            match_reason="fx_estimated",
+                            confidence=conf,
+                            has_merchant_overlap=has_overlap,
+                            sim_score=sim_score,
+                            date_diff=date_diff,
+                            amt_diff=abs(est_amt - target_amt),
+                            original_amount=orig_amt,
+                            original_currency=orig_curr,
+                            estimated_receipt_amount=est_amt,
+                        )
+                    )
+
+    candidates.sort(
+        key=lambda c: (
+            c.tier_rank,
+            1 if c.has_merchant_overlap else 0,
+            c.confidence,
+            -c.date_diff,
+            -c.amt_diff,
+        ),
+        reverse=True,
+    )
+    return candidates
+
+
+def find_receipt_transaction_candidates(
+    db: Session,
+    receipt: Receipt,
+    limit: int = 5,
+) -> list[TransactionCandidateRead]:
+    """Return top sorted candidate expense transactions for a receipt."""
+    scored = _evaluate_receipt_candidates(db, receipt)
+    results: list[TransactionCandidateRead] = []
+    for item in scored[:limit]:
+        tx = item.tx
+        results.append(
+            TransactionCandidateRead(
+                transaction_id=tx.id,
+                transaction_date=tx.transaction_date,
+                merchant=tx.merchant,
+                raw_description=tx.raw_description,
+                amount=float(tx.amount),
+                currency=tx.currency,
+                account_id=tx.account_id,
+                account_name=tx.account.name if tx.account else None,
+                original_amount=item.original_amount,
+                original_currency=item.original_currency,
+                estimated_receipt_amount=item.estimated_receipt_amount,
+                confidence=item.confidence,
+                match_reason=item.match_reason,
+            )
+        )
+    return results
+
+
+def _select_unambiguous_winner(
+    candidates: list[_ScoredCandidate],
+) -> Optional[_ScoredCandidate]:
+    """Return single unambiguous auto-match winner, or None if tied/empty."""
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    def rank_key(c: _ScoredCandidate) -> tuple[int, float, int, float]:
+        return (
+            1 if c.has_merchant_overlap else 0,
+            round(c.sim_score, 4),
+            -c.date_diff,
+            -round(c.amt_diff, 4),
+        )
+
+    ranked = sorted(candidates, key=rank_key, reverse=True)
+    if rank_key(ranked[0]) > rank_key(ranked[1]):
+        return ranked[0]
+    return None
+
+
+def match_receipt_to_transaction(receipt: Receipt, db: Session) -> Optional[Transaction]:
+    """Match a receipt unambiguously via same-currency or raw_description FX, else flag needs_review/unlinked."""
+    if receipt.transaction_id is not None:
+        return receipt.transaction
+
+    candidates = _evaluate_receipt_candidates(db, receipt)
+    tier_a = [c for c in candidates if c.match_reason == "exact_same_currency"]
+    tier_b = [
+        c
+        for c in candidates
+        if c.match_reason == "original_fx_description" and c.has_merchant_overlap
+    ]
+
+    winner = _select_unambiguous_winner(tier_a)
+    if winner is None and not tier_a:
+        winner = _select_unambiguous_winner(tier_b)
+
+    if winner is not None:
+        receipt.transaction_id = winner.tx.id
         receipt.status = "matched"
         db.commit()
         db.refresh(receipt)
-        return best_match
+        return winner.tx
+
+    if receipt.status != "verified":
+        receipt.status = "needs_review" if candidates else "unlinked"
+        db.commit()
+        db.refresh(receipt)
 
     return None
 
 
 def reconcile_unlinked_receipts(db: Session) -> int:
-    """Evaluates all unlinked receipts and attempts to match them against current transactions."""
+    """Evaluate all receipts without a linked transaction (unlinked + needs_review)."""
     unlinked = db.scalars(
         select(Receipt).where(Receipt.transaction_id.is_(None))
     ).all()
@@ -775,6 +1443,219 @@ def reconcile_unlinked_receipts(db: Session) -> int:
             matched_count += 1
 
     return matched_count
+
+
+def _normalize_parsed_orders(parsed: Optional[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Normalize single-order or multi-order LLM output into a list of valid order dicts."""
+    if not isinstance(parsed, dict):
+        return []
+    raw_orders = parsed.get("orders")
+    if isinstance(raw_orders, list):
+        candidates = [o for o in raw_orders if isinstance(o, dict)]
+    elif "merchant" in parsed and "total_amount" in parsed:
+        candidates = [parsed]
+    else:
+        return []
+
+    valid: list[dict[str, Any]] = []
+    for order in candidates:
+        merchant = str(order.get("merchant") or "").strip()
+        try:
+            total_amt = float(order.get("total_amount"))
+        except (TypeError, ValueError):
+            continue
+        if merchant and total_amt >= 0:
+            valid.append(order)
+    return valid
+
+
+def _find_semantic_duplicate_receipt(
+    db: Session,
+    *,
+    merchant: str,
+    receipt_date: date,
+    total_amount: float,
+    currency: str,
+    order_number: Optional[str],
+) -> Optional[Receipt]:
+    """Return an existing Receipt matching order_number or (merchant, date +/- 1d, total, currency)."""
+    if order_number:
+        by_order = db.scalars(
+            select(Receipt).where(
+                func.lower(Receipt.order_number) == order_number.lower(),
+                func.upper(Receipt.currency) == currency.upper(),
+            )
+        ).all()
+        for existing in by_order:
+            if abs(float(existing.total_amount) - total_amount) <= 0.05:
+                return existing
+
+    target_key = _normalize_merchant_key(merchant)
+    window_start = receipt_date - timedelta(days=1)
+    window_end = receipt_date + timedelta(days=1)
+    nearby = db.scalars(
+        select(Receipt).where(
+            Receipt.receipt_date >= window_start,
+            Receipt.receipt_date <= window_end,
+            func.upper(Receipt.currency) == currency.upper(),
+        )
+    ).all()
+    for existing in nearby:
+        if abs(float(existing.total_amount) - total_amount) > 0.05:
+            continue
+        if order_number and existing.order_number and existing.order_number.lower() != order_number.lower():
+            continue
+        if _normalize_merchant_key(existing.merchant) == target_key:
+            return existing
+    return None
+
+
+def ingest_purchase_receipt_email(
+    db: Session,
+    payload: InboundEmailDispatchPayload,
+) -> list[Receipt]:
+    """Ingest a purchase receipt email (attachment-first or HTML/text, 1 or N orders)."""
+    local_tz = ZoneInfo(settings.timezone)
+    fallback_date = (
+        payload.received_at.replace(tzinfo=timezone.utc).astimezone(local_tz).date()
+        if payload.received_at and payload.received_at.tzinfo is None
+        else payload.received_at.astimezone(local_tz).date()
+        if payload.received_at
+        else datetime.now(local_tz).date()
+    )
+
+    orders: list[dict[str, Any]] = []
+    stored_media: Optional[tuple[bytes, str, Optional[str]]] = None
+    raw_text_for_record: Optional[str] = None
+
+    for att in payload.attachments:
+        if not att.content_base64:
+            continue
+        try:
+            raw_bytes = base64.b64decode(att.content_base64, validate=False)
+        except Exception:
+            continue
+        if len(raw_bytes) < MIN_RECEIPT_ATTACHMENT_BYTES:
+            continue
+        mime_type = infer_receipt_mime_type(att.filename, att.content_type)
+        if mime_type != "application/pdf" and not mime_type.startswith("image/"):
+            continue
+
+        parsed_att: Optional[dict[str, Any]] = None
+        if mime_type == "application/pdf":
+            pdf_text = extract_pdf_text(raw_bytes)
+            if pdf_text:
+                raw_text_for_record = pdf_text[:32000]
+                parsed_att = parse_receipt_orders_text_with_llm(pdf_text, raise_on_error=False)
+            if not parsed_att:
+                parsed_att = parse_receipt_with_llm(raw_bytes, att.filename, mime_type)
+        else:
+            parsed_att = parse_receipt_with_llm(raw_bytes, att.filename, mime_type)
+
+        extracted = _normalize_parsed_orders(parsed_att)
+        if extracted:
+            orders = extracted
+            comp_bytes, comp_mime = compress_receipt_image(raw_bytes, mime_type)
+            stored_media = (comp_bytes, comp_mime, att.filename)
+            break
+
+    if not orders:
+        sanitized_text, sanitized_date = sanitize_receipt_email_content(
+            subject=payload.subject or "",
+            from_address=payload.from_address,
+            received_at=payload.received_at,
+            text_body=payload.text_body,
+            html_excerpt=payload.html_excerpt,
+            raw_excerpt=payload.raw_excerpt,
+        )
+        fallback_date = sanitized_date
+        if not sanitized_text:
+            raise ValueError("Purchase receipt email contains no readable receipt content or valid attachment.")
+        raw_text_for_record = sanitized_text[:32000]
+        parsed_body = parse_receipt_orders_text_with_llm(sanitized_text, raise_on_error=True)
+        orders = _normalize_parsed_orders(parsed_body)
+
+    if not orders:
+        raise ValueError("Could not extract any purchase orders from receipt email.")
+
+    active_rules, existing_tags, extra_categories = load_receipt_rule_context(db)
+    results: list[Receipt] = []
+
+    for order in orders:
+        merchant = str(order.get("merchant") or "Unknown Merchant").strip()[:150]
+        order_number = normalize_order_number(order.get("order_number"))
+        currency = normalize_receipt_currency(order.get("currency"), fallback="NZD")
+        total_amount = round(float(order.get("total_amount", 0.0) or 0.0), 2)
+        tax_amount = (
+            round(float(order["tax_amount"]), 2)
+            if order.get("tax_amount") is not None
+            else None
+        )
+        try:
+            r_date = date.fromisoformat(str(order.get("receipt_date") or ""))
+        except ValueError:
+            r_date = fallback_date
+
+        existing_dup = _find_semantic_duplicate_receipt(
+            db,
+            merchant=merchant,
+            receipt_date=r_date,
+            total_amount=total_amount,
+            currency=currency,
+            order_number=order_number,
+        )
+        if existing_dup is not None:
+            results.append(existing_dup)
+            continue
+
+        receipt = Receipt(
+            receipt_date=r_date,
+            merchant=merchant,
+            total_amount=total_amount,
+            currency=currency,
+            tax_amount=tax_amount,
+            order_number=order_number,
+            source_email_message_id=payload.message_id[:512],
+            status="unlinked",
+            is_processed=True,
+            raw_text=raw_text_for_record,
+            image_data=stored_media[0] if stored_media else None,
+            image_mime_type=stored_media[1] if stored_media else None,
+            image_filename=stored_media[2][:255] if stored_media and stored_media[2] else None,
+        )
+        db.add(receipt)
+        db.flush()
+
+        resolved_items = apply_receipt_discounts_with_jev(order.get("items") or [])
+        for it in resolved_items:
+            create_classified_receipt_item(
+                db,
+                receipt=receipt,
+                item_name=str(it.get("item_name") or "Item"),
+                brand=it.get("brand"),
+                quantity=float(it.get("quantity", 1.0) or 1.0),
+                unit_price=float(it.get("unit_price", 0.0) or 0.0),
+                discount_amount=(
+                    float(it["discount_amount"]) if it.get("discount_amount") is not None else None
+                ),
+                total_price=float(it.get("total_price", 0.0) or 0.0),
+                explicit_category=it.get("category"),
+                explicit_domain=it.get("domain"),
+                explicit_product_type=it.get("product_type"),
+                explicit_volume_ml=it.get("volume_ml"),
+                explicit_tags=it.get("tags"),
+                notes=it.get("notes"),
+                active_rules=active_rules,
+                existing_tags=existing_tags,
+                extra_categories=extra_categories,
+            )
+
+        db.commit()
+        db.refresh(receipt)
+        match_receipt_to_transaction(receipt, db)
+        results.append(receipt)
+
+    return results
 
 
 def compute_product_statistics(
