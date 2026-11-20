@@ -7,7 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
 from app.db import get_db
-from app.models import Account, CategorizationRule
+from app.models import Account, CategorizationRule, Loan
 from app.schemas import (
     CategorizationRuleCreate,
     CategorizationRuleRead,
@@ -25,10 +25,11 @@ router = APIRouter(prefix="/rules", tags=["Categorization Rules"])
 
 
 def _hydrate_rule(rule: CategorizationRule) -> CategorizationRule:
-    """Populate derived counterpart_account_name for CategorizationRuleRead."""
+    """Populate derived counterpart_account_name and loan_name for CategorizationRuleRead."""
     rule.counterpart_account_name = (
         rule.counterpart_account.name if rule.counterpart_account else None
     )
+    rule.loan_name = rule.loan.name if rule.loan else None
     return rule
 
 
@@ -41,11 +42,23 @@ def _validate_counterpart_account(db: Session, counterpart_account_id: Optional[
         )
 
 
+def _validate_loan(db: Session, loan_id: Optional[int]) -> None:
+    """Ensure referenced loan_id exists in Loan."""
+    if loan_id is not None and db.get(Loan, loan_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Loan not found",
+        )
+
+
 def _load_rule_with_counterpart(db: Session, rule_id: int) -> Optional[CategorizationRule]:
-    """Load one rule with its counterpart_account relationship hydrated."""
+    """Load one rule with its counterpart_account and loan relationships hydrated."""
     return db.scalar(
         select(CategorizationRule)
-        .options(joinedload(CategorizationRule.counterpart_account))
+        .options(
+            joinedload(CategorizationRule.counterpart_account),
+            joinedload(CategorizationRule.loan),
+        )
         .where(CategorizationRule.id == rule_id)
     )
 
@@ -56,7 +69,10 @@ def list_rules(
     db: Session = Depends(get_db),
 ):
     """List all Outlook-style categorization rules."""
-    stmt = select(CategorizationRule).options(joinedload(CategorizationRule.counterpart_account))
+    stmt = select(CategorizationRule).options(
+        joinedload(CategorizationRule.counterpart_account),
+        joinedload(CategorizationRule.loan),
+    )
     if is_active is not None:
         stmt = stmt.where(CategorizationRule.is_active == is_active)
     rules = (
@@ -74,6 +90,7 @@ def create_rule(
 ):
     """Create a new transaction categorization rule and optionally apply it retroactively."""
     _validate_counterpart_account(db, payload.counterpart_account_id)
+    _validate_loan(db, payload.loan_id)
     amt = (
         float(payload.amount_equals)
         if (payload.amount_equals is not None and float(payload.amount_equals) > 0)
@@ -93,6 +110,7 @@ def create_rule(
         target_recurrence=payload.target_recurrence,
         rename_merchant=cleaned_rename or None,
         counterpart_account_id=payload.counterpart_account_id,
+        loan_id=payload.loan_id,
         priority=payload.priority,
         is_active=payload.is_active,
     )
@@ -148,6 +166,8 @@ def update_rule(
 
     if "counterpart_account_id" in payload.model_fields_set:
         _validate_counterpart_account(db, payload.counterpart_account_id)
+    if "loan_id" in payload.model_fields_set:
+        _validate_loan(db, payload.loan_id)
 
     if "name" in payload.model_fields_set and payload.name is not None:
         rule.name = payload.name.strip()
@@ -178,6 +198,8 @@ def update_rule(
         rule.rename_merchant = cleaned_rename or None
     if "counterpart_account_id" in payload.model_fields_set:
         rule.counterpart_account_id = payload.counterpart_account_id
+    if "loan_id" in payload.model_fields_set:
+        rule.loan_id = payload.loan_id
     if "priority" in payload.model_fields_set and payload.priority is not None:
         rule.priority = payload.priority
     if "is_active" in payload.model_fields_set and payload.is_active is not None:

@@ -9,7 +9,7 @@ from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.orm import Session, joinedload
 
 from app.db import get_db
-from app.models import Account, Receipt, Transaction
+from app.models import Account, Loan, Receipt, Transaction
 from app.schemas import (
     TagCategoryBreakdownItem,
     TagSpendingSummaryItem,
@@ -50,17 +50,19 @@ def _transaction_load_options(*, include_receipt_items: bool = False):
     return (
         joinedload(Transaction.account),
         joinedload(Transaction.counterpart_account),
+        joinedload(Transaction.loan),
         joinedload(Transaction.linked_transaction).joinedload(Transaction.account),
         receipt_load,
     )
 
 
 def hydrate_transaction(tx: Transaction) -> Transaction:
-    """Populate derived account, counterpart, linked-transfer, and receipt fields."""
+    """Populate derived account, counterpart, loan, linked-transfer, and receipt fields."""
     tx.account_name = tx.account.name if tx.account else None
     tx.counterpart_account_name = (
         tx.counterpart_account.name if tx.counterpart_account else None
     )
+    tx.loan_name = tx.loan.name if tx.loan else None
     linked = tx.linked_transaction
     if linked is not None:
         tx.linked_account_name = linked.account.name if linked.account else None
@@ -248,10 +250,11 @@ def list_transactions(
         description="'week', 'last_week', 'month', 'last_month', 'annual', or 'all'",
     ),
     account_id: Optional[int] = Query(default=None),
+    loan_id: Optional[int] = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
     db: Session = Depends(get_db),
 ):
-    """List transactions with optional date range, period, account_id, category, and tag filters."""
+    """List transactions with optional date range, period, account_id, loan_id, category, and tag filters."""
     effective_period = None if (start_date is not None or end_date is not None) else period
     start_date, end_date = resolve_period_dates(effective_period, start_date, end_date)
     ref_date = end_date or date.today()
@@ -268,6 +271,8 @@ def list_transactions(
                 ),
             )
         )
+    if loan_id is not None:
+        stmt = stmt.where(Transaction.loan_id == loan_id)
     if start_date:
         stmt = stmt.where(Transaction.transaction_date >= start_date)
     if end_date:
@@ -385,6 +390,11 @@ def update_transaction(
 
     if "recurrence" in payload.model_fields_set:
         tx.recurrence = payload.recurrence
+
+    if "loan_id" in payload.model_fields_set:
+        if payload.loan_id is not None and db.get(Loan, payload.loan_id) is None:
+            raise HTTPException(status_code=404, detail="Loan not found")
+        tx.loan_id = payload.loan_id
 
     db.commit()
     hydrated = db.scalar(

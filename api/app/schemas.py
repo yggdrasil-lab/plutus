@@ -37,6 +37,32 @@ def normalize_amortize_period(value: Any) -> Optional[str]:
 
 
 # --- Account Schemas ---
+VALID_ACCOUNT_TYPES = {"checking", "savings", "brokerage", "kiwisaver", "crypto", "credit_card"}
+VALID_ACCOUNT_TIERS = {"cash", "growth", "locked"}
+
+
+def normalize_account_type(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = str(value).strip().lower()
+    if cleaned not in VALID_ACCOUNT_TYPES:
+        raise ValueError(
+            f"Unsupported account_type '{value}'. Must be one of: {', '.join(sorted(VALID_ACCOUNT_TYPES))}."
+        )
+    return cleaned
+
+
+def normalize_account_tier(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = str(value).strip().lower()
+    if cleaned not in VALID_ACCOUNT_TIERS:
+        raise ValueError(
+            f"Unsupported tier '{value}'. Must be one of: {', '.join(sorted(VALID_ACCOUNT_TIERS))}."
+        )
+    return cleaned
+
+
 class AccountBase(BaseModel):
     name: str = Field(..., max_length=100)
     account_type: str = Field(..., description="checking, savings, brokerage, kiwisaver, crypto, credit_card")
@@ -46,9 +72,54 @@ class AccountBase(BaseModel):
     expected_annual_return: float = Field(default=0.0, ge=0.0, le=1.0)
     is_active: bool = True
 
+    @field_validator("account_type", mode="before")
+    @classmethod
+    def validate_account_type_base(cls, v: Any) -> str:
+        resolved = normalize_account_type(v)
+        if not resolved:
+            raise ValueError("account_type is required.")
+        return resolved
+
+    @field_validator("tier", mode="before")
+    @classmethod
+    def validate_tier_base(cls, v: Any) -> str:
+        resolved = normalize_account_tier(v)
+        if not resolved:
+            raise ValueError("tier is required.")
+        return resolved
+
 
 class AccountCreate(AccountBase):
     pass
+
+
+class AccountUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, max_length=100)
+    account_type: Optional[str] = Field(default=None, description="checking, savings, brokerage, kiwisaver, crypto, credit_card")
+    tier: Optional[str] = Field(default=None, description="cash, growth, locked")
+    institution: Optional[str] = Field(default=None, max_length=100)
+    expected_annual_return: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    is_active: Optional[bool] = None
+
+    @field_validator("name", "institution")
+    @classmethod
+    def validate_non_empty_text(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        cleaned = v.strip()
+        if not cleaned:
+            raise ValueError("Field cannot be empty.")
+        return cleaned
+
+    @field_validator("account_type", mode="before")
+    @classmethod
+    def validate_account_type_update(cls, v: Any) -> Optional[str]:
+        return normalize_account_type(v)
+
+    @field_validator("tier", mode="before")
+    @classmethod
+    def validate_tier_update(cls, v: Any) -> Optional[str]:
+        return normalize_account_tier(v)
 
 
 class AccountRead(AccountBase):
@@ -169,6 +240,8 @@ class TransactionRead(TransactionBase):
     linked_currency: Optional[str] = None
     counterpart_account_id: Optional[int] = None
     counterpart_account_name: Optional[str] = None
+    loan_id: Optional[int] = None
+    loan_name: Optional[str] = None
     raw_hash: str
     has_receipt: bool = False
     receipt_id: Optional[int] = None
@@ -189,6 +262,7 @@ class TransactionUpdate(BaseModel):
     notes: Optional[str] = None
     tags: Optional[list[str]] = None
     recurrence: Optional[str] = Field(default=None, max_length=20)
+    loan_id: Optional[int] = None
 
     @field_validator("recurrence", mode="before")
     @classmethod
@@ -435,6 +509,7 @@ class CategorizationRuleBase(BaseModel):
     target_recurrence: Optional[str] = Field(default=None, max_length=20)
     rename_merchant: Optional[str] = Field(default=None, max_length=150)
     counterpart_account_id: Optional[int] = None
+    loan_id: Optional[int] = None
     priority: int = Field(default=10, ge=1)
     is_active: bool = True
 
@@ -481,6 +556,7 @@ class CategorizationRuleUpdate(BaseModel):
     target_recurrence: Optional[str] = Field(default=None, max_length=20)
     rename_merchant: Optional[str] = Field(default=None, max_length=150)
     counterpart_account_id: Optional[int] = None
+    loan_id: Optional[int] = None
     priority: Optional[int] = None
     is_active: Optional[bool] = None
     apply_retroactively: bool = False
@@ -509,6 +585,7 @@ class CategorizationRuleUpdate(BaseModel):
 class CategorizationRuleRead(CategorizationRuleBase):
     id: int
     counterpart_account_name: Optional[str] = None
+    loan_name: Optional[str] = None
     match_count: int
     created_at: datetime
     updated_at: datetime
@@ -869,6 +946,18 @@ class LoanUpdate(BaseModel):
     is_active: Optional[bool] = None
 
 
+class LoanPaymentRead(BaseModel):
+    id: int
+    transaction_date: date
+    amount: float
+    currency: str
+    amount_nzd: float
+    merchant: str
+    account_id: int
+    account_name: Optional[str] = None
+    category: str
+
+
 class LoanRead(LoanBase):
     id: int
     payments_made: int
@@ -877,9 +966,14 @@ class LoanRead(LoanBase):
     next_payment_date: Optional[date] = None
     remaining_principal: float
     principal_paid: float
+    total_paid_amount: float = 0.0
+    interest_paid: float = 0.0
     remaining_interest: float
     weekly_payment_equivalent: float
     net_worth_impact: float
+    last_payment_date: Optional[date] = None
+    is_payment_due: bool = False
+    linked_payments: list[LoanPaymentRead] = Field(default_factory=list)
 
 
 class LoansSummaryResponse(BaseModel):

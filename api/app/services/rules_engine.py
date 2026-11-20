@@ -170,6 +170,13 @@ def _apply_rule_to_record(
         if merged_tags != existing_tags:
             record.tags = json.dumps(merged_tags)
             changed = True
+    if (
+        isinstance(record, Transaction)
+        and matched_rule.loan_id is not None
+        and record.loan_id != matched_rule.loan_id
+    ):
+        record.loan_id = matched_rule.loan_id
+        changed = True
     return changed
 
 

@@ -91,6 +91,7 @@ class Transaction(Base):
     raw_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
     linked_transaction_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("transactions.id", ondelete="SET NULL"), nullable=True, index=True)
     counterpart_account_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("accounts.id", ondelete="SET NULL"), nullable=True, index=True)
+    loan_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("loans.id", ondelete="SET NULL"), nullable=True, index=True)
     exchange_rate: Mapped[Optional[float]] = mapped_column(Numeric(18, 8), nullable=True)
     fee_amount: Mapped[Optional[float]] = mapped_column(Numeric(18, 8), nullable=True)
     tags: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
@@ -106,6 +107,11 @@ class Transaction(Base):
     counterpart_account: Mapped[Optional["Account"]] = relationship(
         "Account",
         foreign_keys=[counterpart_account_id],
+    )
+    loan: Mapped[Optional["Loan"]] = relationship(
+        "Loan",
+        back_populates="transactions",
+        foreign_keys=[loan_id],
     )
     linked_transaction: Mapped[Optional["Transaction"]] = relationship(
         "Transaction",
@@ -208,6 +214,7 @@ class CategorizationRule(Base):
     target_recurrence: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     rename_merchant: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
     counterpart_account_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("accounts.id", ondelete="SET NULL"), nullable=True, index=True)
+    loan_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("loans.id", ondelete="SET NULL"), nullable=True, index=True)
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     match_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -217,6 +224,10 @@ class CategorizationRule(Base):
     counterpart_account: Mapped[Optional["Account"]] = relationship(
         "Account",
         foreign_keys=[counterpart_account_id],
+    )
+    loan: Mapped[Optional["Loan"]] = relationship(
+        "Loan",
+        foreign_keys=[loan_id],
     )
 
 
@@ -356,3 +367,9 @@ class Loan(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+    transactions: Mapped[list["Transaction"]] = relationship(
+        "Transaction",
+        back_populates="loan",
+        foreign_keys="Transaction.loan_id",
+    )

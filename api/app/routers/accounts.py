@@ -12,6 +12,7 @@ from app.models import Account, AssetSnapshot
 from app.schemas import (
     AccountCreate,
     AccountRead,
+    AccountUpdate,
     AssetSnapshotCreate,
     AssetSnapshotRead,
 )
@@ -51,6 +52,39 @@ def get_account(account_id: int, db: Session = Depends(get_db)):
     account = db.get(Account, account_id)
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
+    return account
+
+
+@router.patch("/{account_id}", response_model=AccountRead)
+def update_account(
+    account_id: int,
+    payload: AccountUpdate,
+    db: Session = Depends(get_db),
+):
+    """Update editable account metadata such as tier, account_type, name, or expected return."""
+    account = db.get(Account, account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    for field in (
+        "name",
+        "account_type",
+        "tier",
+        "institution",
+        "expected_annual_return",
+        "is_active",
+    ):
+        if field in payload.model_fields_set:
+            val = getattr(payload, field)
+            if val is None:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"{field} cannot be null",
+                )
+            setattr(account, field, val)
+
+    db.commit()
+    db.refresh(account)
     return account
 
 
