@@ -232,6 +232,38 @@ class QuickLogRequest(BaseModel):
     notes: Optional[str] = None
 
 
+class TransactionSplitInput(BaseModel):
+    amount: float = Field(..., gt=0.0)
+    category: str
+    tags: list[str] = Field(default_factory=list)
+    loan_id: Optional[int] = None
+    notes: Optional[str] = Field(default=None, max_length=255)
+
+
+class TransactionSplitsUpdate(BaseModel):
+    splits: list[TransactionSplitInput] = Field(default_factory=list)
+
+
+class TransactionSplitRead(BaseModel):
+    id: int
+    transaction_id: int
+    amount: float
+    category: str
+    tags: list[str] = Field(default_factory=list)
+    loan_id: Optional[int] = None
+    loan_name: Optional[str] = None
+    loan_type: Optional[str] = None
+    notes: Optional[str] = None
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def parse_tags_if_string(cls, v: Any) -> list[str]:
+        return TransactionBase.parse_tags_if_string(v)
+
+    class Config:
+        from_attributes = True
+
+
 class TransactionRead(TransactionBase):
     id: int
     account_name: Optional[str] = None
@@ -248,6 +280,8 @@ class TransactionRead(TransactionBase):
     has_receipt: bool = False
     receipt_id: Optional[int] = None
     is_receipt_split: bool = False
+    splits: list[TransactionSplitRead] = Field(default_factory=list)
+    is_split: bool = False
     is_amortized_commitment: bool = False
     amortized_period_amount_nzd: Optional[float] = None
     amortized_cadence: Optional[str] = None
@@ -1001,6 +1035,7 @@ class LoanUpdate(BaseModel):
 
 class LoanPaymentRead(BaseModel):
     id: int
+    split_id: Optional[int] = None
     transaction_date: date
     amount: float
     currency: str
@@ -1012,6 +1047,7 @@ class LoanPaymentRead(BaseModel):
     account_id: int
     account_name: Optional[str] = None
     category: str
+    notes: Optional[str] = None
 
 
 class LoanRead(LoanBase):

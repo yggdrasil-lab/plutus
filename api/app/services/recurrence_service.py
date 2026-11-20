@@ -6,7 +6,7 @@ from typing import Optional
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, joinedload
 
-from app.models import Transaction
+from app.models import Transaction, TransactionSplit
 from app.services.fx_service import to_nzd_amount
 
 RECURRENCE_WEEKLY_FACTOR: dict[str, float] = {
@@ -75,18 +75,38 @@ def get_active_recurring_commitments(
             joinedload(Transaction.counterpart_account),
             joinedload(Transaction.loan),
             joinedload(Transaction.linked_transaction).joinedload(Transaction.account),
+            joinedload(Transaction.splits).joinedload(TransactionSplit.loan),
             joinedload(Transaction.receipt),
         )
         rows = db.scalars(stmt).unique().all()
     else:
-        stmt = stmt.options(joinedload(Transaction.loan))
+        stmt = stmt.options(
+            joinedload(Transaction.loan),
+            joinedload(Transaction.splits).joinedload(TransactionSplit.loan),
+        )
         rows = db.scalars(stmt).unique().all()
 
     seen: set[tuple[str, str]] = set()
     commitments: list[tuple[Transaction, float]] = []
     for tx in rows:
-        if tx.loan is not None and (tx.loan.loan_type or "").strip().lower() == "lent":
-            continue
+        splits = getattr(tx, "splits", None) or []
+        if splits:
+            non_excluded_splits = [
+                s
+                for s in splits
+                if (s.category or "").strip().lower() not in ("transfers", "transfer")
+                and not (
+                    s.loan is not None
+                    and (s.loan.loan_type or "").strip().lower() == "lent"
+                )
+            ]
+            if not non_excluded_splits:
+                continue
+            effective_amount = sum(abs(float(s.amount)) for s in non_excluded_splits)
+        else:
+            if tx.loan is not None and (tx.loan.loan_type or "").strip().lower() == "lent":
+                continue
+            effective_amount = tx.amount
         rec = (tx.recurrence or "").strip().lower()
         factor = RECURRENCE_WEEKLY_FACTOR.get(rec)
         if not factor:
@@ -97,6 +117,6 @@ def get_active_recurring_commitments(
         if key in seen:
             continue
         seen.add(key)
-        amt_nzd = to_nzd_amount(tx.amount, tx.currency, tx.exchange_rate)
+        amt_nzd = to_nzd_amount(effective_amount, tx.currency, tx.exchange_rate)
         commitments.append((tx, round(amt_nzd * factor, 2)))
     return commitments
