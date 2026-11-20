@@ -8,7 +8,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, joinedload
 
 from app.db import get_db
-from app.models import BudgetRule, Category, Receipt, Transaction
+from app.models import BudgetRule, Category, Receipt, Transaction, TransactionSplit
 from app.schemas import (
     AverageBurnReportResponse,
     BudgetRuleCreate,
@@ -465,6 +465,7 @@ def get_spending_breakdown(
     stmt = select(Transaction).options(
         joinedload(Transaction.receipt).joinedload(Receipt.items),
         joinedload(Transaction.loan),
+        joinedload(Transaction.splits).joinedload(TransactionSplit.loan),
     )
     if start_date:
         stmt = stmt.where(Transaction.transaction_date >= start_date)
@@ -482,6 +483,51 @@ def get_spending_breakdown(
         cat = tx.category or "General"
         cat_lower = cat.lower()
         amt_nzd = to_nzd_amount(amt, tx.currency, tx.exchange_rate)
+        splits = getattr(tx, "splits", None) or []
+
+        if splits:
+            if amt < 0:
+                if is_recurrence_excluded_from_period(effective_period, tx.recurrence):
+                    continue
+                for s in splits:
+                    s_cat = (s.category or cat).strip() or "General"
+                    s_lower = s_cat.lower()
+                    s_nzd = round(
+                        to_nzd_amount(abs(float(s.amount)), tx.currency, tx.exchange_rate),
+                        2,
+                    )
+                    if s_lower in TRANSFER_CATEGORIES:
+                        total_transfers += s_nzd
+                        _accumulate_category(category_spend_map, "Transfers", s_nzd, is_transfer=True)
+                        continue
+                    if s.loan is not None and (s.loan.loan_type or "").strip().lower() == "lent":
+                        continue
+                    effective_cat = get_root_category(s_cat, parent_map) if rollup_base else s_cat
+                    effective_lower = effective_cat.lower()
+                    if (is_weekly_period or is_monthly_period) and (
+                        s_lower in annual_cats
+                        or (rollup_base and effective_lower in annual_base_roots)
+                    ):
+                        continue
+                    total_spend += s_nzd
+                    _accumulate_category(category_spend_map, effective_cat, s_nzd)
+            elif amt > 0:
+                for s in splits:
+                    s_cat = (s.category or cat).strip() or "General"
+                    s_lower = s_cat.lower()
+                    s_nzd = round(
+                        to_nzd_amount(abs(float(s.amount)), tx.currency, tx.exchange_rate),
+                        2,
+                    )
+                    if s_lower in TRANSFER_CATEGORIES:
+                        total_transfers += s_nzd
+                        _accumulate_category(category_spend_map, "Transfers", s_nzd, is_transfer=True)
+                        continue
+                    if s.loan is not None and (s.loan.loan_type or "").strip().lower() == "lent":
+                        continue
+                    total_income += s_nzd
+            continue
+
         is_lent_loan = (
             tx.loan is not None and (tx.loan.loan_type or "").strip().lower() == "lent"
         )

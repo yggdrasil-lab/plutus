@@ -8,11 +8,11 @@ from alembic.config import Config as AlembicConfig
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
-from app.models import Account, CategorizationRule, Category, Loan, Transaction
+from app.models import Account, CategorizationRule, Category, Loan, Transaction, TransactionSplit
 
 
 def test_alembic_upgrade_head_creates_loans_and_commits(tmp_path: Path, monkeypatch) -> None:
-    """Verify alembic upgrade head applies all migrations and tests 0017 <-> 0018 roundtrip."""
+    """Verify alembic upgrade head applies all migrations and tests 0018 <-> 0019 roundtrip."""
     db_file = tmp_path / "migrations_test.db"
     monkeypatch.setenv("PLUTUS_DATABASE_URL", f"sqlite:///{db_file}")
 
@@ -46,9 +46,14 @@ def test_alembic_upgrade_head_creates_loans_and_commits(tmp_path: Path, monkeypa
             row[1]
             for row in conn.execute("PRAGMA table_info(loans)").fetchall()
         }
+        split_columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(transaction_splits)").fetchall()
+        }
 
     assert "loans" in tables
     assert "transactions" in tables
+    assert "transaction_splits" in tables
     assert "categories" in tables
     assert "min_amount" in rule_columns
     assert "max_amount" in rule_columns
@@ -59,8 +64,18 @@ def test_alembic_upgrade_head_creates_loans_and_commits(tmp_path: Path, monkeypa
     assert "loan_id" in tx_columns
     assert "loan_payment_amount" in tx_columns
     assert "loan_type" in loan_columns
+    assert {
+        "id",
+        "transaction_id",
+        "amount",
+        "category",
+        "tags",
+        "loan_id",
+        "notes",
+        "created_at",
+    }.issubset(split_columns)
     assert version is not None
-    assert version[0] == "0018_two_way_loans_system_cat"
+    assert version[0] == "0019_transaction_splits"
 
     parent_by_name = {name: parent for name, parent, _ in seeded_categories}
     system_by_name = {name: bool(is_sys) for name, _, is_sys in seeded_categories}
@@ -71,54 +86,45 @@ def test_alembic_upgrade_head_creates_loans_and_commits(tmp_path: Path, monkeypa
     assert parent_by_name.get("Debt & Loans") == "Finance"
     assert system_by_name.get("Debt & Loans") is True
 
-    # Verify 0018 -> 0017 downgrade -> upgrade roundtrip cleanly on SQLite
-    alembic_command.downgrade(cfg, "0017_transaction_loan_link")
+    # Verify 0019 -> 0018 downgrade -> upgrade roundtrip cleanly on SQLite
+    alembic_command.downgrade(cfg, "0018_two_way_loans_system_cat")
     with sqlite3.connect(db_file) as conn:
         down_ver = conn.execute("SELECT version_num FROM alembic_version").fetchone()
-        down_loan_cols = {
-            row[1]
-            for row in conn.execute("PRAGMA table_info(loans)").fetchall()
+        down_tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
         }
-        down_tx_cols = {
-            row[1]
-            for row in conn.execute("PRAGMA table_info(transactions)").fetchall()
-        }
-        debt_row = conn.execute(
-            "SELECT is_system FROM categories WHERE LOWER(name) = 'debt & loans'"
-        ).fetchone()
     assert down_ver is not None
-    assert down_ver[0] == "0017_transaction_loan_link"
-    assert "loan_type" not in down_loan_cols
-    assert "loan_payment_amount" not in down_tx_cols
-    assert debt_row is not None
-    assert bool(debt_row[0]) is False
+    assert down_ver[0] == "0018_two_way_loans_system_cat"
+    assert "transaction_splits" not in down_tables
 
     alembic_command.upgrade(cfg, "head")
     with sqlite3.connect(db_file) as conn:
         reup_ver = conn.execute("SELECT version_num FROM alembic_version").fetchone()
-        reup_loan_cols = {
-            row[1]
-            for row in conn.execute("PRAGMA table_info(loans)").fetchall()
+        reup_tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
         }
-        reup_tx_cols = {
+        reup_split_cols = {
             row[1]
-            for row in conn.execute("PRAGMA table_info(transactions)").fetchall()
+            for row in conn.execute("PRAGMA table_info(transaction_splits)").fetchall()
         }
-        reup_debt_row = conn.execute(
-            "SELECT is_system FROM categories WHERE LOWER(name) = 'debt & loans'"
-        ).fetchone()
     assert reup_ver is not None
-    assert reup_ver[0] == "0018_two_way_loans_system_cat"
-    assert "loan_type" in reup_loan_cols
-    assert "loan_payment_amount" in reup_tx_cols
-    assert reup_debt_row is not None
-    assert bool(reup_debt_row[0]) is True
+    assert reup_ver[0] == "0019_transaction_splits"
+    assert "transaction_splits" in reup_tables
+    assert {"id", "transaction_id", "amount", "category", "tags", "loan_id", "notes", "created_at"}.issubset(
+        reup_split_cols
+    )
 
     # Verify ORM models select cleanly against the Alembic-migrated schema
     engine = create_engine(f"sqlite:///{db_file}")
     try:
         with Session(engine) as session:
-            for model in (Account, Category, Loan, Transaction, CategorizationRule):
+            for model in (Account, Category, Loan, Transaction, TransactionSplit, CategorizationRule):
                 session.scalars(select(model).limit(1)).all()
     finally:
         engine.dispose()

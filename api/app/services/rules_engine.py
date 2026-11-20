@@ -6,7 +6,7 @@ import json
 import re
 from typing import Any, Iterable, Optional, Tuple
 from sqlalchemy import or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.models import Account, CategorizationRule, ReceiptItem, Transaction
 from app.services.fx_service import get_exchange_rate
@@ -335,7 +335,9 @@ def apply_rules_to_existing_transactions(
             "receipt_items_updated": 0,
         }
 
-    transactions = db.scalars(select(Transaction)).all()
+    transactions = db.scalars(
+        select(Transaction).options(joinedload(Transaction.splits))
+    ).unique().all()
     receipt_items = db.scalars(select(ReceiptItem)).all()
     updated_count = 0
     receipt_items_updated = 0
@@ -345,6 +347,9 @@ def apply_rules_to_existing_transactions(
     for tx in transactions:
         # Paired transfers are already reconciled; never clobber them with category rules.
         if tx.linked_transaction_id is not None:
+            continue
+        # Manual splits take precedence; never overwrite them during retroactive rule runs.
+        if tx.splits:
             continue
         desc = tx.raw_description or tx.merchant
         amt = float(tx.amount)

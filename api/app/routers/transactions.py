@@ -9,13 +9,14 @@ from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.orm import Session, joinedload
 
 from app.db import get_db
-from app.models import Account, Loan, Receipt, Transaction
+from app.models import Account, Loan, Receipt, Transaction, TransactionSplit
 from app.schemas import (
     TagCategoryBreakdownItem,
     TagSpendingSummaryItem,
     TagSpendingSummaryResponse,
     TransactionCreate,
     TransactionRead,
+    TransactionSplitsUpdate,
     TransactionUpdate,
 )
 from app.services.burn_service import (
@@ -52,12 +53,13 @@ def _transaction_load_options(*, include_receipt_items: bool = False):
         joinedload(Transaction.counterpart_account),
         joinedload(Transaction.loan),
         joinedload(Transaction.linked_transaction).joinedload(Transaction.account),
+        joinedload(Transaction.splits).joinedload(TransactionSplit.loan),
         receipt_load,
     )
 
 
 def hydrate_transaction(tx: Transaction) -> Transaction:
-    """Populate derived account, counterpart, loan, linked-transfer, and receipt fields."""
+    """Populate derived account, counterpart, loan, linked-transfer, split, and receipt fields."""
     tx.account_name = tx.account.name if tx.account else None
     tx.counterpart_account_name = (
         tx.counterpart_account.name if tx.counterpart_account else None
@@ -73,6 +75,11 @@ def hydrate_transaction(tx: Transaction) -> Transaction:
         tx.linked_account_name = None
         tx.linked_amount = None
         tx.linked_currency = None
+    splits = getattr(tx, "splits", None) or []
+    for split in splits:
+        split.loan_name = split.loan.name if split.loan else None
+        split.loan_type = split.loan.loan_type if split.loan else None
+    tx.is_split = len(splits) >= 2
     tx.has_receipt = bool(tx.receipt)
     tx.receipt_id = tx.receipt.id if tx.receipt else None
     return tx
@@ -103,13 +110,76 @@ def _matches_receipt_transaction_filter(
     include_subclasses: bool,
     parent_map: Optional[dict[str, str]] = None,
 ) -> Optional[TransactionRead]:
-    """Filter a transaction by category and/or tag, expanding matched receipt items.
+    """Filter a transaction by category and/or tag, expanding manual splits or receipt items.
 
-    Matched receipt items inherit tags from their parent transaction alongside
-    their own item-level tags. Returns a full or receipt-split TransactionRead,
-    or None if the transaction does not match.
+    Manual transaction splits take precedence over receipt items and apply to both
+    outflows and inflows. Matched lines inherit tags from their parent transaction
+    alongside their own tags. Returns a full or sliced TransactionRead, or None.
     """
     tx_cat_lower = (tx.category or "General").strip().lower()
+    splits = getattr(tx, "splits", None) or []
+    if splits:
+        parent_tags = parse_rule_tags(tx.tags)
+        matched_splits: list[tuple[TransactionSplit, str, list[str]]] = []
+        for split in splits:
+            s_cat = (split.category or tx.category or "General").strip() or "General"
+            s_tags = normalize_tags([*parent_tags, *parse_rule_tags(split.tags)])
+            if target_tag and target_tag not in s_tags:
+                continue
+            if target_cat:
+                effective_lower = (
+                    get_root_category(s_cat, parent_map).lower()
+                    if include_subclasses
+                    else s_cat.lower()
+                )
+                if effective_lower != target_cat:
+                    continue
+            matched_splits.append((split, s_cat, s_tags))
+
+        if not matched_splits:
+            return None
+
+        matched_orig = round(sum(float(s.amount) for s, _, _ in matched_splits), 2)
+        total_orig = round(sum(float(s.amount) for s in splits), 2)
+        matched_cats = {s_cat for _, s_cat, _ in matched_splits}
+        if target_cat and include_subclasses:
+            matched_cat = category.strip() if category else (tx.category or "General")
+        elif len(matched_cats) == 1:
+            matched_cat = next(iter(matched_cats))
+        else:
+            matched_cat = tx.category or "General"
+
+        merged_tags = normalize_tags(t for _, _, s_tags in matched_splits for t in s_tags)
+        is_partial = len(matched_splits) < len(splits) or abs(matched_orig - total_orig) > 0.01
+        sign = -1.0 if float(tx.amount) < 0 else 1.0
+        if is_partial or (target_cat and matched_cat.lower() != tx_cat_lower):
+            split_notes = ", ".join(s.notes for s, _, _ in matched_splits if s.notes)
+            resolved_notes = (
+                split_notes
+                if split_notes
+                else (
+                    f"Split of {tx.currency} {abs(float(tx.amount)):.2f}"
+                    if is_partial
+                    else tx.notes
+                )
+            )
+            return TransactionRead.model_validate(tx).model_copy(
+                update={
+                    "amount": round(sign * abs(matched_orig), 2),
+                    "category": matched_cat,
+                    "tags": merged_tags,
+                    "is_split": True,
+                    "notes": resolved_notes,
+                }
+            )
+
+        return TransactionRead.model_validate(tx).model_copy(
+            update={
+                "tags": merged_tags or parent_tags,
+                "is_split": len(splits) >= 2,
+            }
+        )
+
     is_expandable = (
         float(tx.amount) < 0
         and tx.receipt is not None
@@ -273,7 +343,12 @@ def list_transactions(
             )
         )
     if loan_id is not None:
-        stmt = stmt.where(Transaction.loan_id == loan_id)
+        stmt = stmt.where(
+            or_(
+                Transaction.loan_id == loan_id,
+                Transaction.splits.any(TransactionSplit.loan_id == loan_id),
+            )
+        )
     if start_date:
         stmt = stmt.where(Transaction.transaction_date >= start_date)
     if end_date:
@@ -432,6 +507,99 @@ def update_transaction(
     return hydrate_transaction(hydrated or tx)
 
 
+@router.put("/{transaction_id}/splits", response_model=TransactionRead)
+def replace_transaction_splits(
+    transaction_id: int,
+    payload: TransactionSplitsUpdate,
+    db: Session = Depends(get_db),
+):
+    """Replace or clear manual split lines on an unlinked transaction."""
+    tx = db.scalar(
+        select(Transaction)
+        .options(*_transaction_load_options())
+        .where(Transaction.id == transaction_id)
+    )
+    if not tx:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    if tx.linked_transaction_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Linked transfers cannot be split.",
+        )
+
+    if not payload.splits:
+        tx.splits.clear()
+        db.commit()
+        hydrated = db.scalar(
+            select(Transaction)
+            .options(*_transaction_load_options())
+            .where(Transaction.id == transaction_id)
+        )
+        return hydrate_transaction(hydrated or tx)
+
+    if len(payload.splits) < 2:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="At least 2 split lines are required when splitting a transaction.",
+        )
+
+    split_total = round(sum(float(item.amount) for item in payload.splits), 2)
+    tx_abs = round(abs(float(tx.amount)), 2)
+    if abs(split_total - tx_abs) > 0.01:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Split amounts ({split_total:.2f}) must sum to transaction amount ({tx_abs:.2f}).",
+        )
+
+    prepared_splits: list[TransactionSplit] = []
+    for item in payload.splits:
+        cat_clean = (item.category or "").strip()
+        if not cat_clean:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Split category cannot be empty.",
+            )
+        if len(cat_clean) > 50:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Split category cannot exceed 50 characters.",
+            )
+        if item.loan_id is not None:
+            if db.get(Loan, item.loan_id) is None:
+                raise HTTPException(status_code=404, detail="Loan not found")
+            if cat_clean.lower() != "debt & loans":
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="loan_id is only permitted when split category is 'Debt & Loans'.",
+                )
+        notes_clean = item.notes.strip() if item.notes is not None else None
+        if notes_clean == "":
+            notes_clean = None
+        prepared_splits.append(
+            TransactionSplit(
+                amount=round(float(item.amount), 2),
+                category=cat_clean,
+                tags=json.dumps(normalize_tags(item.tags)),
+                loan_id=item.loan_id,
+                notes=notes_clean,
+            )
+        )
+
+    tx.splits.clear()
+    db.flush()
+    tx.splits.extend(prepared_splits)
+    tx.loan_id = None
+    tx.loan_payment_amount = None
+    db.commit()
+
+    hydrated = db.scalar(
+        select(Transaction)
+        .options(*_transaction_load_options())
+        .where(Transaction.id == transaction_id)
+    )
+    return hydrate_transaction(hydrated or tx)
+
+
 @router.post("", response_model=TransactionRead, status_code=status.HTTP_201_CREATED)
 def create_transaction(
     payload: TransactionCreate,
@@ -547,10 +715,16 @@ def get_tag_spending_summary(
 
     stmt = (
         select(Transaction)
-        .options(joinedload(Transaction.receipt).joinedload(Receipt.items))
+        .options(
+            joinedload(Transaction.receipt).joinedload(Receipt.items),
+            joinedload(Transaction.splits).joinedload(TransactionSplit.loan),
+        )
         .where(
             Transaction.amount < 0,
-            func.lower(Transaction.category).not_in(TRANSFER_CATEGORIES),
+            or_(
+                func.lower(Transaction.category).not_in(TRANSFER_CATEGORIES),
+                Transaction.splits.any(),
+            ),
         )
     )
     if start_date:

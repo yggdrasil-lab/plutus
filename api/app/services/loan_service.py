@@ -1,14 +1,27 @@
 """Amortization schedule, countdown, and net worth calculations for loans."""
 
 import calendar
+from dataclasses import dataclass
 from datetime import date
 from typing import Optional
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
-from app.models import Loan, Transaction
+from app.models import Loan, Transaction, TransactionSplit
 from app.services.fx_service import to_nzd_amount
+
+
+@dataclass(frozen=True)
+class _LoanLedgerItem:
+    """Normalized direct-transaction or split-line loan ledger entry."""
+
+    tx: Transaction
+    signed_amount: float
+    category: str
+    split_id: Optional[int] = None
+    notes: Optional[str] = None
+    loan_payment_amount: Optional[float] = None
 
 
 def add_months(base_date: date, months: int) -> date:
@@ -21,10 +34,16 @@ def add_months(base_date: date, months: int) -> date:
 
 
 def load_loans_with_transactions(db: Session, *, active_only: bool = True) -> list[Loan]:
-    """Load loans with linked transactions and transaction accounts eagerly joined."""
+    """Load loans with linked transactions, split entries, and accounts eagerly joined."""
     stmt = (
         select(Loan)
-        .options(joinedload(Loan.transactions).joinedload(Transaction.account))
+        .options(
+            joinedload(Loan.transactions).joinedload(Transaction.account),
+            joinedload(Loan.transactions).joinedload(Transaction.splits),
+            joinedload(Loan.split_entries)
+            .joinedload(TransactionSplit.transaction)
+            .joinedload(Transaction.account),
+        )
         .order_by(Loan.start_date.asc(), Loan.id.asc())
     )
     if active_only:
@@ -33,10 +52,16 @@ def load_loans_with_transactions(db: Session, *, active_only: bool = True) -> li
 
 
 def load_loan_with_transactions(db: Session, loan_id: int) -> Optional[Loan]:
-    """Load one loan with linked transactions and transaction accounts eagerly joined."""
+    """Load one loan with linked transactions, split entries, and accounts eagerly joined."""
     return db.scalar(
         select(Loan)
-        .options(joinedload(Loan.transactions).joinedload(Transaction.account))
+        .options(
+            joinedload(Loan.transactions).joinedload(Transaction.account),
+            joinedload(Loan.transactions).joinedload(Transaction.splits),
+            joinedload(Loan.split_entries)
+            .joinedload(TransactionSplit.transaction)
+            .joinedload(Transaction.account),
+        )
         .where(Loan.id == loan_id)
     )
 
@@ -57,28 +82,92 @@ def _payment_in_loan_currency(
 
 
 def _serialize_loan_entry(
-    tx: Transaction,
+    item: _LoanLedgerItem,
     *,
     applied_amount: float,
     entry_type: str,
 ) -> dict[str, object]:
-    """Serialize one linked loan transaction entry (repayment or disbursement)."""
+    """Serialize one linked loan transaction or split entry (repayment or disbursement)."""
+    tx = item.tx
     return {
         "id": tx.id,
+        "split_id": item.split_id,
         "transaction_date": tx.transaction_date,
-        "amount": float(tx.amount),
+        "amount": float(item.signed_amount),
         "currency": (tx.currency or "NZD").strip().upper(),
-        "amount_nzd": round(abs(to_nzd_amount(float(tx.amount), tx.currency, tx.exchange_rate)), 2),
-        "applied_amount": round(applied_amount, 2),
-        "loan_payment_amount": (
-            float(tx.loan_payment_amount) if tx.loan_payment_amount is not None else None
+        "amount_nzd": round(
+            abs(to_nzd_amount(float(item.signed_amount), tx.currency, tx.exchange_rate)),
+            2,
         ),
+        "applied_amount": round(applied_amount, 2),
+        "loan_payment_amount": item.loan_payment_amount,
         "entry_type": entry_type,
         "merchant": tx.merchant,
         "account_id": tx.account_id,
         "account_name": tx.account.name if tx.account else None,
-        "category": tx.category,
+        "category": item.category,
+        "notes": item.notes,
     }
+
+
+def _build_loan_ledger_items(
+    loan: Loan,
+    linked_transactions: Optional[list[Transaction]] = None,
+) -> list[_LoanLedgerItem]:
+    """Aggregate direct unsplit loan transactions and split-line entries for a loan."""
+    items: list[_LoanLedgerItem] = []
+    if linked_transactions is not None:
+        for tx in linked_transactions:
+            items.append(
+                _LoanLedgerItem(
+                    tx=tx,
+                    signed_amount=float(tx.amount),
+                    category=tx.category,
+                    split_id=None,
+                    notes=tx.notes,
+                    loan_payment_amount=(
+                        float(tx.loan_payment_amount)
+                        if tx.loan_payment_amount is not None
+                        else None
+                    ),
+                )
+            )
+        return items
+
+    for tx in loan.transactions or []:
+        if getattr(tx, "splits", None):
+            continue
+        items.append(
+            _LoanLedgerItem(
+                tx=tx,
+                signed_amount=float(tx.amount),
+                category=tx.category,
+                split_id=None,
+                notes=tx.notes,
+                loan_payment_amount=(
+                    float(tx.loan_payment_amount)
+                    if tx.loan_payment_amount is not None
+                    else None
+                ),
+            )
+        )
+
+    for split in getattr(loan, "split_entries", None) or []:
+        tx = split.transaction
+        if tx is None:
+            continue
+        sign = 1.0 if float(tx.amount) >= 0 else -1.0
+        items.append(
+            _LoanLedgerItem(
+                tx=tx,
+                signed_amount=round(sign * abs(float(split.amount)), 2),
+                category=split.category,
+                split_id=split.id,
+                notes=split.notes,
+                loan_payment_amount=None,
+            )
+        )
+    return items
 
 
 def compute_loan_status(
@@ -86,7 +175,7 @@ def compute_loan_status(
     as_of: date,
     linked_transactions: Optional[list[Transaction]] = None,
 ) -> dict[str, object]:
-    """Compute remaining principal, payment countdown, and net worth impact from linked transactions."""
+    """Compute remaining principal, payment countdown, and net worth impact from linked transactions and splits."""
     principal = float(loan.principal_amount)
     annual_rate = float(loan.annual_interest_rate)
     monthly_rate = annual_rate / 12.0
@@ -98,18 +187,18 @@ def compute_loan_status(
     if loan_type not in ("borrowed", "lent"):
         loan_type = "borrowed"
 
-    source_txs = linked_transactions if linked_transactions is not None else (loan.transactions or [])
+    ledger_items = _build_loan_ledger_items(loan, linked_transactions)
     outflows = sorted(
-        (tx for tx in source_txs if float(tx.amount) < 0),
-        key=lambda tx: (tx.transaction_date, tx.id or 0),
+        (item for item in ledger_items if item.signed_amount < 0),
+        key=lambda item: (item.tx.transaction_date, item.tx.id or 0, item.split_id or 0),
     )
     inflows = sorted(
-        (tx for tx in source_txs if float(tx.amount) > 0),
-        key=lambda tx: (tx.transaction_date, tx.id or 0),
+        (item for item in ledger_items if item.signed_amount > 0),
+        key=lambda item: (item.tx.transaction_date, item.tx.id or 0, item.split_id or 0),
     )
 
-    repayment_txs = inflows if loan_type == "lent" else outflows
-    disbursement_txs = outflows if loan_type == "lent" else []
+    repayment_items = inflows if loan_type == "lent" else outflows
+    disbursement_items = outflows if loan_type == "lent" else []
 
     balance = principal
     payments_made = 0
@@ -117,15 +206,20 @@ def compute_loan_status(
     total_paid = 0.0
     repayment_entries: list[dict[str, object]] = []
 
-    for tx in repayment_txs:
-        applied = _payment_in_loan_currency(
-            tx,
-            loan_currency,
-            raw_amount=(
-                abs(float(tx.loan_payment_amount))
-                if tx.loan_payment_amount is not None
+    for item in repayment_items:
+        raw_override = (
+            abs(item.signed_amount)
+            if item.split_id is not None
+            else (
+                abs(float(item.loan_payment_amount))
+                if item.loan_payment_amount is not None
                 else None
-            ),
+            )
+        )
+        applied = _payment_in_loan_currency(
+            item.tx,
+            loan_currency,
+            raw_amount=raw_override,
         )
         interest = balance * monthly_rate if annual_rate > 0 else 0.0
         principal_part = max(0.0, applied - interest)
@@ -136,24 +230,28 @@ def compute_loan_status(
         total_paid += applied
         payments_made += 1
         repayment_entries.append(
-            _serialize_loan_entry(tx, applied_amount=applied, entry_type="repayment")
+            _serialize_loan_entry(item, applied_amount=applied, entry_type="repayment")
         )
 
     linked_payments = list(reversed(repayment_entries))
     disbursements = [
         _serialize_loan_entry(
-            tx,
-            applied_amount=_payment_in_loan_currency(tx, loan_currency),
+            item,
+            applied_amount=_payment_in_loan_currency(
+                item.tx,
+                loan_currency,
+                raw_amount=abs(item.signed_amount) if item.split_id is not None else None,
+            ),
             entry_type="disbursement",
         )
-        for tx in reversed(disbursement_txs)
+        for item in reversed(disbursement_items)
     ]
 
     remaining_principal = round(balance, 2)
     principal_paid = round(max(0.0, principal - remaining_principal), 2)
     interest_paid = round(interest_paid_total, 2)
     total_paid_amount = round(total_paid, 2)
-    last_payment_date: Optional[date] = repayment_txs[-1].transaction_date if repayment_txs else None
+    last_payment_date: Optional[date] = repayment_items[-1].tx.transaction_date if repayment_items else None
 
     if loan_type == "lent" and term == 0:
         payments_remaining = 0

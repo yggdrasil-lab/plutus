@@ -10,7 +10,7 @@ from typing import Optional
 from sqlalchemy import desc, func, or_, select
 from sqlalchemy.orm import Session, joinedload
 
-from app.models import Account, AssetSnapshot, BudgetRule, Category, Receipt, Transaction
+from app.models import Account, AssetSnapshot, BudgetRule, Category, Receipt, Transaction, TransactionSplit
 from app.services.category_taxonomy import get_category_parent_map, get_parent_category
 from app.services.fx_service import FxRateFetcher, get_exchange_rate, to_nzd_amount
 from app.services.recurrence_service import get_active_recurring_commitments
@@ -277,15 +277,39 @@ class ExpandedReceiptLine:
 
 
 def expand_expense_lines_by_receipt(tx: Transaction) -> list[ExpandedReceiptLine]:
-    """Expand an expense transaction into itemized receipt allocations in NZD.
+    """Expand an expense transaction into manual split lines or itemized receipt allocations in NZD.
 
-    Each receipt line item inherits its parent transaction's tags in addition to
-    its own interface tags, and falls back to the parent transaction's category.
-    Line NZD totals are scaled and rounded so sum(amount_nzd) == tx_nzd.
+    Precedence: manual `tx.splits` -> `tx.receipt.items` -> parent `tx`.
+    Manual split lines compute each line in NZD directly and skip `lent` loan
+    disbursements and `Transfers` lines without inflating remaining lines.
     """
     tx_cat = (tx.category or "General").strip() or "General"
-    tx_nzd = round(to_nzd_amount(abs(float(tx.amount)), tx.currency, tx.exchange_rate), 2)
     parent_tags = parse_rule_tags(tx.tags)
+    splits = getattr(tx, "splits", None) or []
+    if splits:
+        split_result: list[ExpandedReceiptLine] = []
+        for s in splits:
+            raw_cat = (s.category or tx_cat).strip() or tx_cat
+            if raw_cat.lower() in TRANSFER_CATEGORIES:
+                continue
+            if s.loan is not None and (s.loan.loan_type or "").strip().lower() == "lent":
+                continue
+            line_nzd = round(
+                to_nzd_amount(abs(float(s.amount)), tx.currency, tx.exchange_rate),
+                2,
+            )
+            line_tags = normalize_tags([*parent_tags, *parse_rule_tags(s.tags)])
+            split_result.append(
+                ExpandedReceiptLine(
+                    category=raw_cat,
+                    amount_nzd=line_nzd,
+                    effective_tags=line_tags,
+                    item_name=s.notes,
+                )
+            )
+        return split_result
+
+    tx_nzd = round(to_nzd_amount(abs(float(tx.amount)), tx.currency, tx.exchange_rate), 2)
     receipt = getattr(tx, "receipt", None)
     items = getattr(receipt, "items", None) if receipt is not None else None
     positive_items = [it for it in (items or []) if float(it.total_price) > 0]
@@ -349,13 +373,17 @@ def _fetch_expanded_variable_expenses(
         .options(
             joinedload(Transaction.receipt).joinedload(Receipt.items),
             joinedload(Transaction.loan),
+            joinedload(Transaction.splits).joinedload(TransactionSplit.loan),
         )
         .where(
             Transaction.transaction_date >= start_date,
             Transaction.transaction_date <= end_date,
             Transaction.amount < 0,
             Transaction.recurrence.is_(None),
-            func.lower(Transaction.category).not_in(excluded_tx),
+            or_(
+                func.lower(Transaction.category).not_in(excluded_tx),
+                Transaction.splits.any(),
+            ),
         )
     ).unique().all()
 
@@ -366,7 +394,11 @@ def _fetch_expanded_variable_expenses(
 
     expanded: list[tuple[str, float]] = []
     for tx in txs:
-        if tx.loan is not None and (tx.loan.loan_type or "").strip().lower() == "lent":
+        if (
+            not getattr(tx, "splits", None)
+            and tx.loan is not None
+            and (tx.loan.loan_type or "").strip().lower() == "lent"
+        ):
             continue
         for cat_name, amt_nzd in expand_expense_transaction_by_receipt(tx):
             key = cat_name.lower()

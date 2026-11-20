@@ -126,6 +126,49 @@ class Transaction(Base):
         uselist=False,
         primaryjoin="Transaction.id == Receipt.transaction_id",
     )
+    splits: Mapped[list["TransactionSplit"]] = relationship(
+        "TransactionSplit",
+        back_populates="transaction",
+        cascade="all, delete-orphan",
+        order_by="TransactionSplit.id",
+        foreign_keys="TransactionSplit.transaction_id",
+    )
+
+
+class TransactionSplit(Base):
+    """Manual split line allocation belonging to a parent transaction."""
+
+    __tablename__ = "transaction_splits"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    transaction_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("transactions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    amount: Mapped[float] = mapped_column(Numeric(14, 2), nullable=False)
+    category: Mapped[str] = mapped_column(String(50), nullable=False)
+    tags: Mapped[str] = mapped_column(Text, nullable=False, default="[]", server_default="[]")
+    loan_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        ForeignKey("loans.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    notes: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    transaction: Mapped["Transaction"] = relationship(
+        "Transaction",
+        back_populates="splits",
+        foreign_keys=[transaction_id],
+    )
+    loan: Mapped[Optional["Loan"]] = relationship(
+        "Loan",
+        back_populates="split_entries",
+        foreign_keys=[loan_id],
+    )
 
 
 class Category(Base):
@@ -374,4 +417,9 @@ class Loan(Base):
         "Transaction",
         back_populates="loan",
         foreign_keys="Transaction.loan_id",
+    )
+    split_entries: Mapped[list["TransactionSplit"]] = relationship(
+        "TransactionSplit",
+        back_populates="loan",
+        foreign_keys="TransactionSplit.loan_id",
     )
