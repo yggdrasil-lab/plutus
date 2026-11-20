@@ -73,16 +73,20 @@ def get_active_recurring_commitments(
         stmt = stmt.options(
             joinedload(Transaction.account),
             joinedload(Transaction.counterpart_account),
+            joinedload(Transaction.loan),
             joinedload(Transaction.linked_transaction).joinedload(Transaction.account),
             joinedload(Transaction.receipt),
         )
         rows = db.scalars(stmt).unique().all()
     else:
-        rows = db.scalars(stmt).all()
+        stmt = stmt.options(joinedload(Transaction.loan))
+        rows = db.scalars(stmt).unique().all()
 
     seen: set[tuple[str, str]] = set()
     commitments: list[tuple[Transaction, float]] = []
     for tx in rows:
+        if tx.loan is not None and (tx.loan.loan_type or "").strip().lower() == "lent":
+            continue
         rec = (tx.recurrence or "").strip().lower()
         factor = RECURRENCE_WEEKLY_FACTOR.get(rec)
         if not factor:

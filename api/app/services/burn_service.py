@@ -147,7 +147,7 @@ def get_active_categories(db: Session) -> list[str]:
     category_rows = list(
         db.scalars(
             select(Category.name)
-            .where(Category.is_active == True, Category.is_system == False)
+            .where(Category.is_active == True)
             .order_by(Category.name)
         ).all()
     )
@@ -155,7 +155,7 @@ def get_active_categories(db: Session) -> list[str]:
         filtered = [
             name
             for name in category_rows
-            if name and name.strip().lower() not in (*TRANSFER_CATEGORIES, "income")
+            if name and name.strip().lower() not in (*TRANSFER_CATEGORIES, "income", "general")
         ]
         if filtered:
             return filtered
@@ -346,7 +346,10 @@ def _fetch_expanded_variable_expenses(
     excluded_tx = tuple({c.lower() for c in TRANSFER_CATEGORIES})
     txs = db.scalars(
         select(Transaction)
-        .options(joinedload(Transaction.receipt).joinedload(Receipt.items))
+        .options(
+            joinedload(Transaction.receipt).joinedload(Receipt.items),
+            joinedload(Transaction.loan),
+        )
         .where(
             Transaction.transaction_date >= start_date,
             Transaction.transaction_date <= end_date,
@@ -363,6 +366,8 @@ def _fetch_expanded_variable_expenses(
 
     expanded: list[tuple[str, float]] = []
     for tx in txs:
+        if tx.loan is not None and (tx.loan.loan_type or "").strip().lower() == "lent":
+            continue
         for cat_name, amt_nzd in expand_expense_transaction_by_receipt(tx):
             key = cat_name.lower()
             if key in exc_lower:

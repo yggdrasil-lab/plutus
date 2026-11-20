@@ -58,7 +58,7 @@ DEFAULT_CATEGORY_SPECS: tuple[CategorySeedSpec, ...] = (
     CategorySeedSpec("Family", None, False, 100),
     CategorySeedSpec("Finance", None, False, 110),
     CategorySeedSpec("Fees & Admin", "Finance", False, 111),
-    CategorySeedSpec("Debt & Loans", "Finance", False, 112),
+    CategorySeedSpec("Debt & Loans", "Finance", True, 112),
     CategorySeedSpec("General", None, True, 900),
     CategorySeedSpec("Transfers", None, True, 910),
     CategorySeedSpec("Income", None, True, 920),

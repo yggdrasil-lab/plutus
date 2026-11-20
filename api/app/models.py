@@ -92,6 +92,7 @@ class Transaction(Base):
     linked_transaction_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("transactions.id", ondelete="SET NULL"), nullable=True, index=True)
     counterpart_account_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("accounts.id", ondelete="SET NULL"), nullable=True, index=True)
     loan_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("loans.id", ondelete="SET NULL"), nullable=True, index=True)
+    loan_payment_amount: Mapped[Optional[float]] = mapped_column(Numeric(14, 2), nullable=True)
     exchange_rate: Mapped[Optional[float]] = mapped_column(Numeric(18, 8), nullable=True)
     fee_amount: Mapped[Optional[float]] = mapped_column(Numeric(18, 8), nullable=True)
     tags: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
@@ -349,13 +350,14 @@ class ExchangeRate(Base):
 
 
 class Loan(Base):
-    """Financed liability (e.g. vehicle loan, mortgage) with amortization countdown."""
+    """Financed liability or lent receivable tracked with transaction-driven amortization."""
 
     __tablename__ = "loans"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     name: Mapped[str] = mapped_column(String(120), nullable=False)
     lender: Mapped[str] = mapped_column(String(120), nullable=False)
+    loan_type: Mapped[str] = mapped_column(String(20), default="borrowed", nullable=False)
     principal_amount: Mapped[float] = mapped_column(Numeric(14, 2), nullable=False)
     annual_interest_rate: Mapped[float] = mapped_column(Numeric(6, 4), nullable=False)
     term_months: Mapped[int] = mapped_column(Integer, nullable=False)
