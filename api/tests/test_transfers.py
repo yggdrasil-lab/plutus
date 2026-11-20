@@ -468,8 +468,19 @@ TRANSFER-98765433,05-11-2026,500.00,NZD,Client Payment Invoice 101,Freelance,500
         self.assertEqual(float(nzd_in.exchange_rate), 1.0)
 
     def test_recategorize_transfer_to_expense_clears_link_and_fx_rate(self):
-        """Verify changing a linked transfer to an expense category (e.g. Gym) clears FX rate and unlinks both legs."""
+        """Verify changing a linked transfer to an expense unlinks both legs and restores non-NZD FX."""
+        from unittest.mock import patch
+        from app.services.fx_service import cache_exchange_rate
+
         d = date(2026, 11, 12)
+        cache_exchange_rate(
+            self.db,
+            rate_date=d,
+            from_currency="USD",
+            to_currency="NZD",
+            rate=1.68,
+            source="stub",
+        )
         out_tx = Transaction(
             transaction_date=d,
             account_id=self.acc_asb.id,
@@ -514,11 +525,12 @@ TRANSFER-98765433,05-11-2026,500.00,NZD,Client Payment Invoice 101,Freelance,500
         self.db.expire_all()
         self.db.refresh(in_tx)
         self.assertIsNone(in_tx.linked_transaction_id)
-        self.assertIsNone(in_tx.exchange_rate)
+        self.assertAlmostEqual(float(in_tx.exchange_rate), 1.68, places=4)
         self.assertIsNone(in_tx.fee_amount)
 
         # Subsequent reconciliation must not re-link the Gym transaction
-        reconcile_transfers(self.db)
+        with patch("app.services.transfer_service.get_exchange_rate", return_value=None):
+            reconcile_transfers(self.db)
         self.db.refresh(out_tx)
         self.assertIsNone(out_tx.linked_transaction_id)
         self.assertIsNone(out_tx.exchange_rate)

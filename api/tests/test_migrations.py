@@ -34,6 +34,10 @@ def test_alembic_upgrade_head_creates_loans_and_commits(tmp_path: Path, monkeypa
             row[1]
             for row in conn.execute("PRAGMA table_info(categorization_rules)").fetchall()
         }
+        tx_columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(transactions)").fetchall()
+        }
 
     assert "loans" in tables
     assert "transactions" in tables
@@ -41,8 +45,10 @@ def test_alembic_upgrade_head_creates_loans_and_commits(tmp_path: Path, monkeypa
     assert "min_amount" in rule_columns
     assert "max_amount" in rule_columns
     assert "direction" in rule_columns
+    assert "counterpart_account_id" in rule_columns
+    assert "counterpart_account_id" in tx_columns
     assert version is not None
-    assert version[0] == "0015_rule_amount_bounds"
+    assert version[0] == "0016_rule_counterpart_account"
 
     parent_by_name = {name: parent for name, parent, _ in seeded_categories}
     assert parent_by_name.get("Dining") == "Food"
@@ -50,3 +56,26 @@ def test_alembic_upgrade_head_creates_loans_and_commits(tmp_path: Path, monkeypa
     assert parent_by_name.get("Alcohol") == "Food"
     assert parent_by_name.get("Fees & Admin") == "Finance"
     assert parent_by_name.get("Debt & Loans") == "Finance"
+
+    # Verify 0016 downgrade -> upgrade roundtrip cleanly on SQLite
+    alembic_command.downgrade(cfg, "0015_rule_amount_bounds")
+    with sqlite3.connect(db_file) as conn:
+        down_ver = conn.execute("SELECT version_num FROM alembic_version").fetchone()
+        down_rule_cols = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(categorization_rules)").fetchall()
+        }
+        down_tx_cols = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(transactions)").fetchall()
+        }
+    assert down_ver is not None
+    assert down_ver[0] == "0015_rule_amount_bounds"
+    assert "counterpart_account_id" not in down_rule_cols
+    assert "counterpart_account_id" not in down_tx_cols
+
+    alembic_command.upgrade(cfg, "head")
+    with sqlite3.connect(db_file) as conn:
+        reup_ver = conn.execute("SELECT version_num FROM alembic_version").fetchone()
+    assert reup_ver is not None
+    assert reup_ver[0] == "0016_rule_counterpart_account"

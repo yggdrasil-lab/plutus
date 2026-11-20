@@ -77,13 +77,13 @@ class AssetSnapshotBase(BaseModel):
     account_id: int
     balance: float
     currency: str = "NZD"
-    exchange_rate: float = 1.0
+    exchange_rate: Optional[float] = None
     source: str = "manual"
     notes: Optional[str] = None
 
 
 class AssetSnapshotCreate(AssetSnapshotBase):
-    pass
+    exchange_rate: Optional[float] = Field(default=None, gt=0.0)
 
 
 class AssetSnapshotRead(AssetSnapshotBase):
@@ -164,6 +164,11 @@ class QuickLogRequest(BaseModel):
 class TransactionRead(TransactionBase):
     id: int
     account_name: Optional[str] = None
+    linked_account_name: Optional[str] = None
+    linked_amount: Optional[float] = None
+    linked_currency: Optional[str] = None
+    counterpart_account_id: Optional[int] = None
+    counterpart_account_name: Optional[str] = None
     raw_hash: str
     has_receipt: bool = False
     receipt_id: Optional[int] = None
@@ -429,6 +434,7 @@ class CategorizationRuleBase(BaseModel):
     target_tags: list[str] = Field(default_factory=list)
     target_recurrence: Optional[str] = Field(default=None, max_length=20)
     rename_merchant: Optional[str] = Field(default=None, max_length=150)
+    counterpart_account_id: Optional[int] = None
     priority: int = Field(default=10, ge=1)
     is_active: bool = True
 
@@ -474,6 +480,7 @@ class CategorizationRuleUpdate(BaseModel):
     target_tags: Optional[list[str]] = None
     target_recurrence: Optional[str] = Field(default=None, max_length=20)
     rename_merchant: Optional[str] = Field(default=None, max_length=150)
+    counterpart_account_id: Optional[int] = None
     priority: Optional[int] = None
     is_active: Optional[bool] = None
     apply_retroactively: bool = False
@@ -501,6 +508,7 @@ class CategorizationRuleUpdate(BaseModel):
 
 class CategorizationRuleRead(CategorizationRuleBase):
     id: int
+    counterpart_account_name: Optional[str] = None
     match_count: int
     created_at: datetime
     updated_at: datetime

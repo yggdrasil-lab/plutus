@@ -70,7 +70,12 @@ def get_active_recurring_commitments(
         .order_by(Transaction.transaction_date.desc(), Transaction.id.desc())
     )
     if eager_load:
-        stmt = stmt.options(joinedload(Transaction.account), joinedload(Transaction.receipt))
+        stmt = stmt.options(
+            joinedload(Transaction.account),
+            joinedload(Transaction.counterpart_account),
+            joinedload(Transaction.linked_transaction).joinedload(Transaction.account),
+            joinedload(Transaction.receipt),
+        )
         rows = db.scalars(stmt).unique().all()
     else:
         rows = db.scalars(stmt).all()

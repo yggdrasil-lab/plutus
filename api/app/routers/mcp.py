@@ -21,6 +21,7 @@ from starlette.routing import Route
 from app.config import settings
 from app.models import Account, AssetSnapshot, BudgetRule, Transaction
 from app.services.burn_service import get_effective_weekly_burn, get_latest_account_balances
+from app.services.ingestion_service import upsert_account_snapshot
 from app.services.receipt_service import reconcile_unlinked_receipts
 from app.services.runway import (
     calculate_compounding_runway,
@@ -179,26 +180,23 @@ def build_mcp_server() -> MCPServer:
             if not account:
                 raise ToolError(f"Account '{account_name}' not found")
 
-            existing = db.scalar(
-                select(AssetSnapshot).where(AssetSnapshot.account_id == account.id, AssetSnapshot.snapshot_date == snap_dt)
+            existing_id = db.scalar(
+                select(AssetSnapshot.id).where(AssetSnapshot.account_id == account.id, AssetSnapshot.snapshot_date == snap_dt)
             )
-            if existing:
-                existing.balance = balance
-                existing.balance_nzd = balance * float(existing.exchange_rate)
-                existing.source = "mcp"
-                db.commit()
-                return json.dumps({"status": "updated", "account": account.name, "balance": balance, "date": snap_dt.isoformat()})
-
-            snap = AssetSnapshot(
-                account_id=account.id,
+            upsert_account_snapshot(
+                db,
+                account=account,
                 snapshot_date=snap_dt,
                 balance=balance,
-                balance_nzd=balance,
+                currency=account.currency or "NZD",
                 source="mcp",
             )
-            db.add(snap)
-            db.commit()
-            return json.dumps({"status": "created", "account": account.name, "balance": balance, "date": snap_dt.isoformat()})
+            return json.dumps({
+                "status": "updated" if existing_id is not None else "created",
+                "account": account.name,
+                "balance": balance,
+                "date": snap_dt.isoformat(),
+            })
 
     @server.tool(name="plutus_reconcile_transfers", description="Scan and pair unmatched internal and cross-currency (Wise) account transfers.")
     def plutus_reconcile_transfers() -> str:

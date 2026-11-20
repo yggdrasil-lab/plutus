@@ -1,18 +1,23 @@
 """Outlook-style transaction categorization rules engine."""
 
 from collections import Counter
+import hashlib
 import json
 import re
 from typing import Any, Iterable, Optional, Tuple
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
-from app.models import CategorizationRule, ReceiptItem, Transaction
+from app.models import Account, CategorizationRule, ReceiptItem, Transaction
+from app.services.fx_service import get_exchange_rate
 from app.services.jev_client import (
     classify_transaction_jev_with_tags,
     get_extra_jev_categories,
     is_jev_circuit_open,
 )
+
+CRYPTO_CURRENCIES = {"BTC", "ETH", "SOL", "USDC", "USDT"}
+TRANSFER_RULE_CATEGORIES = ("transfers", "transfer")
 
 
 def normalize_tags(tags: Iterable[str], max_length: int = 40) -> list[str]:
@@ -168,6 +173,138 @@ def _apply_rule_to_record(
     return changed
 
 
+def apply_counterpart_account_for_rule(
+    db: Session,
+    tx: Transaction,
+    rule: CategorizationRule,
+) -> bool:
+    """Apply rule counterpart_account_id attribution or auto-mirroring for Transfers."""
+    if rule.counterpart_account_id is None or tx.account_id == rule.counterpart_account_id:
+        return False
+
+    counterpart_acc = db.get(Account, rule.counterpart_account_id)
+    if counterpart_acc is None:
+        return False
+
+    changed = False
+    if tx.counterpart_account_id != rule.counterpart_account_id:
+        tx.counterpart_account_id = rule.counterpart_account_id
+        changed = True
+
+    is_transfer_rule = (rule.target_category or "").strip().lower() in TRANSFER_RULE_CATEGORIES
+    if not is_transfer_rule:
+        return changed
+
+    if tx.linked_transaction_id is not None:
+        return changed
+
+    tx_amt = float(tx.amount)
+    if tx_amt == 0.0:
+        return changed
+
+    mirror_hash = hashlib.sha256(
+        f"mirror:{tx.raw_hash}:{rule.counterpart_account_id}".encode("utf-8")
+    ).hexdigest()
+    existing_mirror = db.scalar(
+        select(Transaction).where(Transaction.raw_hash == mirror_hash)
+    )
+    if existing_mirror is not None:
+        if existing_mirror.linked_transaction_id is None:
+            tx.linked_transaction_id = existing_mirror.id
+            existing_mirror.linked_transaction_id = tx.id
+            existing_mirror.category = "Transfers"
+            if existing_mirror.counterpart_account_id != tx.account_id:
+                existing_mirror.counterpart_account_id = tx.account_id
+            if (tx.currency or "").strip().upper() == (existing_mirror.currency or "").strip().upper():
+                tx.exchange_rate = 1.0
+                existing_mirror.exchange_rate = 1.0
+            return True
+        return changed
+
+    if tx.id is None:
+        db.flush()
+
+    src_currency = (tx.currency or "NZD").strip().upper()
+    dst_currency = (counterpart_acc.currency or src_currency).strip().upper()
+
+    if src_currency == dst_currency:
+        mirror_currency = src_currency[:3]
+        mirror_amount = -tx_amt
+        tx.exchange_rate = 1.0
+        mirror_fx: Optional[float] = 1.0
+    else:
+        resolved = get_exchange_rate(
+            db,
+            rate_date=tx.transaction_date,
+            from_currency=src_currency,
+            to_currency=dst_currency,
+        )
+        if resolved is not None and resolved[0] > 0:
+            conv_rate = float(resolved[0])
+            mirror_currency = dst_currency[:3]
+            decimals = 8 if dst_currency in CRYPTO_CURRENCIES else 2
+            mirror_amount = round(-tx_amt * conv_rate, decimals)
+            precision = 8 if conv_rate < 0.01 else 6 if conv_rate < 1.0 else 4
+            if tx_amt < 0:
+                tx.exchange_rate = round(conv_rate, precision)
+                if dst_currency == "NZD":
+                    mirror_fx = 1.0
+                else:
+                    dst_nzd = get_exchange_rate(
+                        db,
+                        rate_date=tx.transaction_date,
+                        from_currency=dst_currency,
+                        to_currency="NZD",
+                    )
+                    mirror_fx = (
+                        round(float(dst_nzd[0]), 8)
+                        if dst_nzd and dst_nzd[0] > 0
+                        else None
+                    )
+            else:
+                inv_rate = 1.0 / conv_rate
+                inv_precision = 8 if inv_rate < 0.01 else 6 if inv_rate < 1.0 else 4
+                mirror_fx = round(inv_rate, inv_precision)
+                if src_currency == "NZD":
+                    tx.exchange_rate = 1.0
+                elif tx.exchange_rate is None:
+                    src_nzd = get_exchange_rate(
+                        db,
+                        rate_date=tx.transaction_date,
+                        from_currency=src_currency,
+                        to_currency="NZD",
+                    )
+                    if src_nzd and src_nzd[0] > 0:
+                        tx.exchange_rate = round(float(src_nzd[0]), 8)
+        else:
+            mirror_currency = src_currency[:3]
+            mirror_amount = -tx_amt
+            tx.exchange_rate = 1.0
+            mirror_fx = 1.0
+
+    mirror_tx = Transaction(
+        transaction_date=tx.transaction_date,
+        account_id=rule.counterpart_account_id,
+        counterpart_account_id=tx.account_id,
+        amount=mirror_amount,
+        currency=mirror_currency,
+        merchant=tx.merchant,
+        category="Transfers",
+        raw_description=tx.raw_description,
+        raw_hash=mirror_hash,
+        exchange_rate=mirror_fx,
+        fee_amount=None,
+        tags=tx.tags or "[]",
+        recurrence=tx.recurrence,
+        notes=f"mirror:{tx.id}",
+    )
+    db.add(mirror_tx)
+    db.flush()
+    tx.linked_transaction_id = mirror_tx.id
+    mirror_tx.linked_transaction_id = tx.id
+    return True
+
+
 def apply_rules_to_existing_transactions(
     db: Session,
     rule_ids: Optional[list[int]] = None,
@@ -213,6 +350,8 @@ def apply_rules_to_existing_transactions(
                 changed = True
             if matched_rule.target_recurrence and tx.recurrence != matched_rule.target_recurrence:
                 tx.recurrence = matched_rule.target_recurrence
+                changed = True
+            if apply_counterpart_account_for_rule(db, tx, matched_rule):
                 changed = True
             if changed:
                 updated_count += 1
