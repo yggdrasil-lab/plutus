@@ -607,3 +607,73 @@ def test_two_way_lent_loan_partial_repayment_and_budget_purity():
         assert grocery_tx["id"] is not None
     finally:
         app.dependency_overrides.clear()
+
+
+def test_cross_currency_partial_loan_payment_override():
+    client, TestingSessionLocal = _build_test_client()
+
+    try:
+        today = date.today()
+        with TestingSessionLocal() as db:
+            sgd_acc = Account(
+                name="Wise SGD",
+                institution="Wise",
+                account_type="checking",
+                tier="cash",
+                currency="SGD",
+            )
+            db.add(sgd_acc)
+            db.commit()
+            db.refresh(sgd_acc)
+
+        loan_res = client.post(
+            "/loans",
+            json={
+                "name": "SGD Repaid NZD Loan",
+                "lender": "Friend",
+                "loan_type": "lent",
+                "principal_amount": 1000.0,
+                "annual_interest_rate": 0.0,
+                "term_months": 0,
+                "monthly_payment": 0.0,
+                "start_date": today.isoformat(),
+                "currency": "NZD",
+            },
+        )
+        assert loan_res.status_code == 201
+        loan_id = loan_res.json()["id"]
+
+        tx_res = client.post(
+            "/transactions",
+            json={
+                "transaction_date": today.isoformat(),
+                "account_id": sgd_acc.id,
+                "amount": 150.0,
+                "currency": "SGD",
+                "exchange_rate": 1.30,
+                "merchant": "Friend SGD Repayment + Bonus",
+                "category": "Debt & Loans",
+            },
+        )
+        assert tx_res.status_code == 201
+        tx_id = tx_res.json()["id"]
+
+        patch_res = client.patch(
+            f"/transactions/{tx_id}",
+            json={"loan_id": loan_id, "loan_payment_amount": 100.0},
+        )
+        assert patch_res.status_code == 200
+        assert patch_res.json()["loan_payment_amount"] == 100.0
+
+        summary = client.get("/loans").json()
+        loan_status = next(item for item in summary["loans"] if item["id"] == loan_id)
+        # 100 SGD * 1.30 = 130 NZD applied toward the 1000 NZD loan
+        assert loan_status["linked_payments"][0]["applied_amount"] == 130.0
+        assert loan_status["principal_paid"] == 130.0
+        assert loan_status["remaining_principal"] == 870.0
+
+        # Remaining 50 SGD * 1.30 = 65 NZD counts as non-loan income
+        bd = client.get("/budgets/breakdown?period=all").json()
+        assert bd["total_income"] == 65.0
+    finally:
+        app.dependency_overrides.clear()

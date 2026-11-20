@@ -216,7 +216,6 @@ class CategorizationRule(Base):
     rename_merchant: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
     counterpart_account_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("accounts.id", ondelete="SET NULL"), nullable=True, index=True)
     loan_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("loans.id", ondelete="SET NULL"), nullable=True, index=True)
-    loan_payment_amount: Mapped[Optional[float]] = mapped_column(Numeric(14, 2), nullable=True)
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     match_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

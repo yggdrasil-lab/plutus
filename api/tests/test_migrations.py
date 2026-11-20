@@ -5,6 +5,10 @@ import sqlite3
 
 from alembic import command as alembic_command
 from alembic.config import Config as AlembicConfig
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session
+
+from app.models import Account, CategorizationRule, Category, Loan, Transaction
 
 
 def test_alembic_upgrade_head_creates_loans_and_commits(tmp_path: Path, monkeypatch) -> None:
@@ -109,3 +113,12 @@ def test_alembic_upgrade_head_creates_loans_and_commits(tmp_path: Path, monkeypa
     assert "loan_payment_amount" in reup_tx_cols
     assert reup_debt_row is not None
     assert bool(reup_debt_row[0]) is True
+
+    # Verify ORM models select cleanly against the Alembic-migrated schema
+    engine = create_engine(f"sqlite:///{db_file}")
+    try:
+        with Session(engine) as session:
+            for model in (Account, Category, Loan, Transaction, CategorizationRule):
+                session.scalars(select(model).limit(1)).all()
+    finally:
+        engine.dispose()

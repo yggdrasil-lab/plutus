@@ -41,12 +41,19 @@ def load_loan_with_transactions(db: Session, loan_id: int) -> Optional[Loan]:
     )
 
 
-def _payment_in_loan_currency(tx: Transaction, loan_currency: str) -> float:
-    """Resolve a transaction amount in the loan's currency."""
+def _payment_in_loan_currency(
+    tx: Transaction,
+    loan_currency: str,
+    raw_amount: Optional[float] = None,
+) -> float:
+    """Resolve a transaction or partial override amount in the loan's currency."""
+    amount = abs(float(tx.amount if raw_amount is None else raw_amount))
     tx_currency = (tx.currency or "NZD").strip().upper()
     if tx_currency == loan_currency:
-        return abs(float(tx.amount))
-    return abs(to_nzd_amount(float(tx.amount), tx_currency, tx.exchange_rate))
+        return amount
+    if loan_currency == "NZD":
+        return abs(to_nzd_amount(amount, tx_currency, tx.exchange_rate))
+    return amount
 
 
 def _serialize_loan_entry(
@@ -111,10 +118,14 @@ def compute_loan_status(
     repayment_entries: list[dict[str, object]] = []
 
     for tx in repayment_txs:
-        applied = (
-            float(tx.loan_payment_amount)
-            if tx.loan_payment_amount is not None
-            else _payment_in_loan_currency(tx, loan_currency)
+        applied = _payment_in_loan_currency(
+            tx,
+            loan_currency,
+            raw_amount=(
+                abs(float(tx.loan_payment_amount))
+                if tx.loan_payment_amount is not None
+                else None
+            ),
         )
         interest = balance * monthly_rate if annual_rate > 0 else 0.0
         principal_part = max(0.0, applied - interest)
