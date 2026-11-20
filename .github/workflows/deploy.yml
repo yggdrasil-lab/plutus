@@ -23,14 +23,20 @@ jobs:
       - name: Setup Secrets
         env:
           PLUTUS_MCP_TOKEN: ${{ secrets.PLUTUS_MCP_TOKEN }}
+          PLUTUS_DB_PASSWORD: ${{ secrets.PLUTUS_DB_PASSWORD }}
         run: |
           if [ -z "${PLUTUS_MCP_TOKEN}" ]; then
             echo "Error: PLUTUS_MCP_TOKEN secret is required" >&2
             exit 1
           fi
+          if [ -z "${PLUTUS_DB_PASSWORD}" ]; then
+            echo "Error: PLUTUS_DB_PASSWORD secret is required" >&2
+            exit 1
+          fi
           curl -fsSL https://raw.githubusercontent.com/yggdrasil-lab/yggdrasil-os/main/deploy/ensure_secret.sh -o /tmp/ensure_secret.sh
           chmod +x /tmp/ensure_secret.sh
           echo "PLUTUS_MCP_TOKEN_NAME=$(echo "$PLUTUS_MCP_TOKEN" | /tmp/ensure_secret.sh plutus_mcp_token)" >> $GITHUB_ENV
+          echo "PLUTUS_DB_PASSWORD_NAME=$(printf '%s' "$PLUTUS_DB_PASSWORD" | /tmp/ensure_secret.sh plutus_db_password)" >> $GITHUB_ENV
 
       - name: Prepare host data directory
         env:
@@ -44,6 +50,7 @@ jobs:
           DOMAIN_NAME: ${{ vars.DOMAIN_NAME }}
           REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
           PLUTUS_MCP_TOKEN: ${{ secrets.PLUTUS_MCP_TOKEN }}
+          PLUTUS_DB_PASSWORD: ${{ secrets.PLUTUS_DB_PASSWORD }}
           MUNINN_MASTER_KEY: ${{ secrets.MUNINN_MASTER_KEY }}
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_CHANNEL_WEALTH_ID: ${{ vars.DISCORD_CHANNEL_WEALTH_ID }}
@@ -54,6 +61,7 @@ jobs:
           [ -z "$DOMAIN_NAME" ] && MISSING="$MISSING DOMAIN_NAME"
           [ -z "$REGISTRY_PREFIX" ] && MISSING="$MISSING REGISTRY_PREFIX"
           [ -z "$PLUTUS_MCP_TOKEN" ] && MISSING="$MISSING PLUTUS_MCP_TOKEN"
+          [ -z "$PLUTUS_DB_PASSWORD" ] && MISSING="$MISSING PLUTUS_DB_PASSWORD"
           [ -z "$MUNINN_MASTER_KEY" ] && MISSING="$MISSING MUNINN_MASTER_KEY"
           [ -z "$DISCORD_BOT_TOKEN" ] && MISSING="$MISSING DISCORD_BOT_TOKEN"
           [ -z "$DISCORD_CHANNEL_WEALTH_ID" ] && MISSING="$MISSING DISCORD_CHANNEL_WEALTH_ID"
