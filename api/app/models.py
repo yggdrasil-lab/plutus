@@ -1,7 +1,7 @@
 """SQLAlchemy database models for Plutus wealth and runway system."""
 
 from datetime import date, datetime, timezone
-from typing import Optional
+from typing import Optional, Sequence
 
 from sqlalchemy import (
     Boolean,
@@ -170,6 +170,29 @@ class TransactionSplit(Base):
         back_populates="split_entries",
         foreign_keys=[loan_id],
     )
+
+    def signed_amount(
+        self,
+        *,
+        parent_amount: Optional[float] = None,
+        siblings: Optional[Sequence["TransactionSplit"]] = None,
+    ) -> float:
+        """Return this split line's signed amount, normalizing legacy unsigned positive splits on negative parents."""
+        raw = float(self.amount)
+        tx = getattr(self, "transaction", None)
+        resolved_parent = (
+            float(parent_amount)
+            if parent_amount is not None
+            else (float(tx.amount) if tx is not None and tx.amount is not None else 0.0)
+        )
+        resolved_siblings = (
+            siblings
+            if siblings is not None
+            else (getattr(tx, "splits", None) or [self])
+        )
+        if resolved_parent < 0 and resolved_siblings and all(float(s.amount) > 0 for s in resolved_siblings):
+            return -raw
+        return raw
 
 
 class Category(Base):

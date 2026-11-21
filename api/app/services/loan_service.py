@@ -10,7 +10,6 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.models import Loan, Transaction, TransactionSplit
 from app.services.fx_service import to_nzd_amount
-from app.services.split_utils import resolve_signed_split_amount
 
 
 @dataclass(frozen=True)
@@ -163,11 +162,7 @@ def _build_loan_ledger_items(
         tx = split.transaction
         if tx is None:
             continue
-        tx_splits = getattr(tx, "splits", None) or [split]
-        signed_split = round(
-            resolve_signed_split_amount(split, tx_splits, float(tx.amount)),
-            2,
-        )
+        signed_split = round(split.signed_amount(), 2)
         items.append(
             _LoanLedgerItem(
                 tx=tx,
