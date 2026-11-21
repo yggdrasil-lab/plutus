@@ -15,7 +15,6 @@ from app.services.category_taxonomy import get_category_parent_map, get_parent_c
 from app.services.fx_service import FxRateFetcher, get_exchange_rate, to_nzd_amount
 from app.services.recurrence_service import get_active_recurring_commitments
 from app.services.rules_engine import normalize_tags, parse_rule_tags
-from app.services.split_utils import resolve_signed_split_amount
 
 TRANSFER_CATEGORIES = ("transfers", "transfer")
 DEFAULT_WEEKLY_BURN = 1000.0
@@ -290,7 +289,7 @@ def expand_expense_lines_by_receipt(tx: Transaction) -> list[ExpandedReceiptLine
     if splits:
         split_result: list[ExpandedReceiptLine] = []
         for s in splits:
-            signed_amt = resolve_signed_split_amount(s, splits, float(tx.amount))
+            signed_amt = s.signed_amount()
             if signed_amt >= 0:
                 continue
             raw_cat = (s.category or tx_cat).strip() or tx_cat

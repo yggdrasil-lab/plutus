@@ -35,7 +35,6 @@ from app.services.recurrence_service import (
     is_recurrence_excluded_from_period,
 )
 from app.services.rules_engine import normalize_tags, parse_rule_tags
-from app.services.split_utils import resolve_signed_split_amount
 from app.services.statement_parser import generate_transaction_hash
 from app.services.transfer_service import reconcile_transfers
 
@@ -102,6 +101,146 @@ def _resolve_unlinked_fx_rate(db: Session, leg: Transaction) -> Optional[float]:
     return None
 
 
+def _category_matches_target(
+    cat: str,
+    target_cat: Optional[str],
+    include_subclasses: bool,
+    parent_map: Optional[dict[str, str]],
+) -> bool:
+    if not target_cat:
+        return True
+    effective_lower = (
+        get_root_category(cat, parent_map).lower()
+        if include_subclasses
+        else cat.lower()
+    )
+    return effective_lower == target_cat
+
+
+def _resolve_matched_category(
+    tx: Transaction,
+    matched_cats: set[str],
+    category: Optional[str],
+    target_cat: Optional[str],
+    include_subclasses: bool,
+) -> str:
+    if target_cat and include_subclasses:
+        return category.strip() if category else (tx.category or "General")
+    if len(matched_cats) == 1:
+        return next(iter(matched_cats))
+    return tx.category or "General"
+
+
+def _match_manual_splits(
+    tx: Transaction,
+    splits: list[TransactionSplit],
+    *,
+    target_cat: Optional[str],
+    target_tag: Optional[str],
+    include_subclasses: bool,
+    parent_map: Optional[dict[str, str]],
+) -> list[tuple[TransactionSplit, str, list[str]]]:
+    parent_tags = parse_rule_tags(tx.tags)
+    matched: list[tuple[TransactionSplit, str, list[str]]] = []
+    for split in splits:
+        s_cat = (split.category or tx.category or "General").strip() or "General"
+        s_tags = normalize_tags([*parent_tags, *parse_rule_tags(split.tags)])
+        if target_tag and target_tag not in s_tags:
+            continue
+        if not _category_matches_target(s_cat, target_cat, include_subclasses, parent_map):
+            continue
+        matched.append((split, s_cat, s_tags))
+    return matched
+
+
+def _filter_transaction_by_manual_splits(
+    tx: Transaction,
+    splits: list[TransactionSplit],
+    *,
+    category: Optional[str],
+    target_cat: Optional[str],
+    target_tag: Optional[str],
+    include_subclasses: bool,
+    parent_map: Optional[dict[str, str]],
+) -> Optional[TransactionRead]:
+    matched_splits = _match_manual_splits(
+        tx,
+        splits,
+        target_cat=target_cat,
+        target_tag=target_tag,
+        include_subclasses=include_subclasses,
+        parent_map=parent_map,
+    )
+    if not matched_splits:
+        return None
+    tx_cat_lower = (tx.category or "General").strip().lower()
+    matched_orig = round(sum(s.signed_amount() for s, _, _ in matched_splits), 2)
+    total_orig = round(sum(s.signed_amount() for s in splits), 2)
+    matched_cats = {s_cat for _, s_cat, _ in matched_splits}
+    matched_cat = _resolve_matched_category(tx, matched_cats, category, target_cat, include_subclasses)
+    merged_tags = normalize_tags(t for _, _, s_tags in matched_splits for t in s_tags)
+    is_partial = len(matched_splits) < len(splits) or abs(matched_orig - total_orig) > 0.01
+    if is_partial or (target_cat and matched_cat.lower() != tx_cat_lower):
+        split_notes = ", ".join(s.notes for s, _, _ in matched_splits if s.notes)
+        fallback = f"Split of {tx.currency} {abs(float(tx.amount)):.2f}" if is_partial else tx.notes
+        return TransactionRead.model_validate(tx).model_copy(
+            update={
+                "amount": matched_orig,
+                "category": matched_cat,
+                "tags": merged_tags,
+                "is_split": True,
+                "notes": split_notes or fallback,
+            }
+        )
+    return TransactionRead.model_validate(tx).model_copy(
+        update={"tags": merged_tags or parse_rule_tags(tx.tags), "is_split": len(splits) >= 2}
+    )
+
+
+def _filter_transaction_by_receipt_lines(
+    tx: Transaction,
+    *,
+    category: Optional[str],
+    target_cat: Optional[str],
+    target_tag: Optional[str],
+    include_subclasses: bool,
+    parent_map: Optional[dict[str, str]],
+) -> Optional[TransactionRead]:
+    tx_cat_lower = (tx.category or "General").strip().lower()
+    lines = expand_expense_lines_by_receipt(tx)
+    matched_lines = [
+        line
+        for line in lines
+        if (not target_tag or target_tag in line.effective_tags)
+        and _category_matches_target(line.category, target_cat, include_subclasses, parent_map)
+    ]
+    if not matched_lines:
+        return None
+    matched_nzd = round(sum(line.amount_nzd for line in matched_lines), 2)
+    total_tx_nzd = round(sum(line.amount_nzd for line in lines), 2)
+    matched_cats = {line.category for line in matched_lines}
+    matched_cat = _resolve_matched_category(tx, matched_cats, category, target_cat, include_subclasses)
+    merged_tags = normalize_tags(t for line in matched_lines for t in line.effective_tags)
+    is_partial = len(matched_lines) < len(lines) or abs(matched_nzd - total_tx_nzd) > 0.01
+    if is_partial or (target_cat and matched_cat.lower() != tx_cat_lower):
+        fx_unit = to_nzd_amount(1.0, tx.currency, tx.exchange_rate)
+        split_orig = round(matched_nzd / fx_unit, 2) if fx_unit > 0 else matched_nzd
+        names = ", ".join(line.item_name for line in matched_lines if line.item_name)
+        notes = f"Receipt split ({names}) of {tx.currency} {abs(float(tx.amount)):.2f}" if names else tx.notes
+        return TransactionRead.model_validate(tx).model_copy(
+            update={
+                "amount": -abs(split_orig),
+                "category": matched_cat,
+                "tags": merged_tags,
+                "is_receipt_split": True,
+                "notes": notes,
+            }
+        )
+    return TransactionRead.model_validate(tx).model_copy(
+        update={"tags": merged_tags or parse_rule_tags(tx.tags)}
+    )
+
+
 def _matches_receipt_transaction_filter(
     tx: Transaction,
     *,
@@ -111,84 +250,19 @@ def _matches_receipt_transaction_filter(
     include_subclasses: bool,
     parent_map: Optional[dict[str, str]] = None,
 ) -> Optional[TransactionRead]:
-    """Filter a transaction by category and/or tag, expanding manual splits or receipt items.
-
-    Manual transaction splits take precedence over receipt items and apply to both
-    outflows and inflows. Matched lines inherit tags from their parent transaction
-    alongside their own tags. Returns a full or sliced TransactionRead, or None.
-    """
-    tx_cat_lower = (tx.category or "General").strip().lower()
-    splits = getattr(tx, "splits", None) or []
+    """Filter a transaction by category and/or tag, expanding manual splits or receipt items."""
+    splits = list(getattr(tx, "splits", None) or [])
     if splits:
-        parent_tags = parse_rule_tags(tx.tags)
-        matched_splits: list[tuple[TransactionSplit, str, list[str]]] = []
-        for split in splits:
-            s_cat = (split.category or tx.category or "General").strip() or "General"
-            s_tags = normalize_tags([*parent_tags, *parse_rule_tags(split.tags)])
-            if target_tag and target_tag not in s_tags:
-                continue
-            if target_cat:
-                effective_lower = (
-                    get_root_category(s_cat, parent_map).lower()
-                    if include_subclasses
-                    else s_cat.lower()
-                )
-                if effective_lower != target_cat:
-                    continue
-            matched_splits.append((split, s_cat, s_tags))
-
-        if not matched_splits:
-            return None
-
-        matched_orig = round(
-            sum(
-                resolve_signed_split_amount(s, splits, float(tx.amount))
-                for s, _, _ in matched_splits
-            ),
-            2,
+        return _filter_transaction_by_manual_splits(
+            tx,
+            splits,
+            category=category,
+            target_cat=target_cat,
+            target_tag=target_tag,
+            include_subclasses=include_subclasses,
+            parent_map=parent_map,
         )
-        total_orig = round(
-            sum(resolve_signed_split_amount(s, splits, float(tx.amount)) for s in splits),
-            2,
-        )
-        matched_cats = {s_cat for _, s_cat, _ in matched_splits}
-        if target_cat and include_subclasses:
-            matched_cat = category.strip() if category else (tx.category or "General")
-        elif len(matched_cats) == 1:
-            matched_cat = next(iter(matched_cats))
-        else:
-            matched_cat = tx.category or "General"
-
-        merged_tags = normalize_tags(t for _, _, s_tags in matched_splits for t in s_tags)
-        is_partial = len(matched_splits) < len(splits) or abs(matched_orig - total_orig) > 0.01
-        if is_partial or (target_cat and matched_cat.lower() != tx_cat_lower):
-            split_notes = ", ".join(s.notes for s, _, _ in matched_splits if s.notes)
-            resolved_notes = (
-                split_notes
-                if split_notes
-                else (
-                    f"Split of {tx.currency} {abs(float(tx.amount)):.2f}"
-                    if is_partial
-                    else tx.notes
-                )
-            )
-            return TransactionRead.model_validate(tx).model_copy(
-                update={
-                    "amount": matched_orig,
-                    "category": matched_cat,
-                    "tags": merged_tags,
-                    "is_split": True,
-                    "notes": resolved_notes,
-                }
-            )
-
-        return TransactionRead.model_validate(tx).model_copy(
-            update={
-                "tags": merged_tags or parent_tags,
-                "is_split": len(splits) >= 2,
-            }
-        )
-
+    tx_cat_lower = (tx.category or "General").strip().lower()
     is_expandable = (
         float(tx.amount) < 0
         and tx.receipt is not None
@@ -198,66 +272,16 @@ def _matches_receipt_transaction_filter(
     if not is_expandable:
         if target_tag and target_tag not in parse_rule_tags(tx.tags):
             return None
-        if target_cat:
-            effective_lower = (
-                get_root_category(tx.category or "General", parent_map).lower()
-                if include_subclasses
-                else tx_cat_lower
-            )
-            if effective_lower != target_cat:
-                return None
+        if not _category_matches_target(tx.category or "General", target_cat, include_subclasses, parent_map):
+            return None
         return TransactionRead.model_validate(tx)
-
-    lines = expand_expense_lines_by_receipt(tx)
-    matched_lines = [
-        line
-        for line in lines
-        if (not target_tag or target_tag in line.effective_tags)
-        and (
-            not target_cat
-            or (
-                get_root_category(line.category, parent_map).lower()
-                if include_subclasses
-                else line.category.lower()
-            )
-            == target_cat
-        )
-    ]
-    if not matched_lines:
-        return None
-
-    matched_nzd = round(sum(line.amount_nzd for line in matched_lines), 2)
-    total_tx_nzd = round(sum(line.amount_nzd for line in lines), 2)
-    matched_cats = {line.category for line in matched_lines}
-    if target_cat and include_subclasses:
-        matched_cat = category.strip() if category else (tx.category or "General")
-    elif len(matched_cats) == 1:
-        matched_cat = next(iter(matched_cats))
-    else:
-        matched_cat = tx.category or "General"
-
-    merged_tags = normalize_tags(t for line in matched_lines for t in line.effective_tags)
-    is_partial = len(matched_lines) < len(lines) or abs(matched_nzd - total_tx_nzd) > 0.01
-    if is_partial or (target_cat and matched_cat.lower() != tx_cat_lower):
-        fx_unit = to_nzd_amount(1.0, tx.currency, tx.exchange_rate)
-        split_orig = round(matched_nzd / fx_unit, 2) if fx_unit > 0 else matched_nzd
-        item_names = ", ".join(line.item_name for line in matched_lines if line.item_name)
-        return TransactionRead.model_validate(tx).model_copy(
-            update={
-                "amount": -abs(split_orig),
-                "category": matched_cat,
-                "tags": merged_tags,
-                "is_receipt_split": True,
-                "notes": (
-                    f"Receipt split ({item_names}) of {tx.currency} {abs(float(tx.amount)):.2f}"
-                    if item_names
-                    else tx.notes
-                ),
-            }
-        )
-
-    return TransactionRead.model_validate(tx).model_copy(
-        update={"tags": merged_tags or parse_rule_tags(tx.tags)}
+    return _filter_transaction_by_receipt_lines(
+        tx,
+        category=category,
+        target_cat=target_cat,
+        target_tag=target_tag,
+        include_subclasses=include_subclasses,
+        parent_map=parent_map,
     )
 
 

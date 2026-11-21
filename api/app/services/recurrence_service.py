@@ -8,7 +8,6 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.models import Transaction, TransactionSplit
 from app.services.fx_service import to_nzd_amount
-from app.services.split_utils import resolve_signed_split_amount
 
 RECURRENCE_WEEKLY_FACTOR: dict[str, float] = {
     "weekly": 1.0,
@@ -100,7 +99,7 @@ def get_active_recurring_commitments(
         if splits:
             outflow_amounts: list[float] = []
             for s in splits:
-                signed_amt = resolve_signed_split_amount(s, splits, float(tx.amount))
+                signed_amt = s.signed_amount()
                 if signed_amt >= 0:
                     continue
                 if (s.category or "").strip().lower() in ("transfers", "transfer"):
