@@ -5,7 +5,7 @@ from datetime import date, datetime, timedelta
 import json
 import logging
 import re
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 import urllib.request
 
 from sqlalchemy import select
@@ -467,6 +467,38 @@ def parse_dbs_alert_text(
     return parse_dbs_alert_details(subject, text, received_at=received_at).normalized
 
 
+_DBS_PRODUCT_MATCHERS: tuple[tuple[tuple[str, ...], Callable[[Account], bool]], ...] = (
+    (("cashline",), lambda a: "cashline" in a.name.lower()),
+    (
+        ("live fresh", "visa", "credit card", "card ending"),
+        lambda a: a.account_type == "credit_card"
+        or "live fresh" in a.name.lower()
+        or "card" in a.name.lower(),
+    ),
+    (("multiplier",), lambda a: "multiplier" in a.name.lower()),
+    (("savings",), lambda a: "savings" in a.name.lower()),
+)
+
+
+def _load_dbs_account_candidates(db: Session, currency: str) -> tuple[list[Account], list[Account]]:
+    """Return active currency-matched DBS accounts and active accounts with last-4 suffixes."""
+    active_dbs = list(
+        db.scalars(
+            select(Account)
+            .where(Account.institution.ilike("%DBS%"), Account.currency == currency, Account.is_active == True)
+            .order_by(Account.id.asc())
+        ).all()
+    )
+    last4_accounts = list(
+        db.scalars(
+            select(Account)
+            .where(Account.account_number_last4.isnot(None), Account.is_active == True)
+            .order_by(Account.id.asc())
+        ).all()
+    )
+    return active_dbs, last4_accounts
+
+
 def _match_dbs_account_in_text(
     db: Session,
     search_text: str,
@@ -479,46 +511,52 @@ def _match_dbs_account_in_text(
     """Match a DBS account inside a single text scope via map -> last4 -> product keywords."""
     if not search_text:
         return None
-
     for suffix, acc_id in dbs_map.items():
         if _text_matches_suffix(search_text, suffix, strict_marker=strict_marker):
             mapped_acc = db.get(Account, acc_id)
             if mapped_acc is not None and mapped_acc.is_active:
                 return mapped_acc
-
     for acc in all_last4_accounts:
         parts = [p.strip() for p in str(acc.account_number_last4 or "").split(",") if p.strip()]
         if any(_text_matches_suffix(search_text, part, strict_marker=strict_marker) for part in parts):
             return acc
-
     lowered = search_text.lower()
-    if "cashline" in lowered:
-        match = next((a for a in active_dbs_accounts if "cashline" in a.name.lower()), None)
-        if match is not None:
-            return match
-    if any(kw in lowered for kw in ("live fresh", "visa", "credit card", "card ending")):
-        match = next(
-            (
-                a
-                for a in active_dbs_accounts
-                if a.account_type == "credit_card"
-                or "live fresh" in a.name.lower()
-                or "card" in a.name.lower()
-            ),
-            None,
-        )
-        if match is not None:
-            return match
-    if "multiplier" in lowered:
-        match = next((a for a in active_dbs_accounts if "multiplier" in a.name.lower()), None)
-        if match is not None:
-            return match
-    if "savings" in lowered:
-        match = next((a for a in active_dbs_accounts if "savings" in a.name.lower()), None)
-        if match is not None:
-            return match
-
+    for keywords, predicate in _DBS_PRODUCT_MATCHERS:
+        if any(kw in lowered for kw in keywords):
+            match = next((a for a in active_dbs_accounts if predicate(a)), None)
+            if match is not None:
+                return match
     return None
+
+
+def _fallback_dbs_account(
+    db: Session,
+    *,
+    currency: str,
+    active_dbs_accounts: list[Account],
+    explicit_account_name: Optional[str],
+) -> Account:
+    """Return default DBS savings/first active account or create external dbs_email account."""
+    default_savings = next(
+        (a for a in active_dbs_accounts if a.account_type != "credit_card" and "cashline" not in a.name.lower()),
+        None,
+    )
+    if default_savings is not None:
+        return default_savings
+    if active_dbs_accounts:
+        return active_dbs_accounts[0]
+    return get_or_create_external_account(
+        db,
+        ExternalAccountSpec(
+            provider="dbs_email",
+            external_id=f"dbs-{currency.lower()}",
+            name=explicit_account_name or f"DBS Singapore ({currency})",
+            institution="DBS",
+            account_type="checking",
+            tier="cash",
+            currency=currency,
+        ),
+    )
 
 
 def resolve_dbs_account(
@@ -532,73 +570,25 @@ def resolve_dbs_account(
     """Resolve target DBS account with precedence: explicit name -> account_hint -> combined_text -> default."""
     if explicit_account_name:
         explicit = db.scalar(
-            select(Account).where(
-                Account.name.ilike(f"%{explicit_account_name}%"),
-                Account.is_active == True,
-            )
+            select(Account).where(Account.name.ilike(f"%{explicit_account_name}%"), Account.is_active == True)
         )
         if explicit is not None:
             return explicit
-
     dbs_map = settings.resolved_dbs_account_map()
-    active_dbs_accounts = list(
-        db.scalars(
-            select(Account)
-            .where(
-                Account.institution.ilike("%DBS%"),
-                Account.currency == currency,
-                Account.is_active == True,
-            )
-            .order_by(Account.id.asc())
-        ).all()
-    )
-    all_last4_accounts = list(
-        db.scalars(
-            select(Account)
-            .where(
-                Account.account_number_last4.isnot(None),
-                Account.is_active == True,
-            )
-            .order_by(Account.id.asc())
-        ).all()
-    )
-
+    active_dbs, last4_accounts = _load_dbs_account_candidates(db, currency)
     for search_text, strict_flag in ((account_hint, False), (combined_text, True)):
         matched = _match_dbs_account_in_text(
             db,
             search_text,
             strict_marker=strict_flag,
             dbs_map=dbs_map,
-            all_last4_accounts=all_last4_accounts,
-            active_dbs_accounts=active_dbs_accounts,
+            all_last4_accounts=last4_accounts,
+            active_dbs_accounts=active_dbs,
         )
         if matched is not None:
             return matched
-
-    default_savings = next(
-        (
-            a
-            for a in active_dbs_accounts
-            if a.account_type != "credit_card" and "cashline" not in a.name.lower()
-        ),
-        None,
-    )
-    if default_savings is not None:
-        return default_savings
-    if active_dbs_accounts:
-        return active_dbs_accounts[0]
-
-    return get_or_create_external_account(
-        db,
-        ExternalAccountSpec(
-            provider="dbs_email",
-            external_id=f"dbs-{currency.lower()}",
-            name=explicit_account_name or f"DBS Singapore ({currency})",
-            institution="DBS",
-            account_type="checking",
-            tier="cash",
-            currency=currency,
-        ),
+    return _fallback_dbs_account(
+        db, currency=currency, active_dbs_accounts=active_dbs, explicit_account_name=explicit_account_name
     )
 
 

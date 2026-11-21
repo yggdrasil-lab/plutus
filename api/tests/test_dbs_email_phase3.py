@@ -385,12 +385,12 @@ class TestDbsEmailPhase3(unittest.TestCase):
 
     def test_text_matches_suffix_matrix_and_no_filler_word_capture(self):
         positive_cases = [
-            ("DBS Multiplier Account (A/C ending 0912)", "0912"),
-            ("CashLine A/C ending 9188", "9188"),
-            ("Raymund Tienzo magla A/C ending 5540", "5540"),
-            ("Your DBS/ POSB account ending 0912", "0912"),
-            ("DBS CASHLINE (Ref ending 9188)", "9188"),
-            ("Account 091-2", "0912"),
+            ("DBS Multiplier Account (A/C ending 1001)", "1001"),
+            ("CashLine A/C ending 2002", "2002"),
+            ("Jordan Lee A/C ending 4004", "4004"),
+            ("Your DBS/ POSB account ending 1001", "1001"),
+            ("DBS CASHLINE (Ref ending 2002)", "2002"),
+            ("Account 100-1", "1001"),
         ]
         for text, suffix in positive_cases:
             with self.subTest(text=text, suffix=suffix):
@@ -399,28 +399,28 @@ class TestDbsEmailPhase3(unittest.TestCase):
 
         # Negative: Transaction Ref digits must not match in strict_marker=True (or embedded in longer ref)
         self.assertFalse(
-            _text_matches_suffix("Transaction Ref: 12340912", "0912", strict_marker=True)
+            _text_matches_suffix("Transaction Ref: 99881001", "1001", strict_marker=True)
         )
         self.assertFalse(
-            _text_matches_suffix("Transaction Ref: 12340912", "0912", strict_marker=False)
+            _text_matches_suffix("Transaction Ref: 99881001", "1001", strict_marker=False)
         )
 
         # Negative: never capture or match filler word "ending"
         self.assertEqual(
-            EXPLICIT_SUFFIX_RE.findall("DBS Multiplier Account (A/C ending 0912)"),
-            ["0912"],
+            EXPLICIT_SUFFIX_RE.findall("DBS Multiplier Account (A/C ending 1001)"),
+            ["1001"],
         )
         self.assertIsNone(EXPLICIT_SUFFIX_RE.search("DBS Multiplier Account (A/C ending)"))
         self.assertFalse(
             _text_matches_suffix(
-                "DBS Multiplier Account (A/C ending 0912)", "ending", strict_marker=True
+                "DBS Multiplier Account (A/C ending 1001)", "ending", strict_marker=True
             )
         )
         self.assertFalse(
-            _text_matches_suffix("DBS Multiplier Account (A/C ending)", "0912", strict_marker=False)
+            _text_matches_suffix("DBS Multiplier Account (A/C ending)", "1001", strict_marker=False)
         )
 
-    def test_real_email_3_multiplier_to_cashline_dedups_tx122_without_misroute(self):
+    def test_email_3_multiplier_to_cashline_dedups_generic_row_without_misroute(self):
         self.acc_savings.account_number_last4 = None
         self.acc_cashline.account_number_last4 = None
         self.acc_card.account_number_last4 = None
@@ -428,14 +428,14 @@ class TestDbsEmailPhase3(unittest.TestCase):
 
         settings.dbs_account_map = json.dumps(
             {
-                "0912": self.acc_savings.id,
-                "5673": self.acc_savings.id,
-                "9188": self.acc_cashline.id,
+                "1001": self.acc_savings.id,
+                "1002": self.acc_savings.id,
+                "2002": self.acc_cashline.id,
             }
         )
-        settings.own_account_suffixes = "0912,5673,9188,5540"
+        settings.own_account_suffixes = "1001,1002,2002,4004"
 
-        existing_tx122 = Transaction(
+        existing_tx = Transaction(
             transaction_date=date(2026, 10, 29),
             account_id=self.acc_savings.id,
             amount=-117.78,
@@ -443,24 +443,24 @@ class TestDbsEmailPhase3(unittest.TestCase):
             merchant="Advice",
             category="Debt & Loans",
             raw_description="Advice",
-            raw_hash="pdf-multiplier-tx122",
+            raw_hash="pdf-multiplier-advice-1",
             notes=None,
         )
-        self.db.add(existing_tx122)
+        self.db.add(existing_tx)
         self.db.commit()
-        self.db.refresh(existing_tx122)
+        self.db.refresh(existing_tx)
 
         email3_body = (
             "---------- Forwarded message ---------\n"
             "From: DBS digibank Alert <ibanking@dbs.com>\n"
             "Date: Wed, 28 Oct 2026 at 12:00\u202fAM\n"
             "Subject: DBS digibank Alert\n"
-            "To: <raymund@example.com>\n\n"
-            "*Transaction Ref: *17930989610271358514\n"
+            "To: <alex@example.com>\n\n"
+            "*Transaction Ref: *DBSREF900100200300\n"
             "*Date & Time: *27 Oct 19:02 (SGT)\n"
             "*Amount: *SGD 117.78\n"
-            "*From: *DBS Multiplier Account (A/C ending 0912)\n"
-            "*To: *DBS CASHLINE (Ref ending 9188)\n"
+            "*From: *DBS Multiplier Account (A/C ending 1001)\n"
+            "*To: *DBS CASHLINE (Ref ending 2002)\n"
         )
 
         with patch(
@@ -471,7 +471,7 @@ class TestDbsEmailPhase3(unittest.TestCase):
                 "/integrations/email",
                 json={
                     "email_id": 3,
-                    "message_id": "<live-email-3@example.com>",
+                    "message_id": "<synthetic-email-3@example.com>",
                     "route_target": "plutus_dbs_alert",
                     "subject": "Fwd: DBS digibank Alert",
                     "received_at": "2026-10-27T11:00:00Z",
@@ -481,7 +481,7 @@ class TestDbsEmailPhase3(unittest.TestCase):
 
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
-        self.assertEqual(body["transaction_id"], existing_tx122.id)
+        self.assertEqual(body["transaction_id"], existing_tx.id)
 
         self.db.expire_all()
         savings_txs = self.db.scalars(
@@ -494,9 +494,9 @@ class TestDbsEmailPhase3(unittest.TestCase):
         self.assertEqual(len(cashline_txs), 0)
 
         enriched = savings_txs[0]
-        self.assertEqual(enriched.id, existing_tx122.id)
+        self.assertEqual(enriched.id, existing_tx.id)
         self.assertEqual(enriched.account_id, self.acc_savings.id)
-        self.assertEqual(enriched.notes, "dbs:17930989610271358514")
+        self.assertEqual(enriched.notes, "dbs:DBSREF900100200300")
 
     def test_account_hint_keyword_precedence_over_combined_text_suffix(self):
         self.acc_savings.account_number_last4 = None
@@ -506,8 +506,8 @@ class TestDbsEmailPhase3(unittest.TestCase):
 
         settings.dbs_account_map = json.dumps(
             {
-                "0912": self.acc_savings.id,
-                "9188": self.acc_cashline.id,
+                "1001": self.acc_savings.id,
+                "2002": self.acc_cashline.id,
             }
         )
 
@@ -517,7 +517,7 @@ class TestDbsEmailPhase3(unittest.TestCase):
             account_hint="DBS Multiplier Account",
             combined_text=(
                 "From: DBS Multiplier Account\n"
-                "To: DBS CASHLINE (Ref ending 9188)\n"
+                "To: DBS CASHLINE (Ref ending 2002)\n"
                 "Amount: SGD 117.78"
             ),
         )
@@ -536,7 +536,7 @@ class TestDbsEmailPhase3(unittest.TestCase):
                         "Date & Time: 27 Oct 19:02 (SGT)\n"
                         "Amount: SGD 117.78\n"
                         "From: DBS Multiplier Account\n"
-                        "To: DBS CASHLINE (Ref ending 9188)\n"
+                        "To: DBS CASHLINE (Ref ending 2002)\n"
                     ),
                 ),
                 received_at=datetime(2026, 10, 27, 11, 5, tzinfo=timezone.utc),
@@ -545,7 +545,7 @@ class TestDbsEmailPhase3(unittest.TestCase):
         self.assertIsNotNone(result.transaction)
         self.assertEqual(result.transaction.account_id, self.acc_savings.id)
 
-    def test_real_email_4_paynow_credit_parses_sgt_and_enriches_tx120_preserving_link(self):
+    def test_email_4_paynow_credit_parses_sgt_and_enriches_preserving_link(self):
         self.acc_savings.account_number_last4 = None
         self.acc_cashline.account_number_last4 = None
         self.acc_card.account_number_last4 = None
@@ -553,12 +553,12 @@ class TestDbsEmailPhase3(unittest.TestCase):
 
         settings.dbs_account_map = json.dumps(
             {
-                "0912": self.acc_savings.id,
-                "5673": self.acc_savings.id,
-                "9188": self.acc_cashline.id,
+                "1001": self.acc_savings.id,
+                "1002": self.acc_savings.id,
+                "2002": self.acc_cashline.id,
             }
         )
-        settings.own_account_suffixes = "0912,5673,9188,5540"
+        settings.own_account_suffixes = "1001,1002,2002,4004"
 
         wise_partner = Transaction(
             transaction_date=date(2026, 10, 27),
@@ -567,14 +567,14 @@ class TestDbsEmailPhase3(unittest.TestCase):
             currency="SGD",
             merchant="Wise SGD Outflow",
             category="Transfers",
-            raw_hash="wise-partner-98",
-            notes="wise:tx-98",
+            raw_hash="wise-partner-synthetic",
+            notes="wise:tx-synthetic",
         )
         self.db.add(wise_partner)
         self.db.commit()
         self.db.refresh(wise_partner)
 
-        existing_tx120 = Transaction(
+        existing_tx = Transaction(
             transaction_date=date(2026, 10, 28),
             account_id=self.acc_savings.id,
             amount=651.37,
@@ -582,14 +582,14 @@ class TestDbsEmailPhase3(unittest.TestCase):
             merchant="Advice FAST Payment / Receipt",
             category="Transfers",
             raw_description="Advice FAST Payment / Receipt",
-            raw_hash="pdf-multiplier-tx120",
+            raw_hash="pdf-multiplier-fast-1",
             notes=None,
             linked_transaction_id=wise_partner.id,
         )
-        self.db.add(existing_tx120)
+        self.db.add(existing_tx)
         self.db.commit()
-        self.db.refresh(existing_tx120)
-        wise_partner.linked_transaction_id = existing_tx120.id
+        self.db.refresh(existing_tx)
+        wise_partner.linked_transaction_id = existing_tx.id
         self.db.commit()
 
         email4_body = (
@@ -597,11 +597,11 @@ class TestDbsEmailPhase3(unittest.TestCase):
             "From: DBS digibank Alert <ibanking@dbs.com>\n"
             "Date: Wed, 28 Oct 2026 at 12:00\u202fAM\n"
             "Subject: PayNow Transfer Alert\n"
-            "To: <raymund@example.com>\n\n"
-            "Transaction Ref: TW00000000000046838080C120630614240\n"
+            "To: <alex@example.com>\n\n"
+            "Transaction Ref: TW00000000000011223344C120630614240\n"
             "You have received SGD 651.37 via PayNow on 27 Oct 2026 19:00 SGT.\n"
-            "* From:*\u202fRaymund Tienzo maglalang\n"
-            "*To:*\u202fYour DBS/ POSB account ending 0912\n"
+            "* From:*\u202fJordan Lee\n"
+            "*To:*\u202fYour DBS/ POSB account ending 1001\n"
         )
 
         parsed = parse_dbs_alert_details(
@@ -613,8 +613,8 @@ class TestDbsEmailPhase3(unittest.TestCase):
         self.assertEqual(parsed.normalized.amount, 651.37)
         self.assertEqual(parsed.normalized.currency, "SGD")
         self.assertEqual(parsed.normalized.transaction_date, date(2026, 10, 27))
-        self.assertEqual(parsed.account_hint, "Your DBS/ POSB account ending 0912")
-        self.assertEqual(parsed.normalized.notes, "dbs:TW00000000000046838080C120630614240")
+        self.assertEqual(parsed.account_hint, "Your DBS/ POSB account ending 1001")
+        self.assertEqual(parsed.normalized.notes, "dbs:TW00000000000011223344C120630614240")
 
         with patch(
             "app.services.ingestion_service.classify_transaction_jev_with_tags",
@@ -624,7 +624,7 @@ class TestDbsEmailPhase3(unittest.TestCase):
                 "/integrations/email",
                 json={
                     "email_id": 4,
-                    "message_id": "<live-email-4@example.com>",
+                    "message_id": "<synthetic-email-4@example.com>",
                     "route_target": "plutus_dbs_alert",
                     "subject": "Fwd: PayNow Transfer Alert",
                     "received_at": "2026-10-27T11:00:00Z",
@@ -633,7 +633,7 @@ class TestDbsEmailPhase3(unittest.TestCase):
             )
 
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.json()["transaction_id"], existing_tx120.id)
+        self.assertEqual(resp.json()["transaction_id"], existing_tx.id)
 
         self.db.expire_all()
         savings_txs = self.db.scalars(
@@ -641,13 +641,13 @@ class TestDbsEmailPhase3(unittest.TestCase):
         ).all()
         self.assertEqual(len(savings_txs), 1)
         enriched = savings_txs[0]
-        self.assertEqual(enriched.id, existing_tx120.id)
+        self.assertEqual(enriched.id, existing_tx.id)
         self.assertEqual(enriched.account_id, self.acc_savings.id)
         self.assertEqual(enriched.category, "Transfers")
         self.assertEqual(enriched.linked_transaction_id, wise_partner.id)
-        self.assertEqual(enriched.notes, "dbs:TW00000000000046838080C120630614240")
+        self.assertEqual(enriched.notes, "dbs:TW00000000000011223344C120630614240")
 
-    def test_real_email_2_cashline_to_own_suffix_5540_marks_transfers(self):
+    def test_email_2_cashline_to_own_suffix_marks_transfers(self):
         self.acc_savings.account_number_last4 = None
         self.acc_cashline.account_number_last4 = None
         self.acc_card.account_number_last4 = None
@@ -655,17 +655,17 @@ class TestDbsEmailPhase3(unittest.TestCase):
 
         settings.dbs_account_map = json.dumps(
             {
-                "0912": self.acc_savings.id,
-                "5673": self.acc_savings.id,
-                "9188": self.acc_cashline.id,
+                "1001": self.acc_savings.id,
+                "1002": self.acc_savings.id,
+                "2002": self.acc_cashline.id,
             }
         )
         with patch.dict(
             os.environ,
-            {"PLUTUS_OWN_ACCOUNT_SUFFIXES": "0912,5673,9188,5540"},
+            {"PLUTUS_OWN_ACCOUNT_SUFFIXES": "1001,1002,2002,4004"},
         ):
             env_settings = Settings()
-            self.assertIn("5540", env_settings.resolved_own_account_suffixes())
+            self.assertIn("4004", env_settings.resolved_own_account_suffixes())
             settings.own_account_suffixes = env_settings.own_account_suffixes
 
         email2_body = (
@@ -673,12 +673,12 @@ class TestDbsEmailPhase3(unittest.TestCase):
             "From: DBS digibank Alert <ibanking@dbs.com>\n"
             "Date: Fri, 6 Nov 2026 at 8:17\u202fPM\n"
             "Subject: DBS digibank Alert\n"
-            "To: <raymund@example.com>\n\n"
+            "To: <alex@example.com>\n\n"
             "Transaction Ref: FAST202611062000\n"
             "Date & Time: 06 Nov 15:17 (SGT)\n"
             "Amount: SGD2000.00\n"
-            "From: CashLine A/C ending 9188\n"
-            "To: Raymund Tienzo magla A/C ending 5540\n"
+            "From: CashLine A/C ending 2002\n"
+            "To: Alex Tan A/C ending 4004\n"
         )
 
         with patch(
@@ -689,7 +689,7 @@ class TestDbsEmailPhase3(unittest.TestCase):
                 "/integrations/email",
                 json={
                     "email_id": 2,
-                    "message_id": "<live-email-2@example.com>",
+                    "message_id": "<synthetic-email-2@example.com>",
                     "route_target": "plutus_dbs_alert",
                     "subject": "Fwd: DBS digibank Alert",
                     "received_at": "2026-11-06T07:17:00Z",
