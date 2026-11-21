@@ -27,7 +27,11 @@ from app.services.connectors.dbs_email import (
     parse_dbs_alert_details,
     resolve_dbs_account,
 )
-from app.services.email_utils import parse_forwarded_date, strip_invisible_unicode
+from app.services.email_utils import (
+    extract_and_strip_forwarded_header,
+    parse_forwarded_date,
+    strip_invisible_unicode,
+)
 from app.services.ingestion_service import NormalizedTx, ingest_normalized_transactions
 
 TEST_DB_URL = "sqlite:///:memory:"
@@ -723,6 +727,51 @@ class TestDbsEmailPhase3(unittest.TestCase):
             parse_forwarded_date("28 Oct 2026 at 12:00 AM"),
             datetime(2026, 10, 28, 0, 0),
         )
+
+    def test_nested_double_forwarded_gmail_strips_all_blocks_and_prefers_innermost_meta(self):
+        double_fwd_body = (
+            "---------- Forwarded message ---------\n"
+            "From: Jordan Taylor <jordan@example.com>\n"
+            "Date: Sat, 21 Nov 2026 at 10:00\u202fAM\n"
+            "Subject: Fwd: Your Synthetic Store Order\n"
+            "To: <archive@example.com>\n\n"
+            "---------- Forwarded message ---------\n"
+            "From: Synthetic Store <orders@store.example.com>\n"
+            "Date: Thu, 12 Nov 2026 at 3:15\u202fPM\n"
+            "Subject: Your Synthetic Store Order\n"
+            "To: <jordan@example.com>\n\n"
+            "Order #SYN-9001\n"
+            "Total: NZD 42.50\n"
+        )
+        subj, body, ref_dt = extract_and_strip_forwarded_header(
+            "Fwd: Fwd: Your Synthetic Store Order",
+            double_fwd_body,
+            datetime(2026, 11, 21, 1, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(subj, "Your Synthetic Store Order")
+        self.assertEqual(body, "Order #SYN-9001\nTotal: NZD 42.50")
+        self.assertNotIn("Forwarded message", body)
+        self.assertEqual(ref_dt.date(), date(2026, 11, 12))
+
+    def test_nested_forwarded_preserves_outer_meta_when_inner_lacks_it(self):
+        partial_inner = (
+            "---------- Forwarded message ---------\n"
+            "From: Alex Morgan <alex@example.com>\n"
+            "Date: Fri, 13 Nov 2026 at 9:30 AM\n"
+            "Subject: Fw: Receipt SYN-9002\n"
+            "To: <archive@example.com>\n\n"
+            "---------- Forwarded message ---------\n"
+            "From: Merchant Dispatch <dispatch@example.com>\n\n"
+            "Item: Widget A\n"
+        )
+        subj, body, ref_dt = extract_and_strip_forwarded_header(
+            "Fw: Fwd: Receipt SYN-9002",
+            partial_inner,
+            datetime(2026, 11, 21, 5, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(subj, "Receipt SYN-9002")
+        self.assertEqual(body, "Item: Widget A")
+        self.assertEqual(ref_dt.date(), date(2026, 11, 13))
 
 
 if __name__ == "__main__":
