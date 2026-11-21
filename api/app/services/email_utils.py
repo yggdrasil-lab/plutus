@@ -89,7 +89,7 @@ def html_to_plain_text(html_body: Optional[str]) -> str:
 
 def strip_invisible_unicode(text: str) -> str:
     """Remove invisible Unicode Cf format characters while preserving standard whitespace."""
-    cleaned = text.replace("\xa0", " ")
+    cleaned = text.replace("\xa0", " ").replace("\u202f", " ")
     cleaned = INVISIBLE_CHARS_RE.sub("", cleaned)
     return "".join(ch for ch in cleaned if unicodedata.category(ch) != "Cf")
 
@@ -102,7 +102,7 @@ def clean_email_text(raw: str) -> str:
 
 def parse_forwarded_date(raw_date: str) -> Optional[datetime]:
     """Parse RFC 5322 or Gmail UI forwarded Date header values."""
-    text = raw_date.strip()
+    text = strip_invisible_unicode(raw_date).strip()
     if not text:
         return None
     try:
@@ -116,6 +116,8 @@ def parse_forwarded_date(raw_date: str) -> Optional[datetime]:
         "%a, %b %d, %Y %I:%M %p",
         "%b %d, %Y %I:%M %p",
         "%a, %b %d, %Y, %I:%M %p",
+        "%a, %d %b %Y %I:%M %p",
+        "%d %b %Y %I:%M %p",
         "%a, %d %b %Y %H:%M",
         "%d %b %Y %H:%M",
         "%d %b %Y, %H:%M",
