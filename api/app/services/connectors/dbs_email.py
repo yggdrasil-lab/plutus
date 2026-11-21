@@ -71,8 +71,12 @@ STRUCTURED_FIELD_RE = re.compile(
 )
 ACCOUNT_NUMBER_TOKEN_RE = re.compile(r"\b[0-9Xx*]+(?:[-\s][0-9Xx*]+){1,4}\b")
 EXPLICIT_SUFFIX_RE = re.compile(
-    r"(?:ending(?:\s+(?:in|with))?|a/c(?:\s+no\.?)?|account(?:\s+no\.?)?|card(?:\s+no\.?)?|[*Xx]{2,})"
-    r"[:\s#-]*([A-Za-z0-9]{4,8})\b",
+    r"(?:"
+    r"(?:\b(?:a/c|account|card)\b(?:\s+(?:no\.?|number|ending(?:\s+(?:in|with))?))?)"
+    r"|(?:\bending(?:\s+(?:in|with))?\b)"
+    r"|(?:[*Xx]{2,})"
+    r")"
+    r"[:\s#-]*((?=[A-Za-z0-9]*\d)[A-Za-z0-9]{4,8})\b",
     re.IGNORECASE,
 )
 
@@ -212,8 +216,8 @@ def _text_matches_suffix(text: str, suffix: str, *, strict_marker: bool = False)
             return True
 
     if not strict_marker:
-        compact = re.sub(r"[\s-]+", "", lowered)
-        if re.search(rf"(?<![a-z0-9]){re.escape(clean_suffix)}(?![a-z0-9])", compact):
+        digit_compact = re.sub(r"(?<=\d)[\s-]+(?=\d)", "", lowered)
+        if re.search(rf"(?<![a-z0-9]){re.escape(clean_suffix)}(?![a-z0-9])", digit_compact):
             return True
     return False
 
@@ -463,6 +467,60 @@ def parse_dbs_alert_text(
     return parse_dbs_alert_details(subject, text, received_at=received_at).normalized
 
 
+def _match_dbs_account_in_text(
+    db: Session,
+    search_text: str,
+    *,
+    strict_marker: bool,
+    dbs_map: dict[str, int],
+    all_last4_accounts: list[Account],
+    active_dbs_accounts: list[Account],
+) -> Optional[Account]:
+    """Match a DBS account inside a single text scope via map -> last4 -> product keywords."""
+    if not search_text:
+        return None
+
+    for suffix, acc_id in dbs_map.items():
+        if _text_matches_suffix(search_text, suffix, strict_marker=strict_marker):
+            mapped_acc = db.get(Account, acc_id)
+            if mapped_acc is not None and mapped_acc.is_active:
+                return mapped_acc
+
+    for acc in all_last4_accounts:
+        parts = [p.strip() for p in str(acc.account_number_last4 or "").split(",") if p.strip()]
+        if any(_text_matches_suffix(search_text, part, strict_marker=strict_marker) for part in parts):
+            return acc
+
+    lowered = search_text.lower()
+    if "cashline" in lowered:
+        match = next((a for a in active_dbs_accounts if "cashline" in a.name.lower()), None)
+        if match is not None:
+            return match
+    if any(kw in lowered for kw in ("live fresh", "visa", "credit card", "card ending")):
+        match = next(
+            (
+                a
+                for a in active_dbs_accounts
+                if a.account_type == "credit_card"
+                or "live fresh" in a.name.lower()
+                or "card" in a.name.lower()
+            ),
+            None,
+        )
+        if match is not None:
+            return match
+    if "multiplier" in lowered:
+        match = next((a for a in active_dbs_accounts if "multiplier" in a.name.lower()), None)
+        if match is not None:
+            return match
+    if "savings" in lowered:
+        match = next((a for a in active_dbs_accounts if "savings" in a.name.lower()), None)
+        if match is not None:
+            return match
+
+    return None
+
+
 def resolve_dbs_account(
     db: Session,
     *,
@@ -471,7 +529,7 @@ def resolve_dbs_account(
     combined_text: str,
     explicit_account_name: Optional[str] = None,
 ) -> Account:
-    """Resolve target DBS account with precedence: explicit name -> map -> last4 -> keyword -> default."""
+    """Resolve target DBS account with precedence: explicit name -> account_hint -> combined_text -> default."""
     if explicit_account_name:
         explicit = db.scalar(
             select(Account).where(
@@ -483,16 +541,6 @@ def resolve_dbs_account(
             return explicit
 
     dbs_map = settings.resolved_dbs_account_map()
-    if dbs_map:
-        for search_text, strict_flag in ((account_hint, False), (combined_text, True)):
-            if not search_text:
-                continue
-            for suffix, acc_id in dbs_map.items():
-                if _text_matches_suffix(search_text, suffix, strict_marker=strict_flag):
-                    mapped_acc = db.get(Account, acc_id)
-                    if mapped_acc is not None and mapped_acc.is_active:
-                        return mapped_acc
-
     active_dbs_accounts = list(
         db.scalars(
             select(Account)
@@ -514,43 +562,18 @@ def resolve_dbs_account(
             .order_by(Account.id.asc())
         ).all()
     )
-    for search_text, strict_flag in ((account_hint, False), (combined_text, True)):
-        if not search_text:
-            continue
-        for acc in all_last4_accounts:
-            parts = [p.strip() for p in str(acc.account_number_last4 or "").split(",") if p.strip()]
-            if any(_text_matches_suffix(search_text, part, strict_marker=strict_flag) for part in parts):
-                return acc
 
-    for search_text in (account_hint, combined_text):
-        lowered = (search_text or "").lower()
-        if not lowered:
-            continue
-        if "cashline" in lowered:
-            match = next((a for a in active_dbs_accounts if "cashline" in a.name.lower()), None)
-            if match is not None:
-                return match
-        if any(kw in lowered for kw in ("live fresh", "visa", "credit card", "card ending")):
-            match = next(
-                (
-                    a
-                    for a in active_dbs_accounts
-                    if a.account_type == "credit_card"
-                    or "live fresh" in a.name.lower()
-                    or "card" in a.name.lower()
-                ),
-                None,
-            )
-            if match is not None:
-                return match
-        if "multiplier" in lowered:
-            match = next((a for a in active_dbs_accounts if "multiplier" in a.name.lower()), None)
-            if match is not None:
-                return match
-        if "savings" in lowered:
-            match = next((a for a in active_dbs_accounts if "savings" in a.name.lower()), None)
-            if match is not None:
-                return match
+    for search_text, strict_flag in ((account_hint, False), (combined_text, True)):
+        matched = _match_dbs_account_in_text(
+            db,
+            search_text,
+            strict_marker=strict_flag,
+            dbs_map=dbs_map,
+            all_last4_accounts=all_last4_accounts,
+            active_dbs_accounts=active_dbs_accounts,
+        )
+        if matched is not None:
+            return matched
 
     default_savings = next(
         (

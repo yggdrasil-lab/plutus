@@ -2,6 +2,7 @@
 
 from datetime import date, datetime, timezone
 import json
+import os
 from pathlib import Path
 import sys
 import unittest
@@ -14,10 +15,19 @@ from sqlalchemy.pool import StaticPool
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.config import settings
+from app.config import Settings, settings
 from app.db import Base, get_db
 from app.main import app
 from app.models import Account, IngestedEmail, Receipt, Transaction
+from app.schemas import DbsAlertPayload
+from app.services.connectors.dbs_email import (
+    EXPLICIT_SUFFIX_RE,
+    _text_matches_suffix,
+    ingest_dbs_alert,
+    parse_dbs_alert_details,
+    resolve_dbs_account,
+)
+from app.services.email_utils import parse_forwarded_date, strip_invisible_unicode
 from app.services.ingestion_service import NormalizedTx, ingest_normalized_transactions
 
 TEST_DB_URL = "sqlite:///:memory:"
@@ -372,6 +382,347 @@ class TestDbsEmailPhase3(unittest.TestCase):
         )
         self.assertIsNotNone(failed_row)
         self.assertEqual(failed_row.status, "failed")
+
+    def test_text_matches_suffix_matrix_and_no_filler_word_capture(self):
+        positive_cases = [
+            ("DBS Multiplier Account (A/C ending 0912)", "0912"),
+            ("CashLine A/C ending 9188", "9188"),
+            ("Raymund Tienzo magla A/C ending 5540", "5540"),
+            ("Your DBS/ POSB account ending 0912", "0912"),
+            ("DBS CASHLINE (Ref ending 9188)", "9188"),
+            ("Account 091-2", "0912"),
+        ]
+        for text, suffix in positive_cases:
+            with self.subTest(text=text, suffix=suffix):
+                self.assertTrue(_text_matches_suffix(text, suffix, strict_marker=False))
+                self.assertTrue(_text_matches_suffix(text, suffix, strict_marker=True))
+
+        # Negative: Transaction Ref digits must not match in strict_marker=True (or embedded in longer ref)
+        self.assertFalse(
+            _text_matches_suffix("Transaction Ref: 12340912", "0912", strict_marker=True)
+        )
+        self.assertFalse(
+            _text_matches_suffix("Transaction Ref: 12340912", "0912", strict_marker=False)
+        )
+
+        # Negative: never capture or match filler word "ending"
+        self.assertEqual(
+            EXPLICIT_SUFFIX_RE.findall("DBS Multiplier Account (A/C ending 0912)"),
+            ["0912"],
+        )
+        self.assertIsNone(EXPLICIT_SUFFIX_RE.search("DBS Multiplier Account (A/C ending)"))
+        self.assertFalse(
+            _text_matches_suffix(
+                "DBS Multiplier Account (A/C ending 0912)", "ending", strict_marker=True
+            )
+        )
+        self.assertFalse(
+            _text_matches_suffix("DBS Multiplier Account (A/C ending)", "0912", strict_marker=False)
+        )
+
+    def test_real_email_3_multiplier_to_cashline_dedups_tx122_without_misroute(self):
+        self.acc_savings.account_number_last4 = None
+        self.acc_cashline.account_number_last4 = None
+        self.acc_card.account_number_last4 = None
+        self.db.commit()
+
+        settings.dbs_account_map = json.dumps(
+            {
+                "0912": self.acc_savings.id,
+                "5673": self.acc_savings.id,
+                "9188": self.acc_cashline.id,
+            }
+        )
+        settings.own_account_suffixes = "0912,5673,9188,5540"
+
+        existing_tx122 = Transaction(
+            transaction_date=date(2026, 10, 29),
+            account_id=self.acc_savings.id,
+            amount=-117.78,
+            currency="SGD",
+            merchant="Advice",
+            category="Debt & Loans",
+            raw_description="Advice",
+            raw_hash="pdf-multiplier-tx122",
+            notes=None,
+        )
+        self.db.add(existing_tx122)
+        self.db.commit()
+        self.db.refresh(existing_tx122)
+
+        email3_body = (
+            "---------- Forwarded message ---------\n"
+            "From: DBS digibank Alert <ibanking@dbs.com>\n"
+            "Date: Wed, 28 Oct 2026 at 12:00\u202fAM\n"
+            "Subject: DBS digibank Alert\n"
+            "To: <raymund@example.com>\n\n"
+            "*Transaction Ref: *17930989610271358514\n"
+            "*Date & Time: *27 Oct 19:02 (SGT)\n"
+            "*Amount: *SGD 117.78\n"
+            "*From: *DBS Multiplier Account (A/C ending 0912)\n"
+            "*To: *DBS CASHLINE (Ref ending 9188)\n"
+        )
+
+        with patch(
+            "app.services.ingestion_service.classify_transaction_jev_with_tags",
+            return_value=("General", False, []),
+        ):
+            resp = self.client.post(
+                "/integrations/email",
+                json={
+                    "email_id": 3,
+                    "message_id": "<live-email-3@example.com>",
+                    "route_target": "plutus_dbs_alert",
+                    "subject": "Fwd: DBS digibank Alert",
+                    "received_at": "2026-10-27T11:00:00Z",
+                    "text_body": email3_body,
+                },
+            )
+
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["transaction_id"], existing_tx122.id)
+
+        self.db.expire_all()
+        savings_txs = self.db.scalars(
+            select(Transaction).where(Transaction.account_id == self.acc_savings.id)
+        ).all()
+        cashline_txs = self.db.scalars(
+            select(Transaction).where(Transaction.account_id == self.acc_cashline.id)
+        ).all()
+        self.assertEqual(len(savings_txs), 1)
+        self.assertEqual(len(cashline_txs), 0)
+
+        enriched = savings_txs[0]
+        self.assertEqual(enriched.id, existing_tx122.id)
+        self.assertEqual(enriched.account_id, self.acc_savings.id)
+        self.assertEqual(enriched.notes, "dbs:17930989610271358514")
+
+    def test_account_hint_keyword_precedence_over_combined_text_suffix(self):
+        self.acc_savings.account_number_last4 = None
+        self.acc_cashline.account_number_last4 = None
+        self.acc_card.account_number_last4 = None
+        self.db.commit()
+
+        settings.dbs_account_map = json.dumps(
+            {
+                "0912": self.acc_savings.id,
+                "9188": self.acc_cashline.id,
+            }
+        )
+
+        resolved = resolve_dbs_account(
+            self.db,
+            currency="SGD",
+            account_hint="DBS Multiplier Account",
+            combined_text=(
+                "From: DBS Multiplier Account\n"
+                "To: DBS CASHLINE (Ref ending 9188)\n"
+                "Amount: SGD 117.78"
+            ),
+        )
+        self.assertEqual(resolved.id, self.acc_savings.id)
+
+        with patch(
+            "app.services.ingestion_service.classify_transaction_jev_with_tags",
+            return_value=("General", False, []),
+        ):
+            result = ingest_dbs_alert(
+                self.db,
+                DbsAlertPayload(
+                    subject="DBS digibank Alert",
+                    text=(
+                        "Transaction Ref: 8877665544\n"
+                        "Date & Time: 27 Oct 19:02 (SGT)\n"
+                        "Amount: SGD 117.78\n"
+                        "From: DBS Multiplier Account\n"
+                        "To: DBS CASHLINE (Ref ending 9188)\n"
+                    ),
+                ),
+                received_at=datetime(2026, 10, 27, 11, 5, tzinfo=timezone.utc),
+            )
+        self.assertEqual(result.status, "created")
+        self.assertIsNotNone(result.transaction)
+        self.assertEqual(result.transaction.account_id, self.acc_savings.id)
+
+    def test_real_email_4_paynow_credit_parses_sgt_and_enriches_tx120_preserving_link(self):
+        self.acc_savings.account_number_last4 = None
+        self.acc_cashline.account_number_last4 = None
+        self.acc_card.account_number_last4 = None
+        self.db.commit()
+
+        settings.dbs_account_map = json.dumps(
+            {
+                "0912": self.acc_savings.id,
+                "5673": self.acc_savings.id,
+                "9188": self.acc_cashline.id,
+            }
+        )
+        settings.own_account_suffixes = "0912,5673,9188,5540"
+
+        wise_partner = Transaction(
+            transaction_date=date(2026, 10, 27),
+            account_id=self.acc_wise.id,
+            amount=-651.37,
+            currency="SGD",
+            merchant="Wise SGD Outflow",
+            category="Transfers",
+            raw_hash="wise-partner-98",
+            notes="wise:tx-98",
+        )
+        self.db.add(wise_partner)
+        self.db.commit()
+        self.db.refresh(wise_partner)
+
+        existing_tx120 = Transaction(
+            transaction_date=date(2026, 10, 28),
+            account_id=self.acc_savings.id,
+            amount=651.37,
+            currency="SGD",
+            merchant="Advice FAST Payment / Receipt",
+            category="Transfers",
+            raw_description="Advice FAST Payment / Receipt",
+            raw_hash="pdf-multiplier-tx120",
+            notes=None,
+            linked_transaction_id=wise_partner.id,
+        )
+        self.db.add(existing_tx120)
+        self.db.commit()
+        self.db.refresh(existing_tx120)
+        wise_partner.linked_transaction_id = existing_tx120.id
+        self.db.commit()
+
+        email4_body = (
+            "---------- Forwarded message ---------\n"
+            "From: DBS digibank Alert <ibanking@dbs.com>\n"
+            "Date: Wed, 28 Oct 2026 at 12:00\u202fAM\n"
+            "Subject: PayNow Transfer Alert\n"
+            "To: <raymund@example.com>\n\n"
+            "Transaction Ref: TW00000000000046838080C120630614240\n"
+            "You have received SGD 651.37 via PayNow on 27 Oct 2026 19:00 SGT.\n"
+            "* From:*\u202fRaymund Tienzo maglalang\n"
+            "*To:*\u202fYour DBS/ POSB account ending 0912\n"
+        )
+
+        parsed = parse_dbs_alert_details(
+            "Fwd: PayNow Transfer Alert",
+            email4_body,
+            received_at=datetime(2026, 10, 27, 11, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(parsed.direction, "credit")
+        self.assertEqual(parsed.normalized.amount, 651.37)
+        self.assertEqual(parsed.normalized.currency, "SGD")
+        self.assertEqual(parsed.normalized.transaction_date, date(2026, 10, 27))
+        self.assertEqual(parsed.account_hint, "Your DBS/ POSB account ending 0912")
+        self.assertEqual(parsed.normalized.notes, "dbs:TW00000000000046838080C120630614240")
+
+        with patch(
+            "app.services.ingestion_service.classify_transaction_jev_with_tags",
+            return_value=("Income", False, []),
+        ):
+            resp = self.client.post(
+                "/integrations/email",
+                json={
+                    "email_id": 4,
+                    "message_id": "<live-email-4@example.com>",
+                    "route_target": "plutus_dbs_alert",
+                    "subject": "Fwd: PayNow Transfer Alert",
+                    "received_at": "2026-10-27T11:00:00Z",
+                    "text_body": email4_body,
+                },
+            )
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["transaction_id"], existing_tx120.id)
+
+        self.db.expire_all()
+        savings_txs = self.db.scalars(
+            select(Transaction).where(Transaction.account_id == self.acc_savings.id)
+        ).all()
+        self.assertEqual(len(savings_txs), 1)
+        enriched = savings_txs[0]
+        self.assertEqual(enriched.id, existing_tx120.id)
+        self.assertEqual(enriched.account_id, self.acc_savings.id)
+        self.assertEqual(enriched.category, "Transfers")
+        self.assertEqual(enriched.linked_transaction_id, wise_partner.id)
+        self.assertEqual(enriched.notes, "dbs:TW00000000000046838080C120630614240")
+
+    def test_real_email_2_cashline_to_own_suffix_5540_marks_transfers(self):
+        self.acc_savings.account_number_last4 = None
+        self.acc_cashline.account_number_last4 = None
+        self.acc_card.account_number_last4 = None
+        self.db.commit()
+
+        settings.dbs_account_map = json.dumps(
+            {
+                "0912": self.acc_savings.id,
+                "5673": self.acc_savings.id,
+                "9188": self.acc_cashline.id,
+            }
+        )
+        with patch.dict(
+            os.environ,
+            {"PLUTUS_OWN_ACCOUNT_SUFFIXES": "0912,5673,9188,5540"},
+        ):
+            env_settings = Settings()
+            self.assertIn("5540", env_settings.resolved_own_account_suffixes())
+            settings.own_account_suffixes = env_settings.own_account_suffixes
+
+        email2_body = (
+            "---------- Forwarded message ---------\n"
+            "From: DBS digibank Alert <ibanking@dbs.com>\n"
+            "Date: Fri, 6 Nov 2026 at 8:17\u202fPM\n"
+            "Subject: DBS digibank Alert\n"
+            "To: <raymund@example.com>\n\n"
+            "Transaction Ref: FAST202611062000\n"
+            "Date & Time: 06 Nov 15:17 (SGT)\n"
+            "Amount: SGD2000.00\n"
+            "From: CashLine A/C ending 9188\n"
+            "To: Raymund Tienzo magla A/C ending 5540\n"
+        )
+
+        with patch(
+            "app.services.ingestion_service.classify_transaction_jev_with_tags",
+            return_value=("General", False, []),
+        ):
+            resp = self.client.post(
+                "/integrations/email",
+                json={
+                    "email_id": 2,
+                    "message_id": "<live-email-2@example.com>",
+                    "route_target": "plutus_dbs_alert",
+                    "subject": "Fwd: DBS digibank Alert",
+                    "received_at": "2026-11-06T07:17:00Z",
+                    "text_body": email2_body,
+                },
+            )
+
+        self.assertEqual(resp.status_code, 200)
+        tx = self.db.get(Transaction, resp.json()["transaction_id"])
+        self.assertIsNotNone(tx)
+        self.assertEqual(tx.account_id, self.acc_cashline.id)
+        self.assertEqual(tx.category, "Transfers")
+        self.assertEqual(float(tx.amount), -2000.00)
+        self.assertEqual(tx.currency, "SGD")
+        self.assertEqual(tx.transaction_date, date(2026, 11, 6))
+
+    def test_parse_forwarded_date_gmail_nz_sg_with_nnbsp(self):
+        self.assertEqual(
+            strip_invisible_unicode("12:00\u202fAM\xa0SGT"),
+            "12:00 AM SGT",
+        )
+        self.assertEqual(
+            parse_forwarded_date("Wed, 28 Oct 2026 at 12:00\u202fAM"),
+            datetime(2026, 10, 28, 0, 0),
+        )
+        self.assertEqual(
+            parse_forwarded_date("Fri, 6 Nov 2026 at 8:17\u202fPM"),
+            datetime(2026, 11, 6, 20, 17),
+        )
+        self.assertEqual(
+            parse_forwarded_date("28 Oct 2026 at 12:00 AM"),
+            datetime(2026, 10, 28, 0, 0),
+        )
 
 
 if __name__ == "__main__":
