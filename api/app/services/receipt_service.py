@@ -624,15 +624,16 @@ def extract_pdf_text(content: bytes) -> str:
         return ""
 
 
-def _invoke_receipt_llm(
+def _build_receipt_llm_request(
     messages: list[dict[str, Any]],
     *,
-    raise_on_error: bool = False,
-) -> Optional[dict[str, Any]]:
-    """Call Muninn LLM gateway with configured receipt vision model and parse JSON."""
+    resolved_model: str,
+    response_format_json: bool,
+    raise_on_error: bool,
+) -> Optional[urllib.request.Request]:
+    """Validate LLM gateway settings and build a chat/completions POST request."""
     base_url = settings.resolved_llm_base_url
     api_key = settings.resolved_llm_api_key
-    model = settings.resolved_receipt_llm_model
     if not api_key and not base_url:
         if raise_on_error:
             raise ValueError("Receipt LLM endpoint is not configured.")
@@ -640,52 +641,81 @@ def _invoke_receipt_llm(
     if raise_on_error and not api_key:
         raise ValueError("Receipt LLM API key is not configured.")
 
-    url = f"{base_url.rstrip('/')}/chat/completions"
+    payload: dict[str, Any] = {
+        "model": resolved_model,
+        "messages": messages,
+        "temperature": 0.1,
+    }
+    if response_format_json:
+        payload["response_format"] = {"type": "json_object"}
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key or 'no-key'}",
         "User-Agent": "Yggdrasil-Plutus/1.0",
     }
-    payload = {
-        "model": model,
-        "messages": messages,
-        "temperature": 0.1,
-    }
+    return urllib.request.Request(
+        f"{base_url.rstrip('/')}/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+
+
+def _invoke_receipt_llm(
+    messages: list[dict[str, Any]],
+    *,
+    model: Optional[str] = None,
+    timeout: int = 60,
+    response_format_json: bool = False,
+    raise_on_error: bool = False,
+) -> Optional[dict[str, Any]]:
+    """Call Muninn LLM gateway with the resolved receipt model and parse JSON."""
+    resolved_model = (model or settings.resolved_receipt_llm_model).strip()
+    req = _build_receipt_llm_request(
+        messages,
+        resolved_model=resolved_model,
+        response_format_json=response_format_json,
+        raise_on_error=raise_on_error,
+    )
+    if req is None:
+        return None
 
     try:
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers=headers,
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=60) as response:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
             res_data = json.loads(response.read().decode("utf-8"))
             content = res_data["choices"][0]["message"]["content"].strip()
             if content.startswith("```"):
                 content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
             return json.loads(content)
     except json.JSONDecodeError as e:
-        logger.warning("LLM receipt JSON decode failed (%s): %s", model, e)
+        logger.warning("LLM receipt JSON decode failed (%s): %s", resolved_model, e)
         if raise_on_error:
             raise ValueError(f"Receipt LLM returned invalid JSON: {e}") from e
         return None
     except Exception as e:
-        logger.warning("LLM receipt parsing failed (%s): %s", model, e)
+        logger.warning("LLM receipt parsing failed (%s): %s", resolved_model, e)
         if raise_on_error:
-            raise ConnectorUpstreamError(f"Receipt LLM request failed ({model}): {e}") from e
+            raise ConnectorUpstreamError(
+                f"Receipt LLM request failed ({resolved_model}): {e}"
+            ) from e
         return None
 
 
 def parse_receipt_text_with_llm(raw_text: str) -> Optional[dict[str, Any]]:
-    """Invoke receipt LLM to extract structured line items from raw receipt text."""
+    """Invoke text LLM to extract structured line items from raw receipt text."""
     messages = [
         {
             "role": "user",
             "content": f"{RECEIPT_PARSING_PROMPT}\n\nReceipt text:\n{raw_text}",
         }
     ]
-    return _invoke_receipt_llm(messages)
+    text_model = settings.resolved_llm_model or settings.resolved_receipt_llm_model
+    return _invoke_receipt_llm(
+        messages,
+        model=text_model,
+        timeout=60,
+        response_format_json=True,
+    )
 
 
 def parse_receipt_orders_text_with_llm(
@@ -693,14 +723,21 @@ def parse_receipt_orders_text_with_llm(
     *,
     raise_on_error: bool = True,
 ) -> Optional[dict[str, Any]]:
-    """Invoke receipt LLM to extract one or multiple structured orders from email/document text."""
+    """Invoke text LLM to extract one or multiple structured orders from email/document text."""
     messages = [
         {
             "role": "user",
             "content": f"{MULTI_ORDER_EMAIL_RECEIPT_PROMPT}\n\nEmail / Receipt content:\n{raw_text}",
         }
     ]
-    return _invoke_receipt_llm(messages, raise_on_error=raise_on_error)
+    text_model = settings.resolved_llm_model or settings.resolved_receipt_llm_model
+    return _invoke_receipt_llm(
+        messages,
+        model=text_model,
+        timeout=60,
+        response_format_json=True,
+        raise_on_error=raise_on_error,
+    )
 
 
 def parse_receipt_with_llm(
@@ -708,7 +745,7 @@ def parse_receipt_with_llm(
     filename: Optional[str],
     mime_type: str,
 ) -> Optional[dict[str, Any]]:
-    """Extract structured receipt fields from an image, PDF, or text document using Hydrogen."""
+    """Extract structured receipt fields from an image, PDF, or text document."""
     if mime_type.startswith("image/"):
         llm_bytes, llm_mime = prepare_image_for_llm(content, mime_type)
         b64_data = base64.b64encode(llm_bytes).decode("ascii")
@@ -722,7 +759,11 @@ def parse_receipt_with_llm(
                 ],
             }
         ]
-        return _invoke_receipt_llm(messages)
+        return _invoke_receipt_llm(
+            messages,
+            model=settings.resolved_receipt_llm_model,
+            timeout=105,
+        )
 
     if mime_type == "application/pdf" or (filename and filename.lower().endswith(".pdf")):
         pdf_text = extract_pdf_text(content)

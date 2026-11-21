@@ -131,43 +131,52 @@ def parse_forwarded_date(raw_date: str) -> Optional[datetime]:
     return None
 
 
-def extract_and_strip_forwarded_header(
-    subject: str,
-    text: str,
-    received_at: Optional[datetime],
-    *,
-    target_tz: ZoneInfo = SGT_TZ,
-) -> tuple[str, str, datetime]:
-    """Strip Gmail/Apple forwarded message block and compute reference target-tz datetime."""
-    cleaned_body = clean_email_text(text)
-    clean_subject = clean_email_text(subject).strip()
+def _parse_forwarded_block_meta(
+    header_block: str,
+) -> tuple[Optional[datetime], Optional[str]]:
+    """Extract Date and Subject from a single forwarded header block."""
+    block_date: Optional[datetime] = None
+    block_subject: Optional[str] = None
+    for line in header_block.splitlines():
+        if ":" not in line:
+            continue
+        key, _, val = line.partition(":")
+        key_lower = key.strip().lower()
+        val_clean = val.strip()
+        if key_lower == "date" and block_date is None:
+            block_date = parse_forwarded_date(val_clean)
+        elif key_lower == "subject" and not block_subject and val_clean:
+            block_subject = val_clean
+    return block_date, block_subject
 
+
+def _strip_forwarded_blocks(
+    cleaned_body: str,
+) -> tuple[str, Optional[datetime], Optional[str]]:
+    """Strip up to 5 nested forwarded blocks, preferring innermost parsed Date and Subject."""
     fwd_date: Optional[datetime] = None
     fwd_subject: Optional[str] = None
-
-    match = FORWARDED_BLOCK_RE.search(cleaned_body)
-    if match:
-        header_block = match.group(1)
-        for line in header_block.splitlines():
-            if ":" not in line:
-                continue
-            key, _, val = line.partition(":")
-            key_lower = key.strip().lower()
-            val_clean = val.strip()
-            if key_lower == "date" and fwd_date is None:
-                fwd_date = parse_forwarded_date(val_clean)
-            elif key_lower == "subject" and not fwd_subject and val_clean:
-                fwd_subject = val_clean
+    for _ in range(5):
+        match = FORWARDED_BLOCK_RE.search(cleaned_body)
+        if not match:
+            break
+        block_date, block_subject = _parse_forwarded_block_meta(match.group(1))
+        if block_date is not None:
+            fwd_date = block_date
+        if block_subject:
+            fwd_subject = block_subject
         cleaned_body = (
             cleaned_body[: match.start()] + cleaned_body[match.end() :]
         ).strip()
+    return cleaned_body, fwd_date, fwd_subject
 
-    if re.match(r"^(?:fwd?|fw)\s*:\s*", clean_subject, re.IGNORECASE):
-        stripped_subj = re.sub(
-            r"^(?:fwd?|fw)\s*:\s*", "", clean_subject, flags=re.IGNORECASE
-        ).strip()
-        clean_subject = fwd_subject or stripped_subj
 
+def _resolve_reference_datetime(
+    fwd_date: Optional[datetime],
+    received_at: Optional[datetime],
+    target_tz: ZoneInfo,
+) -> datetime:
+    """Resolve reference target-tz datetime from forwarded Date and received_at."""
     received_local: Optional[datetime] = None
     if received_at is not None:
         aware_rec = (
@@ -178,17 +187,38 @@ def extract_and_strip_forwarded_header(
         received_local = aware_rec.astimezone(target_tz)
 
     if fwd_date is not None and fwd_date.tzinfo is not None:
-        ref_dt = fwd_date.astimezone(target_tz)
-    elif fwd_date is not None and received_local is not None:
+        return fwd_date.astimezone(target_tz)
+    if fwd_date is not None and received_local is not None:
         if abs((received_local.date() - fwd_date.date()).days) <= 2:
-            ref_dt = received_local
-        else:
-            ref_dt = fwd_date.replace(tzinfo=target_tz)
-    elif fwd_date is not None:
-        ref_dt = fwd_date.replace(tzinfo=target_tz)
-    elif received_local is not None:
-        ref_dt = received_local
-    else:
-        ref_dt = datetime.now(target_tz)
+            return received_local
+        return fwd_date.replace(tzinfo=target_tz)
+    if fwd_date is not None:
+        return fwd_date.replace(tzinfo=target_tz)
+    if received_local is not None:
+        return received_local
+    return datetime.now(target_tz)
 
+
+def extract_and_strip_forwarded_header(
+    subject: str,
+    text: str,
+    received_at: Optional[datetime],
+    *,
+    target_tz: ZoneInfo = SGT_TZ,
+) -> tuple[str, str, datetime]:
+    """Strip Gmail/Apple forwarded message blocks and compute reference target-tz datetime."""
+    cleaned_body, fwd_date, fwd_subject = _strip_forwarded_blocks(clean_email_text(text))
+    clean_subject = clean_email_text(subject).strip()
+
+    if re.match(r"^(?:fwd?|fw)\s*:\s*", clean_subject, re.IGNORECASE):
+        stripped_subj = re.sub(
+            r"^(?:(?:fwd?|fw)\s*:\s*)+", "", clean_subject, flags=re.IGNORECASE
+        ).strip()
+        candidate = fwd_subject or stripped_subj
+        clean_subject = (
+            re.sub(r"^(?:(?:fwd?|fw)\s*:\s*)+", "", candidate, flags=re.IGNORECASE).strip()
+            or stripped_subj
+        )
+
+    ref_dt = _resolve_reference_datetime(fwd_date, received_at, target_tz)
     return clean_subject, cleaned_body, ref_dt

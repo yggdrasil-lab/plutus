@@ -21,7 +21,13 @@ from app.config import settings
 from app.db import Base, get_db
 from app.main import app
 from app.models import Account, ExchangeRate, IngestedEmail, Receipt, Transaction
-from app.services.receipt_service import reconcile_unlinked_receipts, sanitize_receipt_email_content
+from app.services.receipt_service import (
+    parse_receipt_orders_text_with_llm,
+    parse_receipt_text_with_llm,
+    parse_receipt_with_llm,
+    reconcile_unlinked_receipts,
+    sanitize_receipt_email_content,
+)
 
 TEST_DB_URL = "sqlite:///:memory:"
 engine = create_engine(
@@ -587,6 +593,65 @@ class TestReceiptsPhase4(unittest.TestCase):
         self.db.refresh(failed_audit)
         self.assertEqual(failed_audit.status, "processed")
         self.assertEqual(failed_audit.consumer_ref, f"receipt:{retry_res.json()['receipt_id']}")
+
+    def test_text_receipt_llm_routes_to_fast_text_model_with_json_mode_and_60s_timeout(self):
+        settings.llm_api_key = "test-llm-key"
+        recorded: list[tuple[dict, int]] = []
+
+        def fake_urlopen(req, timeout=None):
+            recorded.append((json.loads(req.data.decode("utf-8")), timeout))
+            return _FakeLlmResponse(
+                {"orders": [{"merchant": "Demo Store", "total_amount": 12.5}]}
+            )
+
+        with patch("app.services.receipt_service.urllib.request.urlopen", side_effect=fake_urlopen):
+            orders_res = parse_receipt_orders_text_with_llm("Order SYN-101 Total NZD 12.50")
+            text_res = parse_receipt_text_with_llm("Receipt Demo Store Total NZD 12.50")
+
+        self.assertIsNotNone(orders_res)
+        self.assertIsNotNone(text_res)
+        self.assertEqual(len(recorded), 2)
+        for payload, timeout in recorded:
+            self.assertEqual(payload["model"], settings.resolved_llm_model)
+            self.assertEqual(payload["response_format"], {"type": "json_object"})
+            self.assertEqual(timeout, 60)
+
+    def test_image_receipt_llm_routes_to_vision_model_with_105s_timeout_without_json_mode(self):
+        settings.llm_api_key = "test-llm-key"
+        recorded: list[tuple[dict, int]] = []
+        png_bytes = _make_png_bytes(128, 128, large=False)
+
+        def fake_urlopen(req, timeout=None):
+            recorded.append((json.loads(req.data.decode("utf-8")), timeout))
+            return _FakeLlmResponse({"merchant": "Demo Mart", "total_amount": 25.0, "items": []})
+
+        with patch("app.services.receipt_service.urllib.request.urlopen", side_effect=fake_urlopen):
+            res = parse_receipt_with_llm(png_bytes, "receipt.png", "image/png")
+
+        self.assertIsNotNone(res)
+        self.assertEqual(len(recorded), 1)
+        payload, timeout = recorded[0]
+        self.assertEqual(payload["model"], settings.resolved_receipt_llm_model)
+        self.assertNotIn("response_format", payload)
+        self.assertEqual(timeout, 105)
+
+
+class _FakeLlmResponse:
+    """Minimal context-manager mock for urllib.request.urlopen responses."""
+
+    def __init__(self, content_obj: dict):
+        self._body = json.dumps(
+            {"choices": [{"message": {"content": json.dumps(content_obj)}}]}
+        ).encode("utf-8")
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self) -> "_FakeLlmResponse":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        return False
 
 
 if __name__ == "__main__":
