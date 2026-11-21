@@ -21,7 +21,12 @@ from app.config import settings
 from app.db import Base, get_db
 from app.main import app
 from app.models import Account, ExchangeRate, IngestedEmail, Receipt, Transaction
+from app.schemas import EmailAttachmentPayload, InboundEmailDispatchPayload
 from app.services.receipt_service import (
+    ingest_purchase_receipt_email,
+    match_receipt_to_transaction,
+    normalize_receipt_currency,
+    parse_original_fx_from_description,
     parse_receipt_orders_text_with_llm,
     parse_receipt_text_with_llm,
     parse_receipt_with_llm,
@@ -634,6 +639,191 @@ class TestReceiptsPhase4(unittest.TestCase):
         self.assertEqual(payload["model"], settings.resolved_receipt_llm_model)
         self.assertNotIn("response_format", payload)
         self.assertEqual(timeout, 105)
+
+    def test_parse_original_fx_from_description_wise_and_nz_bank_formats(self):
+        cases = [
+            ("Card transaction of 11,700.00 PHP issued by Harbour Villa", (11700.00, "PHP")),
+            ("VT JETSTAR AIR (PHP 41194.11 @ 34.98 )", (41194.11, "PHP")),
+            ("MERCHANT ABC (SGD 336.20 @ 0.7131)", (336.20, "SGD")),
+            ("MERCHANT DEF (PHP 4,533.80 @ 35.0343)", (4533.80, "PHP")),
+            ("DEMO STORE AUD 16.29 converted at 0.8281", (16.29, "AUD")),
+            ("AUD 202.80 converted at 0.81", (202.80, "AUD")),
+            ("MAY 12 @ STORE (PHP 4,533.80 @ 35.0343)", (4533.80, "PHP")),
+        ]
+        for desc, expected in cases:
+            self.assertEqual(parse_original_fx_from_description(desc), expected, msg=desc)
+
+        non_fx_cases = [
+            None,
+            "",
+            "Countdown Albany Purchase",
+            "Transfer to ANZ 1234",
+            "Card payment of 12.00 OCT",
+            "OCT 12.00 @ STORE",
+            "USD 0.00 @ 0.60",
+        ]
+        for desc in non_fx_cases:
+            self.assertIsNone(parse_original_fx_from_description(desc), msg=desc)
+
+    def test_match_receipt_to_transaction_nz_bank_fx_jetstar_auto_match(self):
+        tx = Transaction(
+            transaction_date=date(2026, 10, 12),
+            account_id=self.acc_asb.id,
+            amount=-1192.66,
+            currency="NZD",
+            merchant="VT JETSTAR AIR",
+            category="Travel",
+            raw_description="VT JETSTAR AIR (PHP 41194.11 @ 34.98 )",
+            raw_hash="nz-bank-fx-jetstar-1",
+        )
+        self.db.add(tx)
+        self.db.commit()
+        self.db.refresh(tx)
+
+        receipt = Receipt(
+            receipt_date=date(2026, 10, 8),
+            merchant="Jetstar Airways Pty. Ltd.",
+            total_amount=41194.11,
+            currency="PHP",
+            status="unlinked",
+            is_processed=True,
+        )
+        self.db.add(receipt)
+        self.db.commit()
+        self.db.refresh(receipt)
+
+        matched_tx = match_receipt_to_transaction(receipt, self.db)
+        self.assertIsNotNone(matched_tx)
+        self.assertEqual(matched_tx.id, tx.id)
+        self.assertEqual(receipt.status, "matched")
+        self.assertEqual(receipt.transaction_id, tx.id)
+
+    def test_normalize_receipt_currency_unicode_symbols(self):
+        cases = [
+            ("₱", "PHP"),
+            ("PH₱", "PHP"),
+            ("PHP", "PHP"),
+            ("₱11,700.00", "PHP"),
+            ("€", "EUR"),
+            ("£", "GBP"),
+            ("S$", "SGD"),
+            ("SG$", "SGD"),
+            ("NZ$", "NZD"),
+            ("AU$", "AUD"),
+            ("A$", "AUD"),
+            ("US$", "USD"),
+            (None, "NZD"),
+        ]
+        for raw, expected in cases:
+            self.assertEqual(normalize_receipt_currency(raw), expected, msg=raw)
+
+    def test_ingest_purchase_receipt_email_retains_image_on_vision_fallback(self):
+        large_png = _make_png_bytes(256, 256, large=True)
+        self.assertGreaterEqual(len(large_png), 15 * 1024)
+        fallback_orders = {
+            "orders": [
+                {
+                    "order_number": "INV-9001",
+                    "merchant": "Harbour Villa Hotel",
+                    "receipt_date": "2026-11-20",
+                    "currency": "PH₱",
+                    "total_amount": 11700.00,
+                    "items": [
+                        {
+                            "item_name": "Room Downpayment",
+                            "quantity": 1.0,
+                            "unit_price": 11700.00,
+                            "total_price": 11700.00,
+                            "category": "Travel",
+                        }
+                    ],
+                }
+            ]
+        }
+        img_payload = InboundEmailDispatchPayload(
+            email_id=401,
+            message_id="<fallback-img-1@example.com>",
+            route_target="plutus_purchase_receipt",
+            subject="Booking Deposit Receipt",
+            from_address="reservations@example.com",
+            text_body="Thank you Alex Tan. Downpayment Php 11,700.00 received for Harbour Villa Hotel.",
+            attachments=[
+                EmailAttachmentPayload(
+                    filename="deposit_receipt.png",
+                    content_type="image/png",
+                    size_bytes=len(large_png),
+                    content_base64=base64.b64encode(large_png).decode("ascii"),
+                )
+            ],
+        )
+
+        with (
+            patch("app.services.receipt_service.parse_receipt_with_llm", return_value=None) as mock_vis,
+            patch(
+                "app.services.receipt_service.parse_receipt_orders_text_with_llm",
+                return_value=fallback_orders,
+            ) as mock_text,
+        ):
+            created = ingest_purchase_receipt_email(self.db, img_payload)
+            mock_vis.assert_called_once()
+            mock_text.assert_called_once()
+
+        self.assertEqual(len(created), 1)
+        rec = created[0]
+        self.assertIsNotNone(rec.image_data)
+        self.assertTrue(rec.has_image)
+        self.assertEqual(rec.image_mime_type, "image/webp")
+        self.assertEqual(rec.image_filename, "deposit_receipt.png")
+        self.assertEqual(rec.currency, "PHP")
+        self.assertEqual(rec.total_amount, 11700.00)
+
+    def test_ingest_purchase_receipt_email_retains_pdf_on_vision_fallback(self):
+        raw_pdf = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n" + (b"0" * 16000)
+        pdf_fallback_orders = {
+            "orders": [
+                {
+                    "order_number": "INV-9002",
+                    "merchant": "Pacific Airlines",
+                    "receipt_date": "2026-11-20",
+                    "currency": "€",
+                    "total_amount": 320.50,
+                    "items": [],
+                }
+            ]
+        }
+        pdf_payload = InboundEmailDispatchPayload(
+            email_id=402,
+            message_id="<fallback-pdf-1@example.com>",
+            route_target="plutus_purchase_receipt",
+            subject="Flight Itinerary",
+            from_address="bookings@example.com",
+            text_body="Flight confirmation INV-9002 total EUR 320.50 for Alex Tan.",
+            attachments=[
+                EmailAttachmentPayload(
+                    filename="itinerary.pdf",
+                    content_type="application/pdf",
+                    size_bytes=len(raw_pdf),
+                    content_base64=base64.b64encode(raw_pdf).decode("ascii"),
+                )
+            ],
+        )
+
+        with (
+            patch("app.services.receipt_service.extract_pdf_text", return_value=""),
+            patch("app.services.receipt_service.parse_receipt_with_llm", return_value=None),
+            patch(
+                "app.services.receipt_service.parse_receipt_orders_text_with_llm",
+                return_value=pdf_fallback_orders,
+            ),
+        ):
+            pdf_created = ingest_purchase_receipt_email(self.db, pdf_payload)
+
+        self.assertEqual(len(pdf_created), 1)
+        pdf_rec = pdf_created[0]
+        self.assertEqual(pdf_rec.image_data, raw_pdf)
+        self.assertEqual(pdf_rec.image_mime_type, "application/pdf")
+        self.assertEqual(pdf_rec.image_filename, "itinerary.pdf")
+        self.assertEqual(pdf_rec.currency, "EUR")
 
 
 class _FakeLlmResponse:

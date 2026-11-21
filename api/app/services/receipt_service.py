@@ -51,6 +51,27 @@ _ORIG_FX_DESC_RE = re.compile(
     r"\bof\s+([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s+([A-Z]{3})\b",
     re.IGNORECASE,
 )
+_BANK_FX_DESC_RE = re.compile(
+    r"(?:^|[\s(])([A-Z]{3})\s+([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s*(?:@|converted\s+at\b)",
+    re.IGNORECASE,
+)
+_FX_DESC_PATTERNS: tuple[tuple[re.Pattern[str], bool], ...] = (
+    (_ORIG_FX_DESC_RE, False),
+    (_BANK_FX_DESC_RE, True),
+)
+_CURRENCY_EXACT_PREFIXES: dict[str, str] = {
+    "S$": "SGD",
+    "SG$": "SGD",
+    "NZ$": "NZD",
+    "AU$": "AUD",
+    "A$": "AUD",
+    "US$": "USD",
+}
+_CURRENCY_SYMBOL_CODES: tuple[tuple[str, str], ...] = (
+    ("₱", "PHP"),
+    ("€", "EUR"),
+    ("£", "GBP"),
+)
 _MONTH_CODES = frozenset(
     {"JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"}
 )
@@ -930,14 +951,11 @@ def normalize_receipt_currency(raw_currency: Any, *, fallback: str = "NZD") -> s
     if raw_currency is None:
         return fb
     cleaned = str(raw_currency).strip().upper()
-    if cleaned in ("S$", "SG$"):
-        return "SGD"
-    if cleaned in ("NZ$",):
-        return "NZD"
-    if cleaned in ("AU$", "A$"):
-        return "AUD"
-    if cleaned in ("US$",):
-        return "USD"
+    if cleaned in _CURRENCY_EXACT_PREFIXES:
+        return _CURRENCY_EXACT_PREFIXES[cleaned]
+    for symbol, code in _CURRENCY_SYMBOL_CODES:
+        if symbol in cleaned:
+            return code
     m = re.search(r"\b([A-Z]{3})\b", cleaned)
     if m:
         return m.group(1)
@@ -1172,17 +1190,18 @@ def parse_original_fx_from_description(raw_description: Optional[str]) -> Option
     """Extract original foreign currency amount and ISO code from bank/Wise raw_description."""
     if not raw_description:
         return None
-    for match in _ORIG_FX_DESC_RE.finditer(raw_description):
-        amt_str, code = match.groups()
-        upper_code = code.upper()
-        if upper_code in _MONTH_CODES:
-            continue
-        try:
-            amt_val = float(amt_str.replace(",", ""))
-        except ValueError:
-            continue
-        if amt_val > 0:
-            return amt_val, upper_code
+    for pattern, code_first in _FX_DESC_PATTERNS:
+        for match in pattern.finditer(raw_description):
+            code, amt_str = match.groups() if code_first else (match.group(2), match.group(1))
+            upper_code = code.upper()
+            if upper_code in _MONTH_CODES:
+                continue
+            try:
+                amt_val = float(amt_str.replace(",", ""))
+            except ValueError:
+                continue
+            if amt_val > 0:
+                return amt_val, upper_code
     return None
 
 
@@ -1551,25 +1570,59 @@ def _find_semantic_duplicate_receipt(
     return None
 
 
-def ingest_purchase_receipt_email(
-    db: Session,
-    payload: InboundEmailDispatchPayload,
-) -> list[Receipt]:
-    """Ingest a purchase receipt email (attachment-first or HTML/text, 1 or N orders)."""
-    local_tz = ZoneInfo(settings.timezone)
-    fallback_date = (
-        payload.received_at.replace(tzinfo=timezone.utc).astimezone(local_tz).date()
-        if payload.received_at and payload.received_at.tzinfo is None
-        else payload.received_at.astimezone(local_tz).date()
-        if payload.received_at
-        else datetime.now(local_tz).date()
-    )
+@dataclass(frozen=True)
+class _StoredReceiptMedia:
+    """Compressed or raw media bytes retained for Receipt DB persistence."""
 
-    orders: list[dict[str, Any]] = []
-    stored_media: Optional[tuple[bytes, str, Optional[str]]] = None
+    data: bytes
+    mime_type: str
+    filename: Optional[str]
+
+
+@dataclass(frozen=True)
+class _AttachmentParseOutcome:
+    """Outcome of attachment-first receipt extraction including fallback media."""
+
+    orders: list[dict[str, Any]]
+    stored_media: Optional[_StoredReceiptMedia]
+    fallback_attachment: Optional[_StoredReceiptMedia]
+    raw_text: Optional[str]
+
+
+def _resolve_email_fallback_date(received_at: Optional[datetime], local_tz: ZoneInfo) -> date:
+    """Resolve local fallback date from email received_at timestamp or current time."""
+    if not received_at:
+        return datetime.now(local_tz).date()
+    aware = received_at.replace(tzinfo=timezone.utc) if received_at.tzinfo is None else received_at
+    return aware.astimezone(local_tz).date()
+
+
+def _parse_single_attachment(
+    raw_bytes: bytes,
+    filename: Optional[str],
+    mime_type: str,
+) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Parse one PDF or image receipt attachment via text-first then vision LLM."""
+    if mime_type != "application/pdf":
+        return parse_receipt_with_llm(raw_bytes, filename, mime_type), None
+    pdf_text = extract_pdf_text(raw_bytes)
+    raw_excerpt = pdf_text[:32000] if pdf_text else None
+    parsed_att = (
+        parse_receipt_orders_text_with_llm(pdf_text, raise_on_error=False)
+        if pdf_text
+        else None
+    )
+    if not parsed_att:
+        parsed_att = parse_receipt_with_llm(raw_bytes, filename, mime_type)
+    return parsed_att, raw_excerpt
+
+
+def _extract_receipt_orders_from_attachments(attachments: list[Any]) -> _AttachmentParseOutcome:
+    """Parse orders from valid image/PDF attachments and retain first valid attachment for fallback."""
+    fallback_attachment: Optional[_StoredReceiptMedia] = None
     raw_text_for_record: Optional[str] = None
 
-    for att in payload.attachments:
+    for att in attachments:
         if not att.content_base64:
             continue
         try:
@@ -1581,122 +1634,166 @@ def ingest_purchase_receipt_email(
         mime_type = infer_receipt_mime_type(att.filename, att.content_type)
         if mime_type != "application/pdf" and not mime_type.startswith("image/"):
             continue
+        if fallback_attachment is None:
+            fallback_attachment = _StoredReceiptMedia(raw_bytes, mime_type, att.filename)
 
-        parsed_att: Optional[dict[str, Any]] = None
-        if mime_type == "application/pdf":
-            pdf_text = extract_pdf_text(raw_bytes)
-            if pdf_text:
-                raw_text_for_record = pdf_text[:32000]
-                parsed_att = parse_receipt_orders_text_with_llm(pdf_text, raise_on_error=False)
-            if not parsed_att:
-                parsed_att = parse_receipt_with_llm(raw_bytes, att.filename, mime_type)
-        else:
-            parsed_att = parse_receipt_with_llm(raw_bytes, att.filename, mime_type)
-
+        parsed_att, pdf_excerpt = _parse_single_attachment(raw_bytes, att.filename, mime_type)
+        if pdf_excerpt:
+            raw_text_for_record = pdf_excerpt
         extracted = _normalize_parsed_orders(parsed_att)
         if extracted:
-            orders = extracted
             comp_bytes, comp_mime = compress_receipt_image(raw_bytes, mime_type)
-            stored_media = (comp_bytes, comp_mime, att.filename)
-            break
+            return _AttachmentParseOutcome(
+                orders=extracted,
+                stored_media=_StoredReceiptMedia(comp_bytes, comp_mime, att.filename),
+                fallback_attachment=fallback_attachment,
+                raw_text=raw_text_for_record,
+            )
+
+    return _AttachmentParseOutcome(
+        orders=[],
+        stored_media=None,
+        fallback_attachment=fallback_attachment,
+        raw_text=raw_text_for_record,
+    )
+
+
+def _create_receipt_items_for_order(
+    db: Session,
+    *,
+    receipt: Receipt,
+    raw_items: list[dict[str, Any]],
+    active_rules: list[CategorizationRule],
+    existing_tags: list[str],
+    extra_categories: list[str],
+) -> None:
+    """Apply discount folding and persist classified line items for one ingested order."""
+    for it in apply_receipt_discounts_with_jev(raw_items):
+        create_classified_receipt_item(
+            db,
+            receipt=receipt,
+            item_name=str(it.get("item_name") or "Item"),
+            brand=it.get("brand"),
+            quantity=float(it.get("quantity", 1.0) or 1.0),
+            unit_price=float(it.get("unit_price", 0.0) or 0.0),
+            discount_amount=(
+                float(it["discount_amount"]) if it.get("discount_amount") is not None else None
+            ),
+            total_price=float(it.get("total_price", 0.0) or 0.0),
+            explicit_category=it.get("category"),
+            explicit_domain=it.get("domain"),
+            explicit_product_type=it.get("product_type"),
+            explicit_volume_ml=it.get("volume_ml"),
+            explicit_tags=it.get("tags"),
+            notes=it.get("notes"),
+            active_rules=active_rules,
+            existing_tags=existing_tags,
+            extra_categories=extra_categories,
+        )
+
+
+def _resolve_order_date(raw_date: Any, fallback_date: date) -> date:
+    """Parse an ISO order receipt_date or fall back to the resolved email date."""
+    try:
+        return date.fromisoformat(str(raw_date or ""))
+    except ValueError:
+        return fallback_date
+
+
+def _persist_ingested_order(
+    db: Session,
+    *,
+    order: dict[str, Any],
+    fallback_date: date,
+    message_id: str,
+    raw_text: Optional[str],
+    stored_media: Optional[_StoredReceiptMedia],
+    active_rules: list[CategorizationRule],
+    existing_tags: list[str],
+    extra_categories: list[str],
+) -> Receipt:
+    """Persist one parsed email receipt order (with semantic dedup) and match to transaction."""
+    merchant = str(order.get("merchant") or "Unknown Merchant").strip()[:150]
+    order_number = normalize_order_number(order.get("order_number"))
+    currency = normalize_receipt_currency(order.get("currency"), fallback="NZD")
+    total_amount = round(float(order.get("total_amount", 0.0) or 0.0), 2)
+    tax_amount = round(float(order["tax_amount"]), 2) if order.get("tax_amount") is not None else None
+    r_date = _resolve_order_date(order.get("receipt_date"), fallback_date)
+
+    existing_dup = _find_semantic_duplicate_receipt(
+        db, merchant=merchant, receipt_date=r_date,
+        total_amount=total_amount, currency=currency, order_number=order_number,
+    )
+    if existing_dup is not None:
+        return existing_dup
+
+    receipt = Receipt(
+        receipt_date=r_date, merchant=merchant, total_amount=total_amount,
+        currency=currency, tax_amount=tax_amount, order_number=order_number,
+        source_email_message_id=message_id[:512], status="unlinked", is_processed=True,
+        raw_text=raw_text,
+        image_data=stored_media.data if stored_media else None,
+        image_mime_type=stored_media.mime_type if stored_media else None,
+        image_filename=stored_media.filename[:255] if stored_media and stored_media.filename else None,
+    )
+    db.add(receipt)
+    db.flush()
+    _create_receipt_items_for_order(
+        db, receipt=receipt, raw_items=order.get("items") or [],
+        active_rules=active_rules, existing_tags=existing_tags, extra_categories=extra_categories,
+    )
+    db.commit()
+    db.refresh(receipt)
+    match_receipt_to_transaction(receipt, db)
+    return receipt
+
+
+def _extract_orders_from_email_body(payload: InboundEmailDispatchPayload) -> tuple[list[dict[str, Any]], date, str]:
+    """Sanitize email HTML/text body and extract purchase orders via text LLM fallback."""
+    sanitized_text, sanitized_date = sanitize_receipt_email_content(
+        subject=payload.subject or "", from_address=payload.from_address,
+        received_at=payload.received_at, text_body=payload.text_body,
+        html_excerpt=payload.html_excerpt, raw_excerpt=payload.raw_excerpt,
+    )
+    if not sanitized_text:
+        raise ValueError(
+            "Purchase receipt email contains no readable receipt content or valid attachment."
+        )
+    parsed_body = parse_receipt_orders_text_with_llm(sanitized_text, raise_on_error=True)
+    return _normalize_parsed_orders(parsed_body), sanitized_date, sanitized_text[:32000]
+
+
+def ingest_purchase_receipt_email(
+    db: Session,
+    payload: InboundEmailDispatchPayload,
+) -> list[Receipt]:
+    """Ingest a purchase receipt email (attachment-first or HTML/text, 1 or N orders)."""
+    local_tz = ZoneInfo(settings.timezone)
+    fallback_date = _resolve_email_fallback_date(payload.received_at, local_tz)
+    outcome = _extract_receipt_orders_from_attachments(payload.attachments)
+    orders, stored_media, raw_text_for_record = (
+        outcome.orders, outcome.stored_media, outcome.raw_text,
+    )
 
     if not orders:
-        sanitized_text, sanitized_date = sanitize_receipt_email_content(
-            subject=payload.subject or "",
-            from_address=payload.from_address,
-            received_at=payload.received_at,
-            text_body=payload.text_body,
-            html_excerpt=payload.html_excerpt,
-            raw_excerpt=payload.raw_excerpt,
-        )
-        fallback_date = sanitized_date
-        if not sanitized_text:
-            raise ValueError("Purchase receipt email contains no readable receipt content or valid attachment.")
-        raw_text_for_record = sanitized_text[:32000]
-        parsed_body = parse_receipt_orders_text_with_llm(sanitized_text, raise_on_error=True)
-        orders = _normalize_parsed_orders(parsed_body)
+        orders, fallback_date, raw_text_for_record = _extract_orders_from_email_body(payload)
+        if orders and stored_media is None and outcome.fallback_attachment is not None:
+            fb = outcome.fallback_attachment
+            comp_bytes, comp_mime = compress_receipt_image(fb.data, fb.mime_type)
+            stored_media = _StoredReceiptMedia(comp_bytes, comp_mime, fb.filename)
 
     if not orders:
         raise ValueError("Could not extract any purchase orders from receipt email.")
 
     active_rules, existing_tags, extra_categories = load_receipt_rule_context(db)
-    results: list[Receipt] = []
-
-    for order in orders:
-        merchant = str(order.get("merchant") or "Unknown Merchant").strip()[:150]
-        order_number = normalize_order_number(order.get("order_number"))
-        currency = normalize_receipt_currency(order.get("currency"), fallback="NZD")
-        total_amount = round(float(order.get("total_amount", 0.0) or 0.0), 2)
-        tax_amount = (
-            round(float(order["tax_amount"]), 2)
-            if order.get("tax_amount") is not None
-            else None
+    return [
+        _persist_ingested_order(
+            db, order=order, fallback_date=fallback_date, message_id=payload.message_id,
+            raw_text=raw_text_for_record, stored_media=stored_media,
+            active_rules=active_rules, existing_tags=existing_tags, extra_categories=extra_categories,
         )
-        try:
-            r_date = date.fromisoformat(str(order.get("receipt_date") or ""))
-        except ValueError:
-            r_date = fallback_date
-
-        existing_dup = _find_semantic_duplicate_receipt(
-            db,
-            merchant=merchant,
-            receipt_date=r_date,
-            total_amount=total_amount,
-            currency=currency,
-            order_number=order_number,
-        )
-        if existing_dup is not None:
-            results.append(existing_dup)
-            continue
-
-        receipt = Receipt(
-            receipt_date=r_date,
-            merchant=merchant,
-            total_amount=total_amount,
-            currency=currency,
-            tax_amount=tax_amount,
-            order_number=order_number,
-            source_email_message_id=payload.message_id[:512],
-            status="unlinked",
-            is_processed=True,
-            raw_text=raw_text_for_record,
-            image_data=stored_media[0] if stored_media else None,
-            image_mime_type=stored_media[1] if stored_media else None,
-            image_filename=stored_media[2][:255] if stored_media and stored_media[2] else None,
-        )
-        db.add(receipt)
-        db.flush()
-
-        resolved_items = apply_receipt_discounts_with_jev(order.get("items") or [])
-        for it in resolved_items:
-            create_classified_receipt_item(
-                db,
-                receipt=receipt,
-                item_name=str(it.get("item_name") or "Item"),
-                brand=it.get("brand"),
-                quantity=float(it.get("quantity", 1.0) or 1.0),
-                unit_price=float(it.get("unit_price", 0.0) or 0.0),
-                discount_amount=(
-                    float(it["discount_amount"]) if it.get("discount_amount") is not None else None
-                ),
-                total_price=float(it.get("total_price", 0.0) or 0.0),
-                explicit_category=it.get("category"),
-                explicit_domain=it.get("domain"),
-                explicit_product_type=it.get("product_type"),
-                explicit_volume_ml=it.get("volume_ml"),
-                explicit_tags=it.get("tags"),
-                notes=it.get("notes"),
-                active_rules=active_rules,
-                existing_tags=existing_tags,
-                extra_categories=extra_categories,
-            )
-
-        db.commit()
-        db.refresh(receipt)
-        match_receipt_to_transaction(receipt, db)
-        results.append(receipt)
-
-    return results
+        for order in orders
+    ]
 
 
 def compute_product_statistics(
