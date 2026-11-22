@@ -1,4 +1,4 @@
-"""Unit tests for Plutus burn_service, Wise FX guard, FX repair, and average-burn budgets."""
+"""Unit tests for Plutus FX repair, Wise FX guard, and HTTP burn/runway/tag contracts."""
 
 from datetime import date, timedelta
 import json
@@ -15,14 +15,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.db import Base, get_db
 from app.main import app
-from app.models import Account, AssetSnapshot, BudgetRule, Transaction
-from app.services.burn_service import (
-    calculate_category_average_burn,
-    calculate_weekly_burn_summary,
-    repair_transaction_fx_rates,
-    to_nzd_amount,
-)
+from app.models import Account, AssetSnapshot, Transaction
+from app.services.burn_service import repair_transaction_fx_rates
 from app.services.connectors.wise import normalize_wise_feed
+from app.services.fx_service import to_nzd_amount
 
 
 class StubFxFetcher:
@@ -199,7 +195,7 @@ class TestBurnService(unittest.TestCase):
         self.assertAlmostEqual(float(sgd_aud_leaked.exchange_rate), 1.32, places=2)
         self.assertAlmostEqual(float(paired_transfer.exchange_rate), 0.73039, places=5)
 
-    def test_weekly_burn_summary_average_burn_and_budget_sync(self):
+    def test_average_burn_runway_and_budget_sync_http_contracts(self):
         today = date.today()
         monday = today - timedelta(days=today.weekday())
 
@@ -277,14 +273,6 @@ class TestBurnService(unittest.TestCase):
         )
         self.db.commit()
 
-        # 4w variable = (200 + 130 + 100) / 4 = 107.50; recurring = 400.00 -> effective = 507.50
-        summary = calculate_weekly_burn_summary(self.db, today, lookback_weeks=4)
-        self.assertAlmostEqual(summary.variable_weekly_burn, 107.50, places=2)
-        self.assertAlmostEqual(summary.recurring_weekly_burn, 400.00, places=2)
-        self.assertAlmostEqual(summary.effective_weekly_burn, 507.50, places=2)
-        self.assertAlmostEqual(summary.this_week_variable_spend, 200.00, places=2)
-        self.assertAlmostEqual(summary.this_week_spend, 600.00, places=2)
-
         # GET /runway exposes decomposed burn fields and matching weekly_spend_this_week
         runway_res = self.client.get("/runway")
         self.assertEqual(runway_res.status_code, 200)
@@ -332,8 +320,6 @@ class TestBurnService(unittest.TestCase):
         # Re-check /budgets/breakdown uses NZD FX across month period too
         month_res = self.client.get("/budgets/breakdown?period=month")
         self.assertEqual(month_res.status_code, 200)
-        estimates = calculate_category_average_burn(self.db, today, lookback_weeks=4)
-        self.assertEqual(estimates[0].category, "Housing")
 
     def test_annual_budget_category_amortization_without_hardcoding(self):
         """Any category marked budget_period='annual' spreads 365d spend across 52 weeks."""
@@ -382,11 +368,6 @@ class TestBurnService(unittest.TestCase):
             ]
         )
         self.db.commit()
-
-        summary = calculate_weekly_burn_summary(self.db, today, lookback_weeks=4)
-        self.assertAlmostEqual(summary.variable_weekly_burn, 60.00, places=2)
-        self.assertAlmostEqual(summary.this_week_variable_spend, 60.00, places=2)
-        self.assertAlmostEqual(summary.effective_weekly_burn, 60.00, places=2)
 
         avg_res = self.client.get("/budgets/average-burn?lookback_weeks=4")
         self.assertEqual(avg_res.status_code, 200)

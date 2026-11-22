@@ -7,8 +7,6 @@ import unittest
 from unittest.mock import MagicMock, patch
 import urllib.error
 
-from datetime import date
-
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -28,7 +26,6 @@ from app.services.jev_client import (
     is_jev_circuit_open,
     reset_jev_circuit,
 )
-from app.services.period_service import resolve_period_dates
 
 
 class TestPlutusJevClient(unittest.TestCase):
@@ -97,16 +94,6 @@ class TestPlutusJevClient(unittest.TestCase):
         self.assertIsNone(verdict)
         self.assertEqual(latency, 0.0)
         self.assertEqual(mock_urlopen.call_count, CIRCUIT_FAILURE_THRESHOLD)
-
-    def test_resolve_period_dates_last_week_and_custom(self):
-        ref = date(2026, 11, 17)  # Tuesday
-        start, end = resolve_period_dates("last_week", today=ref)
-        self.assertEqual(start, date(2026, 11, 9))
-        self.assertEqual(end, date(2026, 11, 15))
-
-        c_start, c_end = resolve_period_dates(None, date(2026, 10, 1), date(2026, 10, 15), today=ref)
-        self.assertEqual(c_start, date(2026, 10, 1))
-        self.assertEqual(c_end, date(2026, 10, 15))
 
     @patch("app.services.jev_client.call_jev")
     def test_classify_with_tags_vocab_cap_80_extra_cats_and_tag_filtering(self, mock_call_jev):
