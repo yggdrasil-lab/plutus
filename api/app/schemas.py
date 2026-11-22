@@ -288,6 +288,7 @@ class TransactionRead(TransactionBase):
     raw_hash: str
     has_receipt: bool = False
     receipt_id: Optional[int] = None
+    receipt_document_type: Optional[str] = None
     is_receipt_split: bool = False
     splits: list[TransactionSplitRead] = Field(default_factory=list)
     is_split: bool = False
@@ -804,7 +805,23 @@ class ReceiptItemRead(ReceiptItemBase):
         from_attributes = True
 
 
+VALID_RECEIPT_DOCUMENT_TYPES = {"receipt", "payslip"}
+
+
+def normalize_receipt_document_type(value: Any) -> str:
+    """Normalize receipt document_type to 'receipt' or 'payslip'."""
+    if value is None:
+        return "receipt"
+    cleaned = str(value).strip().lower()
+    if cleaned not in VALID_RECEIPT_DOCUMENT_TYPES:
+        raise ValueError(
+            f"Unsupported document_type '{value}'. Must be one of: {', '.join(sorted(VALID_RECEIPT_DOCUMENT_TYPES))}."
+        )
+    return cleaned
+
+
 class ReceiptBase(BaseModel):
+    document_type: str = Field(default="receipt", max_length=32)
     receipt_date: date
     merchant: str = Field(..., max_length=150)
     total_amount: float = Field(..., ge=0.0)
@@ -813,6 +830,11 @@ class ReceiptBase(BaseModel):
     order_number: Optional[str] = Field(default=None, max_length=128)
     status: str = Field(default="unlinked", max_length=30)
     notes: Optional[str] = None
+
+    @field_validator("document_type", mode="before")
+    @classmethod
+    def validate_document_type(cls, v: Any) -> str:
+        return normalize_receipt_document_type(v)
 
 
 class ReceiptCreate(ReceiptBase):
@@ -983,6 +1005,7 @@ class DbsAlertResult(BaseModel):
 VALID_EMAIL_ROUTE_TARGETS = {
     "plutus_dbs_alert",
     "plutus_purchase_receipt",
+    "plutus_payslip",
     "plutus_bank_statement",
 }
 

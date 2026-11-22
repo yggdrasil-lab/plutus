@@ -82,6 +82,7 @@ def hydrate_transaction(tx: Transaction) -> Transaction:
     tx.is_split = len(splits) >= 2
     tx.has_receipt = bool(tx.receipt)
     tx.receipt_id = tx.receipt.id if tx.receipt else None
+    tx.receipt_document_type = tx.receipt.document_type if tx.receipt else None
     return tx
 
 

@@ -20,6 +20,7 @@ from app.schemas import (
     TransactionCandidateRead,
 )
 from app.services.receipt_service import (
+    apply_parsed_payslip_fields,
     apply_receipt_discounts_with_jev,
     compress_receipt_image,
     compute_product_statistics,
@@ -30,6 +31,7 @@ from app.services.receipt_service import (
     match_receipt_to_transaction,
     normalize_order_number,
     normalize_receipt_currency,
+    parse_payslip_with_llm,
     parse_receipt_with_llm,
     reconcile_unlinked_receipts,
 )
@@ -57,27 +59,10 @@ def list_receipts(
     )
 
 
-@router.post("", response_model=ReceiptRead, status_code=status.HTTP_201_CREATED)
-def create_receipt(
-    payload: ReceiptCreate,
-    db: Session = Depends(get_db),
-):
-    """Create a structured receipt with itemized line items and attempt auto-matching."""
-    receipt = Receipt(
-        receipt_date=payload.receipt_date,
-        merchant=payload.merchant.strip(),
-        total_amount=payload.total_amount,
-        currency=normalize_receipt_currency(payload.currency, fallback="NZD"),
-        tax_amount=payload.tax_amount,
-        order_number=normalize_order_number(payload.order_number),
-        status=payload.status,
-        notes=payload.notes,
-    )
-    db.add(receipt)
-    db.flush()
-
+def _persist_payload_receipt_items(db: Session, receipt: Receipt, items: list[Any]) -> None:
+    """Classify and persist line items submitted via ReceiptCreate."""
     active_rules, existing_tags, extra_categories = load_receipt_rule_context(db)
-    for item in payload.items:
+    for item in items:
         create_classified_receipt_item(
             db,
             receipt=receipt,
@@ -98,12 +83,31 @@ def create_receipt(
             extra_categories=extra_categories,
         )
 
+
+@router.post("", response_model=ReceiptRead, status_code=status.HTTP_201_CREATED)
+def create_receipt(
+    payload: ReceiptCreate,
+    db: Session = Depends(get_db),
+):
+    """Create a structured receipt or payslip and attempt auto-matching."""
+    receipt = Receipt(
+        document_type=payload.document_type,
+        receipt_date=payload.receipt_date,
+        merchant=payload.merchant.strip(),
+        total_amount=payload.total_amount,
+        currency=normalize_receipt_currency(payload.currency, fallback="NZD"),
+        tax_amount=payload.tax_amount,
+        order_number=normalize_order_number(payload.order_number),
+        status=payload.status,
+        notes=payload.notes,
+    )
+    db.add(receipt)
+    db.flush()
+    if payload.document_type != "payslip" and payload.items:
+        _persist_payload_receipt_items(db, receipt, payload.items)
     db.commit()
     db.refresh(receipt)
-
-    # Attempt auto-match against ledger transactions
     match_receipt_to_transaction(receipt, db)
-
     return receipt
 
 
@@ -243,7 +247,7 @@ def reprocess_receipt(
     receipt_id: int,
     db: Session = Depends(get_db),
 ):
-    """Re-run Hydrogen Vision parsing on an unprocessed stored receipt and compress on success."""
+    """Re-run LLM parsing on a stored receipt or payslip and compress image attachments on success."""
     receipt = db.get(Receipt, receipt_id)
     if not receipt:
         raise HTTPException(status_code=404, detail="Receipt not found")
@@ -251,14 +255,22 @@ def reprocess_receipt(
         raise HTTPException(status_code=400, detail="Receipt has no stored image to reprocess")
 
     mime_type = receipt.image_mime_type or infer_receipt_mime_type(receipt.image_filename, None)
-    parsed = parse_receipt_with_llm(receipt.image_data, receipt.image_filename, mime_type)
-    if not parsed or "merchant" not in parsed or "total_amount" not in parsed:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Receipt vision parsing failed; original image preserved.",
-        )
+    if receipt.document_type == "payslip":
+        parsed = parse_payslip_with_llm(receipt.image_data, receipt.image_filename, mime_type)
+        if not apply_parsed_payslip_fields(receipt, parsed, db):
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Payslip parsing failed; original document preserved.",
+            )
+    else:
+        parsed = parse_receipt_with_llm(receipt.image_data, receipt.image_filename, mime_type)
+        if not parsed or "merchant" not in parsed or "total_amount" not in parsed:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Receipt vision parsing failed; original image preserved.",
+            )
+        _apply_parsed_receipt_fields(receipt, parsed, db)
 
-    _apply_parsed_receipt_fields(receipt, parsed, db)
     compressed_bytes, compressed_mime = compress_receipt_image(receipt.image_data, mime_type)
     receipt.image_data = compressed_bytes
     receipt.image_mime_type = compressed_mime
@@ -274,7 +286,7 @@ def list_receipt_candidates(
     receipt_id: int,
     db: Session = Depends(get_db),
 ):
-    """Return top 5 sorted candidate expense transactions for linking to this receipt."""
+    """Return top 5 sorted candidate matching transactions for linking to this receipt."""
     receipt = db.get(Receipt, receipt_id)
     if not receipt:
         raise HTTPException(status_code=404, detail="Receipt not found")

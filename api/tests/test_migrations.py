@@ -22,7 +22,7 @@ from app.models import (
 
 
 def test_alembic_upgrade_head_creates_loans_and_commits(tmp_path: Path, monkeypatch) -> None:
-    """Verify alembic upgrade head applies all migrations and tests 0019 <-> 0020 roundtrip."""
+    """Verify alembic upgrade head applies all migrations and tests 0019 <-> 0020 <-> 0021 roundtrips."""
     db_file = tmp_path / "migrations_test.db"
     monkeypatch.setenv("PLUTUS_DATABASE_URL", f"sqlite:///{db_file}")
 
@@ -68,6 +68,10 @@ def test_alembic_upgrade_head_creates_loans_and_commits(tmp_path: Path, monkeypa
             row[1]
             for row in conn.execute("PRAGMA table_info(receipts)").fetchall()
         }
+        receipt_indexes = {
+            row[1]
+            for row in conn.execute("PRAGMA index_list(receipts)").fetchall()
+        }
         ingested_email_columns = {
             row[1]
             for row in conn.execute("PRAGMA table_info(ingested_emails)").fetchall()
@@ -90,6 +94,8 @@ def test_alembic_upgrade_head_creates_loans_and_commits(tmp_path: Path, monkeypa
     assert "account_number_last4" in account_columns
     assert "order_number" in receipt_columns
     assert "source_email_message_id" in receipt_columns
+    assert "document_type" in receipt_columns
+    assert "ix_receipts_document_type" in receipt_indexes
     assert {
         "id",
         "message_id",
@@ -114,7 +120,7 @@ def test_alembic_upgrade_head_creates_loans_and_commits(tmp_path: Path, monkeypa
         "created_at",
     }.issubset(split_columns)
     assert version is not None
-    assert version[0] == "0020_email_ingestion"
+    assert version[0] == "0021_receipt_document_type"
 
     parent_by_name = {name: parent for name, parent, _ in seeded_categories}
     system_by_name = {name: bool(is_sys) for name, _, is_sys in seeded_categories}
@@ -124,6 +130,28 @@ def test_alembic_upgrade_head_creates_loans_and_commits(tmp_path: Path, monkeypa
     assert parent_by_name.get("Fees & Admin") == "Finance"
     assert parent_by_name.get("Debt & Loans") == "Finance"
     assert system_by_name.get("Debt & Loans") is True
+
+    # Verify 0021 -> 0020 downgrade removes document_type + index and preserves pre-existing receipts
+    alembic_command.downgrade(cfg, "0020_email_ingestion")
+    with sqlite3.connect(db_file) as conn:
+        v20 = conn.execute("SELECT version_num FROM alembic_version").fetchone()
+        v20_receipt_cols = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(receipts)").fetchall()
+        }
+        v20_receipt_indexes = {
+            row[1]
+            for row in conn.execute("PRAGMA index_list(receipts)").fetchall()
+        }
+        conn.execute(
+            "INSERT INTO receipts (receipt_date, merchant, total_amount, currency, status, is_processed, created_at, updated_at) "
+            "VALUES ('2026-11-10', 'Existing Shop', 19.99, 'NZD', 'unlinked', 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+        )
+        conn.commit()
+    assert v20 is not None
+    assert v20[0] == "0020_email_ingestion"
+    assert "document_type" not in v20_receipt_cols
+    assert "ix_receipts_document_type" not in v20_receipt_indexes
 
     # Verify 0020 -> 0019 downgrade -> seed DBS Live Fresh savings -> upgrade roundtrip cleanly on SQLite
     alembic_command.downgrade(cfg, "0019_transaction_splits")
@@ -176,16 +204,25 @@ def test_alembic_upgrade_head_creates_loans_and_commits(tmp_path: Path, monkeypa
             row[1]
             for row in conn.execute("PRAGMA table_info(receipts)").fetchall()
         }
+        reup_receipt_indexes = {
+            row[1]
+            for row in conn.execute("PRAGMA index_list(receipts)").fetchall()
+        }
         acc_types = dict(
             conn.execute("SELECT name, account_type FROM accounts").fetchall()
         )
+        existing_doc_types = conn.execute(
+            "SELECT merchant, document_type FROM receipts"
+        ).fetchall()
     assert reup_ver is not None
-    assert reup_ver[0] == "0020_email_ingestion"
+    assert reup_ver[0] == "0021_receipt_document_type"
     assert "ingested_emails" in reup_tables
     assert "account_number_last4" in reup_account_cols
-    assert {"order_number", "source_email_message_id"}.issubset(reup_receipt_cols)
+    assert {"order_number", "source_email_message_id", "document_type"}.issubset(reup_receipt_cols)
+    assert "ix_receipts_document_type" in reup_receipt_indexes
     assert acc_types["DBS Live Fresh Visa"] == "credit_card"
     assert acc_types["ANZ Savings"] == "savings"
+    assert dict(existing_doc_types)["Existing Shop"] == "receipt"
 
     # Verify ORM models select cleanly against the Alembic-migrated schema
     engine = create_engine(f"sqlite:///{db_file}")

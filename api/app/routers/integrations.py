@@ -1,5 +1,6 @@
 """Machine-to-machine integrations router for Shortcuts, Siri, and document ingestion."""
 
+from dataclasses import dataclass
 from datetime import date, timedelta
 import json
 import logging
@@ -44,6 +45,7 @@ from app.services.ingestion_service import (
 )
 from app.services.jev_client import classify_transaction_jev_with_tags, get_extra_jev_categories
 from app.services.receipt_service import (
+    ingest_payslip_email,
     ingest_purchase_receipt_email,
     reconcile_unlinked_receipts,
 )
@@ -464,6 +466,155 @@ def _upsert_failed_ingested_email(
     db.commit()
 
 
+@dataclass(frozen=True)
+class _EmailDispatchOutcome:
+    """Normalized dispatch outcome produced by one inbound email route handler."""
+
+    status: str
+    consumer_ref: str
+    transaction_id: Optional[int] = None
+    receipt_ids: tuple[int, ...] = ()
+    duplicate: bool = False
+
+
+def _dispatch_dbs_alert_email(
+    db: Session,
+    payload: InboundEmailDispatchPayload,
+) -> _EmailDispatchOutcome:
+    effective_text = (
+        (payload.text_body or "").strip()
+        or html_to_plain_text(payload.html_excerpt)
+        or (payload.raw_excerpt or "").strip()
+    )
+    if not effective_text:
+        raise ValueError("DBS alert email contains no readable body.")
+    dbs_res = ingest_dbs_alert(
+        db,
+        DbsAlertPayload(
+            subject=(payload.subject or "")[:300],
+            text=effective_text,
+            from_address=(payload.from_address or "")[:200] or None,
+        ),
+        received_at=payload.received_at,
+    )
+    tx_id = dbs_res.transaction.id if dbs_res.transaction else None
+    consumer_ref = f"tx:{tx_id}" if tx_id is not None else "tx:duplicate"
+    return _EmailDispatchOutcome(
+        status="processed",
+        consumer_ref=consumer_ref,
+        transaction_id=tx_id,
+        duplicate=bool(dbs_res.duplicate),
+    )
+
+
+def _dispatch_purchase_receipt_email(
+    db: Session,
+    payload: InboundEmailDispatchPayload,
+) -> _EmailDispatchOutcome:
+    receipts = ingest_purchase_receipt_email(db, payload)
+    ids = tuple(r.id for r in receipts)
+    consumer_ref = (
+        f"receipt:{ids[0]}"
+        if len(ids) == 1
+        else f"receipts:{','.join(map(str, ids))}"
+    )
+    return _EmailDispatchOutcome(
+        status="processed",
+        consumer_ref=consumer_ref,
+        receipt_ids=ids,
+    )
+
+
+def _dispatch_payslip_email(
+    db: Session,
+    payload: InboundEmailDispatchPayload,
+) -> _EmailDispatchOutcome:
+    receipt = ingest_payslip_email(db, payload)
+    return _EmailDispatchOutcome(
+        status="processed",
+        consumer_ref=f"receipt:{receipt.id}",
+        receipt_ids=(receipt.id,),
+    )
+
+
+def _dispatch_bank_statement_email(
+    _db: Session,
+    _payload: InboundEmailDispatchPayload,
+) -> _EmailDispatchOutcome:
+    return _EmailDispatchOutcome(
+        status="needs_review",
+        consumer_ref="staged:statement",
+    )
+
+
+_EMAIL_ROUTE_DISPATCHERS: dict[
+    str, Callable[[Session, InboundEmailDispatchPayload], _EmailDispatchOutcome]
+] = {
+    "plutus_dbs_alert": _dispatch_dbs_alert_email,
+    "plutus_purchase_receipt": _dispatch_purchase_receipt_email,
+    "plutus_payslip": _dispatch_payslip_email,
+    "plutus_bank_statement": _dispatch_bank_statement_email,
+}
+
+
+def _build_duplicate_email_result(existing: IngestedEmail) -> InboundEmailDispatchResult:
+    """Build idempotent response from an already-processed IngestedEmail row."""
+    receipt_ids: list[int] = []
+    if existing.receipt_ids_json:
+        try:
+            parsed_ids = json.loads(existing.receipt_ids_json)
+            if isinstance(parsed_ids, list):
+                receipt_ids = [int(i) for i in parsed_ids]
+        except Exception:
+            receipt_ids = []
+    return InboundEmailDispatchResult(
+        status=existing.status,
+        route_target=existing.route_target,
+        message_id=existing.message_id,
+        duplicate=True,
+        consumer_ref=existing.consumer_ref,
+        transaction_id=existing.transaction_id,
+        receipt_id=receipt_ids[0] if receipt_ids else None,
+        receipt_ids=receipt_ids,
+        error_detail=existing.error_detail,
+    )
+
+
+def _upsert_processed_ingested_email(
+    db: Session,
+    payload: InboundEmailDispatchPayload,
+    outcome: _EmailDispatchOutcome,
+) -> list[int]:
+    """Persist or update the IngestedEmail audit row and return normalized receipt IDs."""
+    receipt_ids = list(outcome.receipt_ids)
+    email_record = db.scalar(
+        select(IngestedEmail).where(IngestedEmail.message_id == payload.message_id)
+    )
+    receipts_json = json.dumps(receipt_ids) if receipt_ids else None
+    if email_record is None:
+        db.add(
+            IngestedEmail(
+                message_id=payload.message_id,
+                iris_email_id=payload.email_id,
+                route_target=payload.route_target,
+                status=outcome.status,
+                consumer_ref=outcome.consumer_ref[:256],
+                transaction_id=outcome.transaction_id,
+                receipt_ids_json=receipts_json,
+                error_detail=None,
+            )
+        )
+    else:
+        email_record.iris_email_id = payload.email_id
+        email_record.route_target = payload.route_target
+        email_record.status = outcome.status
+        email_record.consumer_ref = outcome.consumer_ref[:256]
+        email_record.transaction_id = outcome.transaction_id
+        email_record.receipt_ids_json = receipts_json
+        email_record.error_detail = None
+    return receipt_ids
+
+
 @router.post("/email", response_model=InboundEmailDispatchResult)
 def receive_routed_email(
     payload: InboundEmailDispatchPayload,
@@ -471,115 +622,33 @@ def receive_routed_email(
     _authorized: bool = Depends(verify_integration_token),
 ):
     """Unified idempotent email ingestion endpoint routed from Iris Notification Gateway."""
-    existing = db.scalar(
-        select(IngestedEmail).where(IngestedEmail.message_id == payload.message_id)
-    )
+    existing = db.scalar(select(IngestedEmail).where(IngestedEmail.message_id == payload.message_id))
     if existing is not None and existing.status != "failed":
-        receipt_ids: list[int] = []
-        if existing.receipt_ids_json:
-            try:
-                parsed_ids = json.loads(existing.receipt_ids_json)
-                if isinstance(parsed_ids, list):
-                    receipt_ids = [int(i) for i in parsed_ids]
-            except Exception:
-                receipt_ids = []
-        return InboundEmailDispatchResult(
-            status=existing.status,
-            route_target=existing.route_target,
-            message_id=existing.message_id,
-            duplicate=True,
-            consumer_ref=existing.consumer_ref,
-            transaction_id=existing.transaction_id,
-            receipt_id=receipt_ids[0] if receipt_ids else None,
-            receipt_ids=receipt_ids,
-            error_detail=existing.error_detail,
-        )
+        return _build_duplicate_email_result(existing)
 
+    dispatcher = _EMAIL_ROUTE_DISPATCHERS.get(payload.route_target)
+    if dispatcher is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Unsupported route_target '{payload.route_target}'.",
+        )
     try:
-        tx_id: Optional[int] = None
-        receipt_ids: list[int] = []
-        record_status = "processed"
-        consumer_ref = ""
-        inner_duplicate = False
-
-        if payload.route_target == "plutus_dbs_alert":
-            effective_text = (
-                (payload.text_body or "").strip()
-                or html_to_plain_text(payload.html_excerpt)
-                or (payload.raw_excerpt or "").strip()
-            )
-            if not effective_text:
-                raise ValueError("DBS alert email contains no readable body.")
-            dbs_res = ingest_dbs_alert(
-                db,
-                DbsAlertPayload(
-                    subject=(payload.subject or "")[:300],
-                    text=effective_text,
-                    from_address=(payload.from_address or "")[:200] or None,
-                ),
-                received_at=payload.received_at,
-            )
-            tx_id = dbs_res.transaction.id if dbs_res.transaction else None
-            consumer_ref = f"tx:{tx_id}" if tx_id is not None else "tx:duplicate"
-            inner_duplicate = bool(dbs_res.duplicate)
-
-        elif payload.route_target == "plutus_purchase_receipt":
-            receipts = ingest_purchase_receipt_email(db, payload)
-            receipt_ids = [r.id for r in receipts]
-            consumer_ref = (
-                f"receipt:{receipt_ids[0]}"
-                if len(receipt_ids) == 1
-                else f"receipts:{','.join(map(str, receipt_ids))}"
-            )
-
-        elif payload.route_target == "plutus_bank_statement":
-            record_status = "needs_review"
-            consumer_ref = "staged:statement"
-
-        email_record = db.scalar(
-            select(IngestedEmail).where(IngestedEmail.message_id == payload.message_id)
-        )
-        if email_record is None:
-            email_record = IngestedEmail(
-                message_id=payload.message_id,
-                iris_email_id=payload.email_id,
-                route_target=payload.route_target,
-                status=record_status,
-                consumer_ref=consumer_ref[:256],
-                transaction_id=tx_id,
-                receipt_ids_json=json.dumps(receipt_ids) if receipt_ids else None,
-                error_detail=None,
-            )
-            db.add(email_record)
-        else:
-            email_record.iris_email_id = payload.email_id
-            email_record.route_target = payload.route_target
-            email_record.status = record_status
-            email_record.consumer_ref = consumer_ref[:256]
-            email_record.transaction_id = tx_id
-            email_record.receipt_ids_json = json.dumps(receipt_ids) if receipt_ids else None
-            email_record.error_detail = None
-
+        outcome = dispatcher(db, payload)
+        receipt_ids = _upsert_processed_ingested_email(db, payload, outcome)
         db.commit()
         return InboundEmailDispatchResult(
-            status=record_status,
+            status=outcome.status,
             route_target=payload.route_target,
             message_id=payload.message_id,
-            duplicate=inner_duplicate,
-            consumer_ref=consumer_ref,
-            transaction_id=tx_id,
+            duplicate=outcome.duplicate,
+            consumer_ref=outcome.consumer_ref,
+            transaction_id=outcome.transaction_id,
             receipt_id=receipt_ids[0] if receipt_ids else None,
             receipt_ids=receipt_ids,
         )
     except ValueError as exc:
         _upsert_failed_ingested_email(db, payload, str(exc))
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(exc),
-        ) from exc
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
     except ConnectorUpstreamError as exc:
         _upsert_failed_ingested_email(db, payload, str(exc))
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=str(exc),
-        ) from exc
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
