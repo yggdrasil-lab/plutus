@@ -3,6 +3,7 @@
 from collections.abc import Iterator
 from dataclasses import FrozenInstanceError, is_dataclass
 from datetime import date, timedelta
+import json
 
 import pytest
 from fastapi.testclient import TestClient
@@ -14,6 +15,7 @@ from app.db import Base, get_db
 from app.main import app
 from app.models import (
     Account,
+    AssetSnapshot,
     BudgetRule,
     Category,
     Loan,
@@ -22,17 +24,28 @@ from app.models import (
     Transaction,
     TransactionSplit,
 )
+from app.routers.mcp import (
+    _run_plutus_get_runway,
+    _run_plutus_get_weekly_burn,
+    build_mcp_server,
+)
 from app.services.category_taxonomy import ensure_default_categories
 from app.services.fx_service import to_nzd_amount
 from app.services.spending_projection import (
+    DEFAULT_WEEKLY_BURN_NZD,
+    BurnProjection,
+    CategoryBurnEstimate,
     InvalidWindowError,
     ProjectedSplit,
     ProjectedTransaction,
+    RecurringCommitmentDetail,
     ReportingWindow,
     TransactionProjection,
     TransactionQuery,
+    WeeklyCategoryBurn,
     expand_expense_lines,
     get_active_recurring_commitment_allocations,
+    project_burn,
     project_cashflow_transactions,
     project_transactions,
     project_window,
@@ -1179,3 +1192,284 @@ def test_http_summary_categories_summary_tags_and_ledger_contracts(
     assert t_xfer.id in by_id
     assert by_id[t_lent.id]["excluded_from_period_budget"] is True
     assert by_id[t_oneoff.id]["excluded_from_period_budget"] is True
+
+
+def test_project_burn_validation_and_effective_fallback_chain(memory_db: Session) -> None:
+    """project_burn validates lookback_weeks >= 1 and enforces observed -> target -> default fallback."""
+    ref = date(2026, 11, 18)
+    for invalid_weeks in (0, -1, -12):
+        with pytest.raises(InvalidWindowError, match="lookback_weeks"):
+            project_burn(memory_db, lookback_weeks=invalid_weeks, reference_date=ref)
+
+    floor_burn = project_burn(memory_db, lookback_weeks=4, reference_date=ref)
+    assert floor_burn.observed_weekly_burn == 0.0
+    assert floor_burn.effective_weekly_burn == DEFAULT_WEEKLY_BURN_NZD
+    assert floor_burn.weekly_budget_target == DEFAULT_WEEKLY_BURN_NZD
+    assert floor_burn.this_week_spend == 0.0
+    assert floor_burn.this_week_categories == ()
+
+    memory_db.add_all([
+        BudgetRule(category="Groceries", weekly_limit=150.0, monthly_limit=650.0, budget_period="weekly", is_active=True),
+        BudgetRule(category="Bills & Telco", weekly_limit=50.0, monthly_limit=216.67, budget_period="monthly", is_active=True),
+    ])
+    memory_db.commit()
+    target_burn = project_burn(memory_db, lookback_weeks=4, reference_date=ref)
+    assert target_burn.observed_weekly_burn == 0.0
+    assert target_burn.effective_weekly_burn == 200.0
+    assert target_burn.weekly_budget_target == 200.0
+
+    acct = _seed_account(memory_db)
+    memory_db.add(
+        Transaction(
+            account_id=acct.id, transaction_date=date(2026, 11, 17),
+            merchant="Local Grocer", amount=-80.0, currency="NZD", category="Groceries", raw_hash="burn-obs-1",
+        )
+    )
+    memory_db.commit()
+    obs_burn = project_burn(memory_db, lookback_weeks=4, reference_date=ref)
+    assert obs_burn.observed_weekly_burn == 20.0
+    assert obs_burn.effective_weekly_burn == 20.0
+    assert obs_burn.weekly_budget_target == 200.0
+
+
+def _seed_burn_projection_fixtures(db: Session) -> None:
+    """Seed FX, splits, receipt transfers, lent/borrowed loans, recurring splits, and annual data."""
+    nzd_acct = _seed_account(db, name="NZD Checking", currency="NZD")
+    sgd_acct = _seed_account(db, name="SGD Card", currency="SGD")
+    db.add(AssetSnapshot(
+        account_id=nzd_acct.id, snapshot_date=date(2026, 11, 18), balance=12000.0,
+        currency="NZD", exchange_rate=1.0, balance_nzd=12000.0, source="manual",
+    ))
+    lent_loan = _seed_loan(db, "Friend Advance", "lent")
+    borrowed_loan = _seed_loan(db, "Car Finance", "borrowed")
+    db.add(BudgetRule(category="Dental", weekly_limit=10.0, monthly_limit=43.33, budget_period="annual", is_active=True))
+
+    fx_dining = Transaction(
+        account_id=sgd_acct.id, transaction_date=date(2026, 11, 17),
+        merchant="SGD Bistro", amount=-100.0, currency="SGD", exchange_rate=1.30,
+        category="Dining", raw_hash="pb-fx-dining",
+    )
+    split_tx = Transaction(
+        account_id=nzd_acct.id, transaction_date=date(2026, 11, 16),
+        merchant="Mixed Split Store", amount=-100.0, currency="NZD", category="General", raw_hash="pb-split-mix",
+    )
+    split_tx.splits = [
+        TransactionSplit(amount=-40.0, category="Groceries"),
+        TransactionSplit(amount=-30.0, category="Transfers"),
+        TransactionSplit(amount=-30.0, category="Debt & Loans", loan_id=lent_loan.id),
+    ]
+    lent_tx = Transaction(
+        account_id=nzd_acct.id, transaction_date=date(2026, 11, 17),
+        merchant="Direct Lend", amount=-250.0, currency="NZD", category="Debt & Loans",
+        loan_id=lent_loan.id, raw_hash="pb-lent-out",
+    )
+    borrowed_tx = Transaction(
+        account_id=nzd_acct.id, transaction_date=date(2026, 11, 17),
+        merchant="Auto Finance", amount=-120.0, currency="NZD", category="Debt & Loans",
+        loan_id=borrowed_loan.id, raw_hash="pb-borrowed-out",
+    )
+    rec_split_tx = Transaction(
+        account_id=nzd_acct.id, transaction_date=date(2026, 10, 1),
+        merchant="Multi Utility", amount=-350.0, currency="NZD", category="General",
+        recurrence="quarterly", raw_hash="pb-rec-split",
+    )
+    rec_split_tx.splits = [
+        TransactionSplit(amount=-195.0, category="Bills & Telco"),
+        TransactionSplit(amount=-105.0, category="Software & AI"),
+        TransactionSplit(amount=-30.0, category="Transfers"),
+        TransactionSplit(amount=-20.0, category="Debt & Loans", loan_id=lent_loan.id),
+    ]
+    dental_annual = Transaction(
+        account_id=nzd_acct.id, transaction_date=date(2026, 7, 10),
+        merchant="City Dental", amount=-520.0, currency="NZD", category="Dental", raw_hash="pb-dental-365",
+    )
+    one_off = Transaction(
+        account_id=nzd_acct.id, transaction_date=date(2026, 11, 17),
+        merchant="Workstation", amount=-900.0, currency="NZD", category="Tech",
+        recurrence="one-off", raw_hash="pb-oneoff",
+    )
+    receipt_tx = Transaction(
+        account_id=nzd_acct.id, transaction_date=date(2026, 11, 16),
+        merchant="Corner Mart", amount=-100.0, currency="NZD", category="Groceries", raw_hash="pb-receipt-tx",
+    )
+    db.add_all([fx_dining, split_tx, lent_tx, borrowed_tx, rec_split_tx, dental_annual, one_off, receipt_tx])
+    db.flush()
+    receipt = Receipt(
+        transaction_id=receipt_tx.id, merchant="Corner Mart", receipt_date=date(2026, 11, 16),
+        total_amount=100.0, currency="NZD", status="matched",
+    )
+    db.add(receipt)
+    db.flush()
+    db.add_all([
+        ReceiptItem(receipt_id=receipt.id, item_name="Produce", unit_price=60.0, total_price=60.0, category="Groceries"),
+        ReceiptItem(receipt_id=receipt.id, item_name="Cash Out", unit_price=40.0, total_price=40.0, category="Transfers"),
+    ])
+    db.commit()
+
+
+def test_project_burn_detached_frozen_contract_and_reconciled_this_week(memory_db: Session) -> None:
+    """project_burn returns detached frozen DTOs, per-split recurring details, and reconciled week spend."""
+    _seed_burn_projection_fixtures(memory_db)
+    ref = date(2026, 11, 18)  # Wednesday; start_of_week = 2026-11-16
+    burn = project_burn(memory_db, lookback_weeks=4, reference_date=ref)
+    memory_db.close()
+
+    assert isinstance(burn, BurnProjection)
+    assert burn.start_of_week == date(2026, 11, 16)
+    assert burn.as_of_date == ref
+    with pytest.raises(FrozenInstanceError):
+        burn.effective_weekly_burn = 0.0  # type: ignore[misc]
+
+    # Lookback regular: Dining 130 + Groceries (40 + 60) + Debt & Loans 120 = 350 / 4 = 87.50; Dental 520 / 52 = 10.00
+    assert burn.variable_weekly_burn == 97.5
+    assert burn.recurring_weekly_burn == 23.08  # 195*4/52 (15.0) + 105*4/52 (8.08)
+    assert burn.observed_weekly_burn == 120.58
+    assert burn.effective_weekly_burn == 120.58
+    assert burn.weekly_budget_target == 10.0
+
+    # Per-split recurring commitments (split categories + actual split outflow amounts, no parent 'General')
+    assert len(burn.recurring_commitments) == 2
+    assert all(isinstance(c, RecurringCommitmentDetail) for c in burn.recurring_commitments)
+    rec_by_cat = {c.category: c for c in burn.recurring_commitments}
+    assert set(rec_by_cat.keys()) == {"Bills & Telco", "Software & AI"}
+    assert rec_by_cat["Bills & Telco"].original_amount == 195.0
+    assert rec_by_cat["Bills & Telco"].weekly_nzd == 15.0
+    assert rec_by_cat["Software & AI"].original_amount == 105.0
+    assert rec_by_cat["Software & AI"].weekly_nzd == 8.08
+
+    # Category burn estimates exclude Transfers receipt lines and lent loans
+    assert all(isinstance(c, CategoryBurnEstimate) for c in burn.categories)
+    est_by_cat = {c.category: c for c in burn.categories}
+    assert "Transfers" not in est_by_cat and "General" not in est_by_cat and "Tech" not in est_by_cat
+    assert est_by_cat["Groceries"].variable_weekly_burn == 25.0
+    assert est_by_cat["Dining"].variable_weekly_burn == 32.5
+    assert est_by_cat["Debt & Loans"].variable_weekly_burn == 30.0
+    assert est_by_cat["Dental"].variable_weekly_burn == 10.0
+
+    # this_week_categories reconciles exactly with this_week_spend
+    assert all(isinstance(c, WeeklyCategoryBurn) for c in burn.this_week_categories)
+    assert burn.this_week_variable_spend == 360.0
+    assert burn.this_week_spend == 383.08
+    assert round(sum(c.spend_nzd for c in burn.this_week_categories), 2) == burn.this_week_spend
+    wk_by_cat = {c.category: c.spend_nzd for c in burn.this_week_categories}
+    assert wk_by_cat == {
+        "Dining": 130.0,
+        "Debt & Loans": 120.0,
+        "Groceries": 100.0,
+        "Bills & Telco": 15.0,
+        "Dental": 10.0,
+        "Software & AI": 8.08,
+    }
+
+
+def _seed_today_http_and_mcp_fixtures(db: Session, today: date) -> None:
+    """Seed FX, split recurring, receipt Transfer exclusion, and lent/borrowed fixtures on `today`."""
+    nzd_acct = _seed_account(db, name="NZD Checking", currency="NZD")
+    sgd_acct = _seed_account(db, name="SGD Cash", currency="SGD")
+    db.add(AssetSnapshot(
+        account_id=nzd_acct.id, snapshot_date=today, balance=10000.0,
+        currency="NZD", exchange_rate=1.0, balance_nzd=10000.0, source="manual",
+    ))
+    lent_loan = _seed_loan(db, "Friend Loan", "lent")
+    borrowed_loan = _seed_loan(db, "Equipment Loan", "borrowed")
+    db.add_all([
+        Transaction(
+            account_id=sgd_acct.id, transaction_date=today, merchant="SGD Cafe",
+            amount=-100.0, currency="SGD", exchange_rate=1.30, category="Dining", raw_hash="hm-sgd",
+        ),
+        Transaction(
+            account_id=nzd_acct.id, transaction_date=today, merchant="Lent Out",
+            amount=-200.0, currency="NZD", category="Debt & Loans", loan_id=lent_loan.id, raw_hash="hm-lent",
+        ),
+        Transaction(
+            account_id=nzd_acct.id, transaction_date=today, merchant="Loan Payment",
+            amount=-80.0, currency="NZD", category="Debt & Loans", loan_id=borrowed_loan.id, raw_hash="hm-borr",
+        ),
+    ])
+    rec_split = Transaction(
+        account_id=nzd_acct.id, transaction_date=today, merchant="Split Monthly Plan",
+        amount=-130.0, currency="NZD", category="General", recurrence="monthly", raw_hash="hm-rec-split",
+    )
+    rec_split.splits = [
+        TransactionSplit(amount=-78.0, category="Bills & Telco"),
+        TransactionSplit(amount=-52.0, category="Transfers"),
+    ]
+    rec_tx = Transaction(
+        account_id=nzd_acct.id, transaction_date=today, merchant="Market Mart",
+        amount=-100.0, currency="NZD", category="Groceries", raw_hash="hm-mart",
+    )
+    db.add_all([rec_split, rec_tx])
+    db.flush()
+    receipt = Receipt(
+        transaction_id=rec_tx.id, merchant="Market Mart", receipt_date=today,
+        total_amount=100.0, currency="NZD", status="matched",
+    )
+    db.add(receipt)
+    db.flush()
+    db.add_all([
+        ReceiptItem(receipt_id=receipt.id, item_name="Food", unit_price=60.0, total_price=60.0, category="Groceries"),
+        ReceiptItem(receipt_id=receipt.id, item_name="Cash Out", unit_price=40.0, total_price=40.0, category="Transfers"),
+    ])
+    db.commit()
+
+
+def test_http_burn_sync_runway_and_mcp_weekly_burn_contracts(
+    api_client: TestClient,
+    memory_db: Session,
+) -> None:
+    """HTTP /budgets/average-burn, /sync-from-burn, /runway, and MCP weekly burn stay unified."""
+    today = date.today()
+    _seed_today_http_and_mcp_fixtures(memory_db, today)
+
+    # Direct MCP tool unit checks
+    server = build_mcp_server()
+    assert server.name == "plutus"
+    mcp_weekly = json.loads(_run_plutus_get_weekly_burn(db=memory_db, reference_date=today))
+    assert set(mcp_weekly.keys()) == {
+        "start_of_week",
+        "as_of_date",
+        "this_week_spend_nzd",
+        "weekly_budget_target_nzd",
+        "remaining_budget_nzd",
+        "time_banked_weeks",
+        "categories",
+    }
+    # 130 Dining + 60 Groceries + 80 Debt & Loans + (78 * 12 / 52 = 18.0) Bills & Telco = 288.0
+    assert mcp_weekly["this_week_spend_nzd"] == 288.0
+    assert mcp_weekly["categories"] == {
+        "Dining": 130.0,
+        "Debt & Loans": 80.0,
+        "Groceries": 60.0,
+        "Bills & Telco": 18.0,
+    }
+    assert round(sum(mcp_weekly["categories"].values()), 2) == mcp_weekly["this_week_spend_nzd"]
+
+    mcp_runway = json.loads(_run_plutus_get_runway(db=memory_db, reference_date=today))
+    # 4w variable = (130 + 60 + 80) / 4 = 67.50; recurring = 18.00 -> effective = 85.50
+    assert mcp_runway["weekly_burn_rate_nzd"] == 85.5
+    assert mcp_runway["breakdown"]["cash_balance_nzd"] == 10000.0
+
+    # HTTP /budgets/average-burn & /budgets/sync-from-burn
+    avg_res = api_client.get("/budgets/average-burn?lookback_weeks=4")
+    assert avg_res.status_code == 200
+    avg_body = avg_res.json()
+    assert avg_body["effective_weekly_burn"] == 85.5
+    assert len(avg_body["recurring_commitments"]) == 1
+    assert avg_body["recurring_commitments"][0]["category"] == "Bills & Telco"
+    assert avg_body["recurring_commitments"][0]["original_amount"] == 78.0
+    avg_cats = {c["category"]: c["average_weekly_burn"] for c in avg_body["categories"]}
+    assert avg_cats == {"Dining": 32.5, "Debt & Loans": 20.0, "Bills & Telco": 18.0, "Groceries": 15.0}
+
+    sync_res = api_client.post("/budgets/sync-from-burn?lookback_weeks=4")
+    assert sync_res.status_code == 200
+    synced = {r["category"]: r["weekly_limit"] for r in sync_res.json()}
+    assert synced == avg_cats
+
+    # HTTP /runway parity
+    runway_res = api_client.get("/runway")
+    assert runway_res.status_code == 200
+    runway_body = runway_res.json()
+    assert runway_body["weekly_spend_this_week"] == 288.0
+    assert runway_body["breakdown"]["weekly_burn_rate"] == 85.5
+    assert runway_body["breakdown"]["variable_weekly_burn"] == 67.5
+    assert runway_body["breakdown"]["recurring_weekly_burn"] == 18.0
