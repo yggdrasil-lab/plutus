@@ -21,11 +21,13 @@ from app.models import (
     TransactionSplit,
 )
 from app.services.category_taxonomy import ensure_default_categories
+from app.services.fx_service import to_nzd_amount
 from app.services.spending_projection import (
     InvalidWindowError,
     ReportingWindow,
     expand_expense_lines,
     get_active_recurring_commitment_allocations,
+    project_cashflow_transactions,
     project_window,
     resolve_reporting_window,
 )
@@ -490,3 +492,293 @@ def test_budgets_breakdown_http_400_and_midas_json_parity(
     assert groc["percent_used"] == 80.0
     assert groc["warning_level"] == "warning"
     assert groc["parent_category"] == "Food"
+
+
+def _effective_cashflow_amount_nzd(item) -> float:
+    """Compute Reporting Currency NZD magnitude for one ProjectedCashflowItem."""
+    tx = item.transaction
+    raw_amt = (
+        item.projected_amount
+        if item.projected_amount is not None
+        else float(tx.amount)
+    )
+    return round(to_nzd_amount(abs(raw_amt), tx.currency, tx.exchange_rate), 2)
+
+
+def test_project_cashflow_transactions_validation_and_exact_window_parity(
+    memory_db: Session,
+) -> None:
+    """project_cashflow_transactions enforces invariants and reconciles with project_window."""
+    ref = date(2026, 11, 18)  # Wednesday; week=Nov16..22, last_week=Nov9..15, month=Nov1..18, last_month=Oct1..31
+    checking = _seed_account(memory_db, name="Primary Checking", currency="NZD")
+    sgd_acct = _seed_account(memory_db, name="SGD Cash", currency="SGD")
+
+    lent_loan = Loan(
+        name="Loan to Alex",
+        lender="Alex Tan",
+        loan_type="lent",
+        principal_amount=2000.0,
+        annual_interest_rate=0.0,
+        term_months=0,
+        monthly_payment=0.0,
+        currency="NZD",
+        start_date=date(2026, 1, 1),
+        is_active=True,
+    )
+    borrowed_loan = Loan(
+        name="Car Finance",
+        lender="North Bank",
+        loan_type="borrowed",
+        principal_amount=5000.0,
+        annual_interest_rate=5.0,
+        term_months=24,
+        monthly_payment=250.0,
+        currency="NZD",
+        start_date=date(2026, 1, 1),
+        is_active=True,
+    )
+    memory_db.add_all([lent_loan, borrowed_loan])
+    memory_db.flush()
+
+    memory_db.add(
+        BudgetRule(
+            category="Dental",
+            weekly_limit=10.0,
+            monthly_limit=43.33,
+            budget_period="annual",
+            is_active=True,
+        )
+    )
+
+    # 1. Standard salary inflow + payslip receipt
+    salary = Transaction(
+        account_id=checking.id,
+        transaction_date=date(2026, 11, 17),
+        merchant="Acme Payroll",
+        amount=3000.0,
+        currency="NZD",
+        category="Income",
+        raw_hash="cf-salary-nov17",
+    )
+    # 2. Mixed-sign split on net-negative parent (-50 = -80 Dining + 30 Income)
+    mixed_neg = Transaction(
+        account_id=checking.id,
+        transaction_date=date(2026, 11, 16),
+        merchant="Dinner Refund Split",
+        amount=-50.0,
+        currency="NZD",
+        category="Dining",
+        tags='["social"]',
+        raw_hash="cf-mixed-neg-nov16",
+    )
+    mixed_neg.splits = [
+        TransactionSplit(amount=-80.0, category="Dining", tags='["dinner"]'),
+        TransactionSplit(amount=30.0, category="Income", tags='["split-back"]'),
+    ]
+    # 3. Mixed-sign split on net-positive parent (+137.17 = +1000 lent + -862.83 Travel)
+    mixed_pos = Transaction(
+        account_id=checking.id,
+        transaction_date=date(2026, 11, 12),
+        merchant="Travel Reimbursement + Ticket",
+        amount=137.17,
+        currency="NZD",
+        category="General",
+        raw_hash="cf-mixed-pos-nov12",
+    )
+    mixed_pos.splits = [
+        TransactionSplit(amount=1000.0, category="Debt & Loans", loan_id=lent_loan.id),
+        TransactionSplit(amount=-862.83, category="Travel", tags='["trip"]'),
+    ]
+    # 4. Partial lent repayment in SGD (150 SGD * 1.30 = 195 NZD; 100 SGD lent -> 50 SGD = 65 NZD income)
+    partial_sgd = Transaction(
+        account_id=sgd_acct.id,
+        transaction_date=date(2026, 10, 20),
+        merchant="Alex Partial Return",
+        amount=150.0,
+        currency="SGD",
+        exchange_rate=1.30,
+        category="Debt & Loans",
+        loan_id=lent_loan.id,
+        loan_payment_amount=100.0,
+        raw_hash="cf-partial-sgd-oct20",
+    )
+    # 5. Pure lent repayment (loan_payment_amount is None -> 0 income) & lent disbursement
+    pure_repay = Transaction(
+        account_id=checking.id,
+        transaction_date=date(2026, 11, 18),
+        merchant="Alex Pure Repayment",
+        amount=200.0,
+        currency="NZD",
+        category="Debt & Loans",
+        loan_id=lent_loan.id,
+        raw_hash="cf-pure-repay-nov18",
+    )
+    lent_out = Transaction(
+        account_id=checking.id,
+        transaction_date=date(2026, 11, 18),
+        merchant="Advance to Alex",
+        amount=-400.0,
+        currency="NZD",
+        category="Debt & Loans",
+        loan_id=lent_loan.id,
+        raw_hash="cf-lent-out-nov18",
+    )
+    borrowed_out = Transaction(
+        account_id=checking.id,
+        transaction_date=date(2026, 11, 17),
+        merchant="Car Loan Repayment",
+        amount=-250.0,
+        currency="NZD",
+        category="Debt & Loans",
+        loan_id=borrowed_loan.id,
+        raw_hash="cf-borrowed-out-nov17",
+    )
+    # 6. Transfer parent (always excluded) + mixed receipt (Groceries 60 + Transfers 40)
+    transfer_parent = Transaction(
+        account_id=checking.id,
+        transaction_date=date(2026, 11, 17),
+        merchant="Internal Transfer",
+        amount=-500.0,
+        currency="NZD",
+        category="Transfers",
+        raw_hash="cf-xfer-nov17",
+    )
+    mixed_receipt_tx = Transaction(
+        account_id=checking.id,
+        transaction_date=date(2026, 11, 17),
+        merchant="North Shore Mart",
+        amount=-100.0,
+        currency="NZD",
+        category="Groceries",
+        raw_hash="cf-receipt-mix-nov17",
+    )
+    # 7. Recurring monthly + one-off + Annualized Dental
+    rec_monthly = Transaction(
+        account_id=checking.id,
+        transaction_date=date(2026, 11, 5),
+        merchant="Cloud Storage",
+        amount=-52.0,
+        currency="NZD",
+        category="Software & AI",
+        recurrence="monthly",
+        raw_hash="cf-rec-mon-nov05",
+    )
+    one_off = Transaction(
+        account_id=checking.id,
+        transaction_date=date(2026, 11, 17),
+        merchant="Laptop Upgrade",
+        amount=-1200.0,
+        currency="NZD",
+        category="Tech",
+        recurrence="one-off",
+        raw_hash="cf-oneoff-nov17",
+    )
+    dental_raw = Transaction(
+        account_id=checking.id,
+        transaction_date=date(2026, 10, 15),
+        merchant="South Island Dental",
+        amount=-240.0,
+        currency="NZD",
+        category="Dental",
+        raw_hash="cf-dental-oct15",
+    )
+
+    memory_db.add_all(
+        [
+            salary,
+            mixed_neg,
+            mixed_pos,
+            partial_sgd,
+            pure_repay,
+            lent_out,
+            borrowed_out,
+            transfer_parent,
+            mixed_receipt_tx,
+            rec_monthly,
+            one_off,
+            dental_raw,
+        ]
+    )
+    memory_db.flush()
+
+    receipt = Receipt(
+        transaction_id=mixed_receipt_tx.id,
+        merchant="North Shore Mart",
+        receipt_date=date(2026, 11, 17),
+        total_amount=100.0,
+        currency="NZD",
+        status="matched",
+    )
+    memory_db.add(receipt)
+    memory_db.flush()
+    memory_db.add_all(
+        [
+            ReceiptItem(
+                receipt_id=receipt.id,
+                item_name="Fresh Veg",
+                unit_price=60.0,
+                total_price=60.0,
+                category="Groceries",
+            ),
+            ReceiptItem(
+                receipt_id=receipt.id,
+                item_name="Cash Withdrawal",
+                unit_price=40.0,
+                total_price=40.0,
+                category="Transfers",
+            ),
+        ]
+    )
+    memory_db.commit()
+
+    # Parameter validation
+    with pytest.raises(InvalidWindowError, match="flow must be"):
+        project_cashflow_transactions(memory_db, ReportingWindow(period="month"), flow="net")  # type: ignore[arg-type]
+    with pytest.raises(InvalidWindowError, match="offset must be"):
+        project_cashflow_transactions(memory_db, ReportingWindow(period="month"), flow="inflow", offset=-1)
+
+    for period in ("week", "last_week", "month", "last_month", "annual", "all"):
+        win = ReportingWindow(period=period)
+        wp = project_window(memory_db, win, group_by="leaf", reference_date=ref)
+
+        inflow_res = project_cashflow_transactions(
+            memory_db, win, flow="inflow", include_amortized=True, limit=500, reference_date=ref
+        )
+        inflow_sum = round(sum(_effective_cashflow_amount_nzd(it) for it in inflow_res.items), 2)
+        assert inflow_sum == wp.total_income, f"Inflow mismatch on period={period}"
+        assert all(not it.excluded_from_period_budget for it in inflow_res.items)
+
+        outflow_res = project_cashflow_transactions(
+            memory_db, win, flow="outflow", include_amortized=True, limit=500, reference_date=ref
+        )
+        actual_sum = sum(
+            _effective_cashflow_amount_nzd(it)
+            for it in outflow_res.items
+            if not it.is_amortized_commitment and not it.excluded_from_period_budget
+        )
+        amort_sum = sum(
+            float(it.amortized_period_amount_nzd or 0.0)
+            for it in outflow_res.items
+            if it.is_amortized_commitment
+        )
+        # On weekly/monthly windows, Dental 365-day smoothing (240 / divisor) lives in breakdown categories
+        annual_cats_smoothed = 0.0
+        if period in ("week", "last_week"):
+            annual_cats_smoothed = round(240.0 / 52.0, 2)
+        elif period in ("month", "last_month"):
+            annual_cats_smoothed = round(240.0 / 12.0, 2)
+        assert round(actual_sum + amort_sum + annual_cats_smoothed, 2) == wp.total_spend, (
+            f"Outflow mismatch on period={period}"
+        )
+
+    # Custom date window parity
+    custom_win = ReportingWindow(start_date=date(2026, 11, 1), end_date=date(2026, 11, 18))
+    wp_custom = project_window(memory_db, custom_win, group_by="leaf", reference_date=ref)
+    cf_custom_in = project_cashflow_transactions(
+        memory_db, custom_win, flow="inflow", limit=500, reference_date=ref
+    )
+    cf_custom_out = project_cashflow_transactions(
+        memory_db, custom_win, flow="outflow", include_amortized=False, limit=500, reference_date=ref
+    )
+    assert round(sum(_effective_cashflow_amount_nzd(it) for it in cf_custom_in.items), 2) == wp_custom.total_income
+    assert round(sum(_effective_cashflow_amount_nzd(it) for it in cf_custom_out.items), 2) == wp_custom.total_spend
