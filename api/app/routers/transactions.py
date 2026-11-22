@@ -2,9 +2,9 @@
 
 from datetime import date, timedelta
 import json
-from typing import Optional
+from typing import Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.orm import Session, joinedload
 
@@ -35,6 +35,13 @@ from app.services.recurrence_service import (
     is_recurrence_excluded_from_period,
 )
 from app.services.rules_engine import normalize_tags, parse_rule_tags
+from app.services.spending_projection import (
+    FlowLiteral,
+    InvalidWindowError,
+    ProjectedCashflowItem,
+    ReportingWindow,
+    project_cashflow_transactions,
+)
 from app.services.statement_parser import generate_transaction_hash
 from app.services.transfer_service import reconcile_transfers
 
@@ -339,32 +346,232 @@ def _collect_amortized_commitments(
     return amortized_results
 
 
-@router.get("", response_model=list[TransactionRead])
-def list_transactions(
-    start_date: Optional[date] = Query(default=None),
-    end_date: Optional[date] = Query(default=None),
-    category: Optional[str] = Query(default=None),
-    include_subclasses: bool = Query(default=False, description="Match child categories inheriting from category"),
-    include_amortized: bool = Query(
-        default=False,
-        description="Include active amortized recurring commitments and flag period-excluded items when inspecting a named weekly/monthly category",
-    ),
-    tag: Optional[str] = Query(default=None),
-    period: Optional[str] = Query(
-        default=None,
-        description="'week', 'last_week', 'month', 'last_month', 'annual', or 'all'",
-    ),
-    account_id: Optional[int] = Query(default=None),
-    loan_id: Optional[int] = Query(default=None),
-    limit: int = Query(default=100, ge=1, le=500),
-    db: Session = Depends(get_db),
-):
-    """List transactions with optional date range, period, account_id, loan_id, category, and tag filters."""
-    effective_period = None if (start_date is not None or end_date is not None) else period
-    start_date, end_date = resolve_period_dates(effective_period, start_date, end_date)
-    ref_date = end_date or date.today()
-    amortized_recurrences = get_period_amortized_recurrences(effective_period)
+def _projected_item_to_read(item: ProjectedCashflowItem) -> TransactionRead:
+    """Hydrate a ProjectedCashflowItem into TransactionRead with projection overrides."""
+    tx = hydrate_transaction(item.transaction)
+    updates: dict[str, object] = {}
+    if item.projected_amount is not None:
+        updates["amount"] = item.projected_amount
+    if item.projected_category is not None:
+        updates["category"] = item.projected_category
+    if item.projected_tags is not None:
+        updates["tags"] = list(item.projected_tags)
+    if item.projected_notes is not None:
+        updates["notes"] = item.projected_notes
+    if item.is_split is not None:
+        updates["is_split"] = item.is_split
+    if item.is_receipt_split:
+        updates["is_receipt_split"] = True
+    if item.excluded_from_period_budget:
+        updates["excluded_from_period_budget"] = True
+    if item.is_amortized_commitment:
+        updates["is_amortized_commitment"] = True
+        updates["amortized_period_amount_nzd"] = item.amortized_period_amount_nzd
+        updates["amortized_cadence"] = item.amortized_cadence
+    dto = TransactionRead.model_validate(tx)
+    return dto.model_copy(update=updates) if updates else dto
 
+
+def _list_cashflow_transactions(
+    db: Session,
+    response: Response,
+    *,
+    flow: FlowLiteral,
+    period: Optional[str],
+    start_date: Optional[date],
+    end_date: Optional[date],
+    category: Optional[str],
+    include_subclasses: bool,
+    include_amortized: bool,
+    account_id: Optional[int],
+    loan_id: Optional[int],
+    tag: Optional[str],
+    offset: int,
+    limit: int,
+) -> list[TransactionRead]:
+    """Execute Spending Projection cashflow query and expose X-Total-Count."""
+    try:
+        result = project_cashflow_transactions(
+            db,
+            ReportingWindow(period=period, start_date=start_date, end_date=end_date),
+            flow=flow,
+            category=category,
+            include_subclasses=include_subclasses,
+            include_amortized=include_amortized,
+            account_id=account_id,
+            loan_id=loan_id,
+            tag=tag,
+            offset=offset,
+            limit=limit,
+        )
+    except InvalidWindowError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    response.headers["X-Total-Count"] = str(result.total_count)
+    return [_projected_item_to_read(item) for item in result.items]
+
+
+def _filter_legacy_rows(
+    rows,
+    *,
+    effective_period: Optional[str],
+    category: Optional[str],
+    target_cat: Optional[str],
+    target_tag: Optional[str],
+    include_subclasses: bool,
+    should_include_amortized: bool,
+    amortized_tx_ids: set[int],
+    parent_map: Optional[dict[str, str]],
+) -> list[TransactionRead]:
+    """Hydrate, filter, and flag legacy rows matching category or tag filters."""
+    matching: list[TransactionRead] = []
+    for tx in rows:
+        if tx.id in amortized_tx_ids:
+            continue
+        hydrate_transaction(tx)
+        dto = _matches_receipt_transaction_filter(
+            tx,
+            category=category,
+            target_cat=target_cat,
+            target_tag=target_tag,
+            include_subclasses=include_subclasses,
+            parent_map=parent_map,
+        )
+        if dto is None:
+            continue
+        if should_include_amortized and (
+            float(dto.amount) >= 0
+            or is_recurrence_excluded_from_period(effective_period, tx.recurrence)
+        ):
+            dto = dto.model_copy(update={"excluded_from_period_budget": True})
+        matching.append(dto)
+    return matching
+
+
+def _list_legacy_filtered_transactions(
+    db: Session,
+    response: Response,
+    ordered_stmt,
+    *,
+    ref_date: date,
+    effective_period: Optional[str],
+    category: Optional[str],
+    target_cat: Optional[str],
+    target_tag: Optional[str],
+    include_subclasses: bool,
+    include_amortized: bool,
+    account_id: Optional[int],
+    amortized_recurrences: frozenset[str],
+    offset: int,
+    limit: int,
+) -> list[TransactionRead]:
+    """Legacy category/tag-filtered transaction listing preserved when flow is None."""
+    parent_map = get_category_parent_map(db) if include_subclasses else None
+    should_include_amortized = bool(
+        include_amortized
+        and target_cat
+        and target_cat not in TRANSFER_CATEGORIES
+        and not target_tag
+        and amortized_recurrences
+    )
+    amortized_results = (
+        _collect_amortized_commitments(
+            db,
+            ref_date=ref_date,
+            effective_period=effective_period,
+            target_cat=target_cat or "",
+            include_subclasses=include_subclasses,
+            account_id=account_id,
+            amortized_recurrences=amortized_recurrences,
+            parent_map=parent_map,
+        )
+        if should_include_amortized
+        else []
+    )
+    amortized_tx_ids = {item.id for item in amortized_results}
+    max_actual = max(0, limit - len(amortized_results)) if should_include_amortized else limit
+    matching = _filter_legacy_rows(
+        db.scalars(ordered_stmt).unique().all(),
+        effective_period=effective_period,
+        category=category,
+        target_cat=target_cat,
+        target_tag=target_tag,
+        include_subclasses=include_subclasses,
+        should_include_amortized=should_include_amortized,
+        amortized_tx_ids=amortized_tx_ids,
+        parent_map=parent_map,
+    )
+    response.headers["X-Total-Count"] = str(len(matching))
+    sliced = matching[offset : offset + max_actual] if max_actual > 0 else []
+    if should_include_amortized and offset == 0:
+        return sliced + amortized_results[:limit]
+    return sliced
+
+
+def _list_legacy_transactions(
+    db: Session,
+    response: Response,
+    *,
+    start_date: Optional[date],
+    end_date: Optional[date],
+    category: Optional[str],
+    include_subclasses: bool,
+    include_amortized: bool,
+    tag: Optional[str],
+    period: Optional[str],
+    account_id: Optional[int],
+    loan_id: Optional[int],
+    offset: int,
+    limit: int,
+) -> list[TransactionRead]:
+    """Preserve legacy GET /transactions listing semantics when flow is omitted."""
+    effective_period = None if (start_date is not None or end_date is not None) else period
+    resolved_start, resolved_end = resolve_period_dates(effective_period, start_date, end_date)
+    ref_date = resolved_end or date.today()
+    amortized_recurrences = get_period_amortized_recurrences(effective_period)
+    stmt = _build_legacy_base_statement(
+        start_date=resolved_start,
+        end_date=resolved_end,
+        account_id=account_id,
+        loan_id=loan_id,
+    )
+    ordered_stmt = stmt.order_by(desc(Transaction.transaction_date), desc(Transaction.id))
+    target_cat = category.strip().lower() if category else None
+    target_tag = tag.strip().lower().lstrip("#").replace(" ", "-") if tag else None
+
+    if target_cat or target_tag:
+        return _list_legacy_filtered_transactions(
+            db,
+            response,
+            ordered_stmt,
+            ref_date=ref_date,
+            effective_period=effective_period,
+            category=category,
+            target_cat=target_cat,
+            target_tag=target_tag,
+            include_subclasses=include_subclasses,
+            include_amortized=include_amortized,
+            account_id=account_id,
+            amortized_recurrences=amortized_recurrences,
+            offset=offset,
+            limit=limit,
+        )
+
+    total_count = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+    response.headers["X-Total-Count"] = str(total_count)
+    txs = db.scalars(ordered_stmt.offset(offset).limit(limit)).unique().all()
+    for tx in txs:
+        hydrate_transaction(tx)
+    return [TransactionRead.model_validate(tx) for tx in txs]
+
+
+def _build_legacy_base_statement(
+    *,
+    start_date: Optional[date],
+    end_date: Optional[date],
+    account_id: Optional[int],
+    loan_id: Optional[int],
+):
+    """Build base Transaction query with account, loan, and date predicates."""
     stmt = select(Transaction).options(*_transaction_load_options(include_receipt_items=True))
     if account_id is not None:
         stmt = stmt.where(
@@ -387,69 +594,65 @@ def list_transactions(
         stmt = stmt.where(Transaction.transaction_date >= start_date)
     if end_date:
         stmt = stmt.where(Transaction.transaction_date <= end_date)
+    return stmt
 
-    ordered_stmt = stmt.order_by(desc(Transaction.transaction_date), desc(Transaction.id))
-    target_cat = category.strip().lower() if category else None
-    target_tag = tag.strip().lower().lstrip("#").replace(" ", "-") if tag else None
 
-    if target_cat or target_tag:
-        parent_map = get_category_parent_map(db) if include_subclasses else None
-        should_include_amortized = bool(
-            include_amortized
-            and target_cat
-            and target_cat not in TRANSFER_CATEGORIES
-            and not target_tag
-            and amortized_recurrences
+@router.get("", response_model=list[TransactionRead])
+def list_transactions(
+    response: Response,
+    start_date: Optional[date] = Query(default=None),
+    end_date: Optional[date] = Query(default=None),
+    category: Optional[str] = Query(default=None),
+    include_subclasses: bool = Query(default=False, description="Match child categories inheriting from category"),
+    include_amortized: bool = Query(
+        default=False,
+        description="Include active amortized recurring commitments and flag period-excluded items when inspecting a named weekly/monthly category",
+    ),
+    tag: Optional[str] = Query(default=None),
+    period: Optional[str] = Query(
+        default=None,
+        description="'week', 'last_week', 'month', 'last_month', 'annual', or 'all'",
+    ),
+    account_id: Optional[int] = Query(default=None),
+    loan_id: Optional[int] = Query(default=None),
+    flow: Optional[Literal["inflow", "outflow"]] = Query(default=None),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    """List transactions with optional flow projection, date range, period, account_id, loan_id, category, and tag filters."""
+    if flow is not None:
+        return _list_cashflow_transactions(
+            db,
+            response,
+            flow=flow,
+            period=period,
+            start_date=start_date,
+            end_date=end_date,
+            category=category,
+            include_subclasses=include_subclasses,
+            include_amortized=include_amortized,
+            account_id=account_id,
+            loan_id=loan_id,
+            tag=tag,
+            offset=offset,
+            limit=limit,
         )
-        amortized_results = (
-            _collect_amortized_commitments(
-                db,
-                ref_date=ref_date,
-                effective_period=effective_period,
-                target_cat=target_cat,
-                include_subclasses=include_subclasses,
-                account_id=account_id,
-                amortized_recurrences=amortized_recurrences,
-                parent_map=parent_map,
-            )
-            if should_include_amortized
-            else []
-        )
-        amortized_tx_ids = {item.id for item in amortized_results}
-        max_actual = max(0, limit - len(amortized_results)) if should_include_amortized else limit
-
-        rows = db.scalars(ordered_stmt).unique().all()
-        results: list[TransactionRead] = []
-        if max_actual > 0:
-            for tx in rows:
-                if tx.id in amortized_tx_ids:
-                    continue
-                hydrate_transaction(tx)
-                dto = _matches_receipt_transaction_filter(
-                    tx,
-                    category=category,
-                    target_cat=target_cat,
-                    target_tag=target_tag,
-                    include_subclasses=include_subclasses,
-                    parent_map=parent_map,
-                )
-                if dto is not None:
-                    if should_include_amortized and (
-                        float(dto.amount) >= 0
-                        or is_recurrence_excluded_from_period(effective_period, tx.recurrence)
-                    ):
-                        dto = dto.model_copy(update={"excluded_from_period_budget": True})
-                    results.append(dto)
-                    if len(results) >= max_actual:
-                        break
-        if should_include_amortized:
-            return results[:max_actual] + amortized_results[:limit]
-        return results
-
-    txs = db.scalars(ordered_stmt.limit(limit)).unique().all()
-    for tx in txs:
-        hydrate_transaction(tx)
-    return txs
+    return _list_legacy_transactions(
+        db,
+        response,
+        start_date=start_date,
+        end_date=end_date,
+        category=category,
+        include_subclasses=include_subclasses,
+        include_amortized=include_amortized,
+        tag=tag,
+        period=period,
+        account_id=account_id,
+        loan_id=loan_id,
+        offset=offset,
+        limit=limit,
+    )
 
 
 @router.patch("/{transaction_id}", response_model=TransactionRead)

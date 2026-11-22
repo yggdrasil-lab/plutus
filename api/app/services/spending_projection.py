@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Literal, Optional
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session, joinedload
 
 from app.models import BudgetRule, Category, Receipt, Transaction, TransactionSplit
@@ -19,6 +19,7 @@ from app.services.rules_engine import normalize_tags, parse_rule_tags
 
 PeriodLiteral = Literal["week", "last_week", "month", "last_month", "annual", "year", "all"]
 GroupByLiteral = Literal["leaf", "base"]
+FlowLiteral = Literal["inflow", "outflow"]
 
 VALID_PERIODS: tuple[str, ...] = (
     "week",
@@ -145,6 +146,54 @@ class WindowProjection:
     net_savings: float
     categories: tuple[CategoryProjection, ...]
     over_budget_count: int
+
+
+@dataclass(frozen=True)
+class ProjectedCashflowItem:
+    """Immutable cashflow row aligned to a source Transaction and optional slice overrides."""
+
+    transaction: Transaction
+    projected_amount: Optional[float] = None
+    projected_category: Optional[str] = None
+    projected_tags: Optional[tuple[str, ...]] = None
+    projected_notes: Optional[str] = None
+    is_split: Optional[bool] = None
+    is_receipt_split: bool = False
+    excluded_from_period_budget: bool = False
+    is_amortized_commitment: bool = False
+    amortized_period_amount_nzd: Optional[float] = None
+    amortized_cadence: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class CashflowProjectionResult:
+    """Paginated cashflow projection rows and pre-slice non-amortized total count."""
+
+    items: tuple[ProjectedCashflowItem, ...]
+    total_count: int
+
+
+@dataclass(frozen=True)
+class _AnnualCategoryMetadata:
+    """Resolved taxonomy, active BudgetRules, and Annualized Category sets without 365d sums."""
+
+    resolved: ResolvedWindow
+    rollup_base: bool
+    parent_map: dict[str, str]
+    canonical_name_map: dict[str, str]
+    raw_budget_rules: dict[str, BudgetRule]
+    annual_cats: frozenset[str]
+    annual_base_roots: frozenset[str]
+
+    def resolve_category(self, category: str) -> str:
+        return get_root_category(category, self.parent_map) if self.rollup_base else category
+
+    def is_smoothed_annual(self, raw_lower: str, effective_lower: str) -> bool:
+        if not self.resolved.is_budget_cadence_window:
+            return False
+        return raw_lower in self.annual_cats or (
+            self.rollup_base and effective_lower in self.annual_base_roots
+        )
 
 
 @dataclass(frozen=True)
@@ -352,31 +401,19 @@ def _expand_manual_split_lines(
     return lines
 
 
-def _expand_receipt_or_parent_lines(
+def _scale_receipt_expense_lines(
     tx: Transaction,
     tx_cat: str,
     parent_tags: list[str],
-) -> list[ExpenseLine]:
-    """Expand an unsplit transaction via receipt line items or parent category in NZD."""
-    if float(tx.amount) >= 0 or _is_lent_loan(getattr(tx, "loan", None)):
-        return []
-    if tx_cat.lower() in TRANSFER_CATEGORIES:
-        return []
-
+) -> tuple[list[ExpenseLine], int, float]:
+    """Scale positive receipt items pro-rata to NZD, returning (non_transfer_lines, positive_item_count, tx_nzd)."""
     tx_nzd = round(to_nzd_amount(abs(float(tx.amount)), tx.currency, tx.exchange_rate), 2)
     receipt = getattr(tx, "receipt", None)
     items = getattr(receipt, "items", None) if receipt is not None else None
     positive_items = [it for it in (items or []) if float(it.total_price) > 0]
     items_sum = sum(float(it.total_price) for it in positive_items)
     if items_sum <= 0 or not positive_items:
-        return [
-            ExpenseLine(
-                category=tx_cat,
-                amount_nzd=tx_nzd,
-                effective_tags=tuple(parent_tags),
-                source="parent",
-            )
-        ]
+        return [], 0, tx_nzd
 
     scale = tx_nzd / items_sum
     scaled = [
@@ -400,7 +437,32 @@ def _expand_receipt_or_parent_lines(
             item_name=target.item_name,
             source=target.source,
         )
-    return [line for line in scaled if line.category.lower() not in TRANSFER_CATEGORIES]
+    non_transfer = [line for line in scaled if line.category.lower() not in TRANSFER_CATEGORIES]
+    return non_transfer, len(positive_items), tx_nzd
+
+
+def _expand_receipt_or_parent_lines(
+    tx: Transaction,
+    tx_cat: str,
+    parent_tags: list[str],
+) -> list[ExpenseLine]:
+    """Expand an unsplit transaction via receipt line items or parent category in NZD."""
+    if float(tx.amount) >= 0 or _is_lent_loan(getattr(tx, "loan", None)):
+        return []
+    if tx_cat.lower() in TRANSFER_CATEGORIES:
+        return []
+
+    scaled, positive_count, tx_nzd = _scale_receipt_expense_lines(tx, tx_cat, parent_tags)
+    if positive_count > 0:
+        return scaled
+    return [
+        ExpenseLine(
+            category=tx_cat,
+            amount_nzd=tx_nzd,
+            effective_tags=tuple(parent_tags),
+            source="parent",
+        )
+    ]
 
 
 def expand_expense_buckets(tx: Transaction) -> list[tuple[str, float]]:
@@ -414,14 +476,48 @@ def expand_expense_buckets(tx: Transaction) -> list[tuple[str, float]]:
     return [(canonical[key], round(amt, 2)) for key, amt in grouped.items()]
 
 
-def _query_recurring_candidate_transactions(db: Session, as_of: date) -> list[Transaction]:
+def _transaction_eager_options(
+    *,
+    include_receipt_items: bool = True,
+    eager_hydrate: bool = False,
+):
+    """Return consistent SQLAlchemy joinedload options for projection and optional hydration."""
+    receipt_load = (
+        joinedload(Transaction.receipt).joinedload(Receipt.items)
+        if include_receipt_items
+        else joinedload(Transaction.receipt)
+    )
+    options = [
+        receipt_load,
+        joinedload(Transaction.loan),
+        joinedload(Transaction.splits).joinedload(TransactionSplit.loan),
+    ]
+    if eager_hydrate:
+        options.extend(
+            [
+                joinedload(Transaction.account),
+                joinedload(Transaction.counterpart_account),
+                joinedload(Transaction.linked_transaction).joinedload(Transaction.account),
+            ]
+        )
+    return tuple(options)
+
+
+def _query_recurring_candidate_transactions(
+    db: Session,
+    as_of: date,
+    *,
+    eager_hydrate: bool = False,
+) -> list[Transaction]:
     """Fetch candidate recurring outflow transactions within the maximum 366-day lookback."""
     max_lookback = as_of - timedelta(days=366)
     stmt = (
         select(Transaction)
         .options(
-            joinedload(Transaction.loan),
-            joinedload(Transaction.splits).joinedload(TransactionSplit.loan),
+            *_transaction_eager_options(
+                include_receipt_items=False,
+                eager_hydrate=eager_hydrate,
+            )
         )
         .where(
             Transaction.transaction_date >= max_lookback,
@@ -441,14 +537,16 @@ def _query_recurring_candidate_transactions(db: Session, as_of: date) -> list[Tr
     return list(db.scalars(stmt).unique().all())
 
 
-def get_active_recurring_commitment_allocations(
+def _iter_active_recurring_allocations(
     db: Session,
     as_of: date,
-) -> list[RecurringCommitmentAllocation]:
-    """Return per-category active recurring commitment allocations within lookback windows."""
-    rows = _query_recurring_candidate_transactions(db, as_of)
+    *,
+    eager_hydrate: bool = False,
+) -> list[tuple[Transaction, RecurringCommitmentAllocation, bool]]:
+    """Return (source_tx, allocation, is_split_slice) for active recurring commitments."""
+    rows = _query_recurring_candidate_transactions(db, as_of, eager_hydrate=eager_hydrate)
     seen: set[tuple[str, str]] = set()
-    allocations: list[RecurringCommitmentAllocation] = []
+    entries: list[tuple[Transaction, RecurringCommitmentAllocation, bool]] = []
     for tx in rows:
         rec = (tx.recurrence or "").strip().lower()
         factor = RECURRENCE_WEEKLY_FACTOR.get(rec)
@@ -461,8 +559,18 @@ def get_active_recurring_commitment_allocations(
         if key in seen:
             continue
         seen.add(key)
-        allocations.extend(_build_tx_commitment_allocations(tx, rec, factor, tx_slices))
-    return allocations
+        is_split_slice = bool(getattr(tx, "splits", None))
+        for alloc in _build_tx_commitment_allocations(tx, rec, factor, tx_slices):
+            entries.append((tx, alloc, is_split_slice))
+    return entries
+
+
+def get_active_recurring_commitment_allocations(
+    db: Session,
+    as_of: date,
+) -> list[RecurringCommitmentAllocation]:
+    """Return per-category active recurring commitment allocations within lookback windows."""
+    return [alloc for _, alloc, _ in _iter_active_recurring_allocations(db, as_of)]
 
 
 def _build_tx_commitment_allocations(
@@ -604,13 +712,45 @@ def _rollup_budget_rules_to_base(
     return rolled
 
 
-def _load_budget_context(
+def _build_canonical_name_map(
+    raw_budget_rules: dict[str, BudgetRule],
+    parent_map: dict[str, str],
+) -> dict[str, str]:
+    """Build lowercase-to-canonical display category map from rules and taxonomy."""
+    names: dict[str, str] = {
+        str(r.category).strip().lower(): str(r.category).strip()
+        for r in raw_budget_rules.values()
+        if r.category and str(r.category).strip()
+    }
+    for child_name, parent_name in parent_map.items():
+        names.setdefault(child_name.lower(), child_name)
+        names.setdefault(parent_name.lower(), parent_name)
+    return names
+
+
+def _apply_category_annual_flags(
+    db: Session,
+    annual_cats: set[str],
+    canonical_name_map: dict[str, str],
+) -> None:
+    """Populate canonical category names and annual amortization flags from Category rows."""
+    for db_cat in db.scalars(select(Category)).all():
+        cat_name = (db_cat.name or "").strip()
+        if not cat_name:
+            continue
+        cat_lower = cat_name.lower()
+        canonical_name_map.setdefault(cat_lower, cat_name)
+        if db_cat.is_active and (db_cat.amortize_period or "").strip().lower() == "annual":
+            annual_cats.add(cat_lower)
+
+
+def _load_annual_metadata(
     db: Session,
     resolved: ResolvedWindow,
     *,
     rollup_base: bool,
-) -> _BudgetProjectionContext:
-    """Load category taxonomy, active budget rules, and 365-day annual category totals."""
+) -> _AnnualCategoryMetadata:
+    """Load category taxonomy, active budget rules, and Annualized Category sets."""
     parent_map = get_category_parent_map(db)
     active_rules: list[BudgetRule] = list(
         db.scalars(select(BudgetRule).where(BudgetRule.is_active == True)).all()
@@ -623,37 +763,42 @@ def _load_budget_context(
         for cat_lower, rule in raw_budget_rules.items()
         if (rule.budget_period or "monthly").strip().lower() == "annual"
     }
-    canonical_name_map: dict[str, str] = {
-        str(r.category).strip().lower(): str(r.category).strip()
-        for r in raw_budget_rules.values()
-        if r.category and str(r.category).strip()
-    }
-    for db_cat in db.scalars(select(Category)).all():
-        cat_name = (db_cat.name or "").strip()
-        if not cat_name:
-            continue
-        cat_lower = cat_name.lower()
-        canonical_name_map.setdefault(cat_lower, cat_name)
-        if db_cat.is_active and (db_cat.amortize_period or "").strip().lower() == "annual":
-            annual_cats.add(cat_lower)
-    for child_name, parent_name in parent_map.items():
-        canonical_name_map.setdefault(child_name.lower(), child_name)
-        canonical_name_map.setdefault(parent_name.lower(), parent_name)
+    canonical_name_map = _build_canonical_name_map(raw_budget_rules, parent_map)
+    _apply_category_annual_flags(db, annual_cats, canonical_name_map)
 
     annual_base_roots: set[str] = {
         c
         for c in annual_cats
         if get_parent_category(canonical_name_map.get(c) or c, parent_map) is None
     }
-    return _finalize_budget_context(
-        db,
-        resolved,
+    return _AnnualCategoryMetadata(
+        resolved=resolved,
         rollup_base=rollup_base,
         parent_map=parent_map,
         canonical_name_map=canonical_name_map,
         raw_budget_rules=raw_budget_rules,
-        annual_cats=annual_cats,
-        annual_base_roots=annual_base_roots,
+        annual_cats=frozenset(annual_cats),
+        annual_base_roots=frozenset(annual_base_roots),
+    )
+
+
+def _load_budget_context(
+    db: Session,
+    resolved: ResolvedWindow,
+    *,
+    rollup_base: bool,
+) -> _BudgetProjectionContext:
+    """Load category taxonomy, active budget rules, and 365-day annual category totals."""
+    meta = _load_annual_metadata(db, resolved, rollup_base=rollup_base)
+    return _finalize_budget_context(
+        db,
+        resolved,
+        rollup_base=rollup_base,
+        parent_map=meta.parent_map,
+        canonical_name_map=meta.canonical_name_map,
+        raw_budget_rules=meta.raw_budget_rules,
+        annual_cats=set(meta.annual_cats),
+        annual_base_roots=set(meta.annual_base_roots),
     )
 
 
@@ -724,17 +869,40 @@ def _finalize_budget_context(
     )
 
 
-def _query_window_transactions(db: Session, resolved: ResolvedWindow) -> list[Transaction]:
+def _query_window_transactions(
+    db: Session,
+    resolved: ResolvedWindow,
+    *,
+    account_id: Optional[int] = None,
+    loan_id: Optional[int] = None,
+    eager_hydrate: bool = False,
+) -> list[Transaction]:
     """Query transactions within the resolved ReportingWindow bounds with eager relations."""
     stmt = select(Transaction).options(
-        joinedload(Transaction.receipt).joinedload(Receipt.items),
-        joinedload(Transaction.loan),
-        joinedload(Transaction.splits).joinedload(TransactionSplit.loan),
+        *_transaction_eager_options(include_receipt_items=True, eager_hydrate=eager_hydrate)
     )
+    if account_id is not None:
+        stmt = stmt.where(
+            or_(
+                Transaction.account_id == account_id,
+                and_(
+                    Transaction.counterpart_account_id == account_id,
+                    Transaction.linked_transaction_id.is_(None),
+                ),
+            )
+        )
+    if loan_id is not None:
+        stmt = stmt.where(
+            or_(
+                Transaction.loan_id == loan_id,
+                Transaction.splits.any(TransactionSplit.loan_id == loan_id),
+            )
+        )
     if resolved.start_date is not None:
         stmt = stmt.where(Transaction.transaction_date >= resolved.start_date)
     if resolved.end_date is not None:
         stmt = stmt.where(Transaction.transaction_date <= resolved.end_date)
+    stmt = stmt.order_by(Transaction.transaction_date.desc(), Transaction.id.desc())
     return list(db.scalars(stmt).unique().all())
 
 
@@ -1016,4 +1184,630 @@ def project_window(
         net_savings=round(total_income - total_spend, 2),
         categories=categories,
         over_budget_count=over_budget_count,
+    )
+
+
+def _matches_account_filter(tx: Transaction, account_id: Optional[int]) -> bool:
+    """Return True when transaction belongs to account_id directly or as unlinked counterpart."""
+    if account_id is None:
+        return True
+    return tx.account_id == account_id or (
+        tx.counterpart_account_id == account_id and tx.linked_transaction_id is None
+    )
+
+
+def _matches_loan_filter(tx: Transaction, loan_id: Optional[int]) -> bool:
+    """Return True when transaction or any of its splits links to loan_id."""
+    if loan_id is None:
+        return True
+    if tx.loan_id == loan_id:
+        return True
+    return any(s.loan_id == loan_id for s in (getattr(tx, "splits", None) or ()))
+
+
+def _matches_category_filter(
+    cat: str,
+    target_cat: Optional[str],
+    include_subclasses: bool,
+    parent_map: dict[str, str],
+) -> bool:
+    """Return True when cat matches target_cat directly or via Root Category rollup."""
+    if not target_cat:
+        return True
+    effective = (
+        get_root_category(cat, parent_map).lower()
+        if include_subclasses
+        else cat.strip().lower()
+    )
+    return effective == target_cat
+
+
+def _nzd_to_tx_currency(amount_nzd: float, tx: Transaction) -> float:
+    """Convert a positive NZD amount back to the parent transaction's native currency."""
+    fx_unit = to_nzd_amount(1.0, tx.currency, tx.exchange_rate)
+    return round(amount_nzd / fx_unit, 2) if fx_unit > 0 else round(amount_nzd, 2)
+
+
+def _resolve_projected_category(
+    tx_cat: str,
+    matched_cats: set[str],
+    category: Optional[str],
+    target_cat: Optional[str],
+    include_subclasses: bool,
+) -> str:
+    """Resolve display category for a projected split or receipt slice."""
+    if target_cat and include_subclasses:
+        return category.strip() if category else tx_cat
+    if len(matched_cats) == 1:
+        return next(iter(matched_cats))
+    if tx_cat.lower() in TRANSFER_CATEGORIES and matched_cats:
+        return sorted(matched_cats)[0]
+    return tx_cat
+
+
+def _build_projected_split_item(
+    tx: Transaction,
+    tx_cat: str,
+    parent_tags: tuple[str, ...],
+    matched: list[tuple[TransactionSplit, str, tuple[str, ...], float]],
+    *,
+    category: Optional[str],
+    target_cat: Optional[str],
+    include_subclasses: bool,
+    excluded: bool = False,
+) -> ProjectedCashflowItem:
+    """Build a ProjectedCashflowItem from matching Manual Split lines on one transaction."""
+    matched_orig = round(sum(amt for _, _, _, amt in matched), 2)
+    total_orig = round(sum(s.signed_amount() for s in tx.splits), 2)
+    matched_cat = _resolve_projected_category(
+        tx_cat, {c for _, c, _, _ in matched}, category, target_cat, include_subclasses
+    )
+    merged_tags = tuple(normalize_tags(t for _, _, tags, _ in matched for t in tags))
+    is_partial = len(matched) < len(tx.splits) or abs(matched_orig - total_orig) > 0.01
+    if is_partial or (target_cat and matched_cat.lower() != tx_cat.lower()):
+        split_notes = ", ".join(s.notes for s, _, _, _ in matched if s.notes)
+        fallback = f"Split of {tx.currency} {abs(float(tx.amount)):.2f}" if is_partial else tx.notes
+        return ProjectedCashflowItem(
+            transaction=tx,
+            projected_amount=matched_orig,
+            projected_category=matched_cat,
+            projected_tags=merged_tags,
+            projected_notes=split_notes or fallback,
+            is_split=True,
+            excluded_from_period_budget=excluded,
+        )
+    resolved_cat = matched_cat if matched_cat != tx_cat else None
+    return ProjectedCashflowItem(
+        transaction=tx,
+        projected_category=resolved_cat,
+        projected_tags=merged_tags or parent_tags,
+        is_split=len(tx.splits) >= 2,
+        excluded_from_period_budget=excluded,
+    )
+
+
+def _project_inflow_splits(
+    tx: Transaction,
+    tx_cat: str,
+    parent_tags: tuple[str, ...],
+    *,
+    category: Optional[str],
+    target_cat: Optional[str],
+    target_tag: Optional[str],
+    include_subclasses: bool,
+    parent_map: dict[str, str],
+) -> list[ProjectedCashflowItem]:
+    """Project positive non-Transfer, non-lent Manual Split lines for flow='inflow'."""
+    matched: list[tuple[TransactionSplit, str, tuple[str, ...], float]] = []
+    for s in tx.splits:
+        signed_amt = s.signed_amount()
+        if signed_amt <= 0 or _is_lent_loan(getattr(s, "loan", None)):
+            continue
+        s_cat = (s.category or tx_cat).strip() or "General"
+        if s_cat.lower() in TRANSFER_CATEGORIES:
+            continue
+        s_tags = tuple(normalize_tags([*parent_tags, *parse_rule_tags(s.tags)]))
+        if target_tag and target_tag not in s_tags:
+            continue
+        if not _matches_category_filter(s_cat, target_cat, include_subclasses, parent_map):
+            continue
+        matched.append((s, s_cat, s_tags, signed_amt))
+    if not matched:
+        return []
+    return [
+        _build_projected_split_item(
+            tx,
+            tx_cat,
+            parent_tags,
+            matched,
+            category=category,
+            target_cat=target_cat,
+            include_subclasses=include_subclasses,
+        )
+    ]
+
+
+def _project_unsplit_inflow(
+    tx: Transaction,
+    tx_cat: str,
+    parent_tags: tuple[str, ...],
+    *,
+    target_cat: Optional[str],
+    target_tag: Optional[str],
+    include_subclasses: bool,
+    parent_map: dict[str, str],
+) -> list[ProjectedCashflowItem]:
+    """Project an unsplit positive Reporting Currency inflow excluding Transfers and lent principal."""
+    amt = float(tx.amount)
+    if amt <= 0 or tx_cat.lower() in TRANSFER_CATEGORIES:
+        return []
+    is_lent = _is_lent_loan(getattr(tx, "loan", None))
+    amt_nzd = to_nzd_amount(amt, tx.currency, tx.exchange_rate)
+    net_nzd = _resolve_unsplit_inflow_nzd(tx, amt_nzd, is_lent=is_lent)
+    if net_nzd <= 0:
+        return []
+    if target_tag and target_tag not in parent_tags:
+        return []
+    if not _matches_category_filter(tx_cat, target_cat, include_subclasses, parent_map):
+        return []
+    projected_amt = (
+        _nzd_to_tx_currency(net_nzd, tx)
+        if (is_lent and tx.loan_payment_amount is not None)
+        else None
+    )
+    return [ProjectedCashflowItem(transaction=tx, projected_amount=projected_amt)]
+
+
+def _classify_outflow_splits(
+    tx: Transaction,
+    tx_cat: str,
+    parent_tags: tuple[str, ...],
+    meta: _AnnualCategoryMetadata,
+    *,
+    target_cat: Optional[str],
+    target_tag: Optional[str],
+    include_subclasses: bool,
+) -> tuple[
+    list[tuple[TransactionSplit, str, tuple[str, ...], float]],
+    list[tuple[TransactionSplit, str, tuple[str, ...], float]],
+]:
+    """Filter negative non-Transfer splits and partition into active vs excluded."""
+    active: list[tuple[TransactionSplit, str, tuple[str, ...], float]] = []
+    excluded: list[tuple[TransactionSplit, str, tuple[str, ...], float]] = []
+    is_rec_excluded = is_recurrence_excluded_from_period(
+        meta.resolved.effective_period, tx.recurrence
+    )
+    for s in tx.splits:
+        signed_amt = s.signed_amount()
+        if signed_amt >= 0:
+            continue
+        s_cat = (s.category or tx_cat).strip() or "General"
+        if s_cat.lower() in TRANSFER_CATEGORIES:
+            continue
+        s_tags = tuple(normalize_tags([*parent_tags, *parse_rule_tags(s.tags)]))
+        if target_tag and target_tag not in s_tags:
+            continue
+        if not _matches_category_filter(s_cat, target_cat, include_subclasses, meta.parent_map):
+            continue
+        is_excluded = (
+            _is_lent_loan(getattr(s, "loan", None))
+            or is_rec_excluded
+            or meta.is_smoothed_annual(s_cat.lower(), meta.resolve_category(s_cat).lower())
+        )
+        (excluded if is_excluded else active).append((s, s_cat, s_tags, signed_amt))
+    return active, excluded
+
+
+def _project_outflow_splits(
+    tx: Transaction,
+    tx_cat: str,
+    parent_tags: tuple[str, ...],
+    meta: _AnnualCategoryMetadata,
+    *,
+    category: Optional[str],
+    target_cat: Optional[str],
+    target_tag: Optional[str],
+    include_subclasses: bool,
+    include_amortized: bool,
+) -> list[ProjectedCashflowItem]:
+    """Project negative non-Transfer Manual Split lines partitioned by active vs excluded."""
+    active, excluded = _classify_outflow_splits(
+        tx,
+        tx_cat,
+        parent_tags,
+        meta,
+        target_cat=target_cat,
+        target_tag=target_tag,
+        include_subclasses=include_subclasses,
+    )
+    items: list[ProjectedCashflowItem] = []
+    if active:
+        items.append(
+            _build_projected_split_item(
+                tx, tx_cat, parent_tags, active, category=category,
+                target_cat=target_cat, include_subclasses=include_subclasses, excluded=False,
+            )
+        )
+    if include_amortized and excluded:
+        items.append(
+            _build_projected_split_item(
+                tx, tx_cat, parent_tags, excluded, category=category,
+                target_cat=target_cat, include_subclasses=include_subclasses, excluded=True,
+            )
+        )
+    return items
+
+
+def _build_receipt_outflow_item(
+    tx: Transaction,
+    tx_cat: str,
+    parent_tags: tuple[str, ...],
+    tx_nzd: float,
+    positive_count: int,
+    matched_lines: list[ExpenseLine],
+    *,
+    category: Optional[str],
+    target_cat: Optional[str],
+    include_subclasses: bool,
+    excluded: bool,
+) -> ProjectedCashflowItem:
+    """Build a ProjectedCashflowItem from matching scaled Receipt Lines."""
+    matched_nzd = round(sum(line.amount_nzd for line in matched_lines), 2)
+    matched_cat = _resolve_projected_category(
+        tx_cat, {line.category for line in matched_lines}, category, target_cat, include_subclasses
+    )
+    merged_tags = tuple(normalize_tags(t for line in matched_lines for t in line.effective_tags))
+    is_partial = len(matched_lines) < positive_count or abs(matched_nzd - tx_nzd) > 0.01
+    if is_partial or (target_cat and matched_cat.lower() != tx_cat.lower()):
+        names = ", ".join(line.item_name for line in matched_lines if line.item_name)
+        notes = f"Receipt split ({names}) of {tx.currency} {abs(float(tx.amount)):.2f}" if names else tx.notes
+        return ProjectedCashflowItem(
+            transaction=tx,
+            projected_amount=-abs(_nzd_to_tx_currency(matched_nzd, tx)),
+            projected_category=matched_cat,
+            projected_tags=merged_tags,
+            projected_notes=notes,
+            is_receipt_split=True,
+            excluded_from_period_budget=excluded,
+        )
+    return ProjectedCashflowItem(
+        transaction=tx,
+        projected_tags=merged_tags or parent_tags,
+        excluded_from_period_budget=excluded,
+    )
+
+
+def _project_lent_unsplit_outflow(
+    tx: Transaction,
+    tx_cat: str,
+    parent_tags: tuple[str, ...],
+    parent_map: dict[str, str],
+    *,
+    target_cat: Optional[str],
+    target_tag: Optional[str],
+    include_subclasses: bool,
+    include_amortized: bool,
+) -> list[ProjectedCashflowItem]:
+    """Project a lent loan outflow transaction as excluded when include_amortized is enabled."""
+    if not include_amortized:
+        return []
+    if target_tag and target_tag not in parent_tags:
+        return []
+    if not _matches_category_filter(tx_cat, target_cat, include_subclasses, parent_map):
+        return []
+    return [ProjectedCashflowItem(transaction=tx, excluded_from_period_budget=True)]
+
+
+def _project_parent_outflow(
+    tx: Transaction,
+    tx_cat: str,
+    parent_tags: tuple[str, ...],
+    meta: _AnnualCategoryMetadata,
+    *,
+    is_rec_excluded: bool,
+    target_cat: Optional[str],
+    target_tag: Optional[str],
+    include_subclasses: bool,
+    include_amortized: bool,
+) -> list[ProjectedCashflowItem]:
+    """Project an unsplit non-receipt outflow transaction."""
+    if target_tag and target_tag not in parent_tags:
+        return []
+    if not _matches_category_filter(tx_cat, target_cat, include_subclasses, meta.parent_map):
+        return []
+    is_excluded = is_rec_excluded or meta.is_smoothed_annual(
+        tx_cat.lower(), meta.resolve_category(tx_cat).lower()
+    )
+    if is_excluded and not include_amortized:
+        return []
+    return [ProjectedCashflowItem(transaction=tx, excluded_from_period_budget=is_excluded)]
+
+
+def _project_outflow_receipt_or_parent(
+    tx: Transaction,
+    tx_cat: str,
+    parent_tags: tuple[str, ...],
+    meta: _AnnualCategoryMetadata,
+    *,
+    category: Optional[str],
+    target_cat: Optional[str],
+    target_tag: Optional[str],
+    include_subclasses: bool,
+    include_amortized: bool,
+) -> list[ProjectedCashflowItem]:
+    """Project an unsplit outflow via Receipt Lines (excluding Transfers) or parent tx."""
+    if float(tx.amount) >= 0 or tx_cat.lower() in TRANSFER_CATEGORIES:
+        return []
+    if _is_lent_loan(getattr(tx, "loan", None)):
+        return _project_lent_unsplit_outflow(
+            tx, tx_cat, parent_tags, meta.parent_map,
+            target_cat=target_cat, target_tag=target_tag,
+            include_subclasses=include_subclasses, include_amortized=include_amortized,
+        )
+
+    scaled_lines, positive_count, tx_nzd = _scale_receipt_expense_lines(tx, tx_cat, list(parent_tags))
+    is_rec_excluded = is_recurrence_excluded_from_period(meta.resolved.effective_period, tx.recurrence)
+    if positive_count > 0:
+        return _partition_receipt_outflow_lines(
+            tx, tx_cat, parent_tags, meta, tx_nzd, positive_count, scaled_lines,
+            is_rec_excluded=is_rec_excluded, category=category, target_cat=target_cat,
+            target_tag=target_tag, include_subclasses=include_subclasses,
+            include_amortized=include_amortized,
+        )
+    return _project_parent_outflow(
+        tx, tx_cat, parent_tags, meta, is_rec_excluded=is_rec_excluded,
+        target_cat=target_cat, target_tag=target_tag,
+        include_subclasses=include_subclasses, include_amortized=include_amortized,
+    )
+
+
+def _partition_receipt_outflow_lines(
+    tx: Transaction,
+    tx_cat: str,
+    parent_tags: tuple[str, ...],
+    meta: _AnnualCategoryMetadata,
+    tx_nzd: float,
+    positive_count: int,
+    scaled_lines: list[ExpenseLine],
+    *,
+    is_rec_excluded: bool,
+    category: Optional[str],
+    target_cat: Optional[str],
+    target_tag: Optional[str],
+    include_subclasses: bool,
+    include_amortized: bool,
+) -> list[ProjectedCashflowItem]:
+    """Filter scaled Receipt Lines and emit active and optional excluded slices."""
+    active: list[ExpenseLine] = []
+    excluded: list[ExpenseLine] = []
+    for line in scaled_lines:
+        if target_tag and target_tag not in line.effective_tags:
+            continue
+        if not _matches_category_filter(line.category, target_cat, include_subclasses, meta.parent_map):
+            continue
+        is_excluded = is_rec_excluded or meta.is_smoothed_annual(
+            line.category.lower(), meta.resolve_category(line.category).lower()
+        )
+        (excluded if is_excluded else active).append(line)
+
+    slices = [(active, False)] + ([(excluded, True)] if include_amortized and excluded else [])
+    return [
+        _build_receipt_outflow_item(
+            tx, tx_cat, parent_tags, tx_nzd, positive_count, grp,
+            category=category, target_cat=target_cat,
+            include_subclasses=include_subclasses, excluded=is_excl,
+        )
+        for grp, is_excl in slices
+        if grp
+    ]
+
+
+def _extract_split_tags_for_category(tx: Transaction, target_category: str) -> tuple[str, ...]:
+    """Combine parent transaction tags with negative split tags matching target_category."""
+    tx_cat = (tx.category or "General").strip() or "General"
+    cat_lower = target_category.strip().lower()
+    tags = list(parse_rule_tags(tx.tags))
+    for s in getattr(tx, "splits", None) or ():
+        s_cat = (s.category or tx_cat).strip().lower()
+        if s.signed_amount() < 0 and s_cat == cat_lower:
+            tags.extend(parse_rule_tags(s.tags))
+    return tuple(normalize_tags(tags))
+
+
+def _build_amortized_cashflow_item(
+    rec_tx: Transaction,
+    alloc: RecurringCommitmentAllocation,
+    is_split_slice: bool,
+    meta: _AnnualCategoryMetadata,
+    *,
+    target_cat: Optional[str],
+    target_tag: Optional[str],
+    include_subclasses: bool,
+    account_id: Optional[int],
+    loan_id: Optional[int],
+) -> Optional[ProjectedCashflowItem]:
+    """Convert an active RecurringCommitmentAllocation into ProjectedCashflowItem if filters match."""
+    if alloc.recurrence not in meta.resolved.amortized_recurrences:
+        return None
+    if not _matches_account_filter(rec_tx, account_id) or not _matches_loan_filter(rec_tx, loan_id):
+        return None
+    if meta.is_smoothed_annual(alloc.category.lower(), meta.resolve_category(alloc.category).lower()):
+        return None
+    if not _matches_category_filter(alloc.category, target_cat, include_subclasses, meta.parent_map):
+        return None
+    effective_tags = (
+        _extract_split_tags_for_category(rec_tx, alloc.category)
+        if is_split_slice
+        else tuple(parse_rule_tags(rec_tx.tags))
+    )
+    if target_tag and target_tag not in effective_tags:
+        return None
+    cadence = "month" if meta.resolved.is_monthly_cadence else "week"
+    amortized_nzd = alloc.monthly_nzd if meta.resolved.is_monthly_cadence else alloc.weekly_nzd
+    return ProjectedCashflowItem(
+        transaction=rec_tx,
+        projected_amount=-abs(alloc.original_amount) if is_split_slice else None,
+        projected_category=alloc.category if is_split_slice else None,
+        projected_tags=effective_tags if is_split_slice else None,
+        is_split=True if is_split_slice else None,
+        is_amortized_commitment=True,
+        amortized_period_amount_nzd=amortized_nzd,
+        amortized_cadence=cadence,
+    )
+
+
+def _collect_cashflow_amortized_commitments(
+    db: Session,
+    meta: _AnnualCategoryMetadata,
+    *,
+    target_cat: Optional[str],
+    target_tag: Optional[str],
+    include_subclasses: bool,
+    account_id: Optional[int],
+    loan_id: Optional[int],
+) -> list[ProjectedCashflowItem]:
+    """Collect active amortized Recurring Commitments aligned with project_window."""
+    if not meta.resolved.amortized_recurrences:
+        return []
+    items: list[ProjectedCashflowItem] = []
+    for rec_tx, alloc, is_split_slice in _iter_active_recurring_allocations(
+        db, meta.resolved.as_of_date, eager_hydrate=True
+    ):
+        built = _build_amortized_cashflow_item(
+            rec_tx, alloc, is_split_slice, meta,
+            target_cat=target_cat, target_tag=target_tag,
+            include_subclasses=include_subclasses, account_id=account_id, loan_id=loan_id,
+        )
+        if built is not None:
+            items.append(built)
+    items.sort(
+        key=lambda item: (
+            -float(item.amortized_period_amount_nzd or 0.0),
+            -item.transaction.transaction_date.toordinal(),
+            -item.transaction.id,
+            (item.projected_category or item.transaction.category or "").lower(),
+        )
+    )
+    return items
+
+
+def _project_cashflow_row(
+    tx: Transaction,
+    meta: _AnnualCategoryMetadata,
+    *,
+    flow: FlowLiteral,
+    category: Optional[str],
+    target_cat: Optional[str],
+    target_tag: Optional[str],
+    include_subclasses: bool,
+    include_amortized: bool,
+) -> list[ProjectedCashflowItem]:
+    """Project one Transaction into zero, one, or partitioned cashflow items."""
+    tx_cat = (tx.category or "General").strip() or "General"
+    parent_tags = tuple(parse_rule_tags(tx.tags))
+    has_splits = bool(getattr(tx, "splits", None))
+    if flow == "inflow":
+        if has_splits:
+            return _project_inflow_splits(
+                tx, tx_cat, parent_tags, category=category, target_cat=target_cat,
+                target_tag=target_tag, include_subclasses=include_subclasses,
+                parent_map=meta.parent_map,
+            )
+        return _project_unsplit_inflow(
+            tx, tx_cat, parent_tags, target_cat=target_cat, target_tag=target_tag,
+            include_subclasses=include_subclasses, parent_map=meta.parent_map,
+        )
+    if has_splits:
+        return _project_outflow_splits(
+            tx, tx_cat, parent_tags, meta, category=category, target_cat=target_cat,
+            target_tag=target_tag, include_subclasses=include_subclasses,
+            include_amortized=include_amortized,
+        )
+    return _project_outflow_receipt_or_parent(
+        tx, tx_cat, parent_tags, meta, category=category, target_cat=target_cat,
+        target_tag=target_tag, include_subclasses=include_subclasses,
+        include_amortized=include_amortized,
+    )
+
+
+def _paginate_and_attach_commitments(
+    db: Session,
+    meta: _AnnualCategoryMetadata,
+    regular_rows: list[ProjectedCashflowItem],
+    *,
+    flow: FlowLiteral,
+    effective_amortized: bool,
+    offset: int,
+    limit: int,
+    target_cat: Optional[str],
+    target_tag: Optional[str],
+    include_subclasses: bool,
+    account_id: Optional[int],
+    loan_id: Optional[int],
+) -> CashflowProjectionResult:
+    """Sort regular cashflow items newest-first, slice page, and attach commitments on offset=0."""
+    regular_rows.sort(
+        key=lambda item: (
+            -item.transaction.transaction_date.toordinal(),
+            -item.transaction.id,
+            bool(item.excluded_from_period_budget),
+        )
+    )
+    total_count = len(regular_rows)
+    sliced = list(regular_rows[offset : offset + limit])
+    if flow == "outflow" and effective_amortized and offset == 0:
+        sliced.extend(
+            _collect_cashflow_amortized_commitments(
+                db, meta, target_cat=target_cat, target_tag=target_tag,
+                include_subclasses=include_subclasses, account_id=account_id, loan_id=loan_id,
+            )
+        )
+    return CashflowProjectionResult(items=tuple(sliced), total_count=total_count)
+
+
+def project_cashflow_transactions(
+    db: Session,
+    window: ReportingWindow,
+    *,
+    flow: FlowLiteral,
+    category: Optional[str] = None,
+    include_subclasses: bool = False,
+    include_amortized: bool = False,
+    account_id: Optional[int] = None,
+    loan_id: Optional[int] = None,
+    tag: Optional[str] = None,
+    offset: int = 0,
+    limit: int = 100,
+    reference_date: date | None = None,
+) -> CashflowProjectionResult:
+    """Project paginated inflow or outflow transactions with exact project_window parity."""
+    if flow not in ("inflow", "outflow"):
+        raise InvalidWindowError("flow must be 'inflow' or 'outflow'")
+    if offset < 0:
+        raise InvalidWindowError("offset must be non-negative")
+    if limit < 1:
+        raise InvalidWindowError("limit must be positive")
+
+    resolved = resolve_reporting_window(window, reference_date=reference_date)
+    meta = _load_annual_metadata(db, resolved, rollup_base=include_subclasses)
+    target_cat = category.strip().lower() if category and category.strip() else None
+    target_tag = tag.strip().lower().lstrip("#").replace(" ", "-") if tag else None
+    effective_amortized = include_amortized if flow == "outflow" else False
+
+    rows = _query_window_transactions(
+        db, resolved, account_id=account_id, loan_id=loan_id, eager_hydrate=True
+    )
+    regular_rows: list[ProjectedCashflowItem] = []
+    for tx in rows:
+        regular_rows.extend(
+            _project_cashflow_row(
+                tx, meta, flow=flow, category=category, target_cat=target_cat,
+                target_tag=target_tag, include_subclasses=include_subclasses,
+                include_amortized=effective_amortized,
+            )
+        )
+    return _paginate_and_attach_commitments(
+        db, meta, regular_rows, flow=flow, effective_amortized=effective_amortized,
+        offset=offset, limit=limit, target_cat=target_cat, target_tag=target_tag,
+        include_subclasses=include_subclasses, account_id=account_id, loan_id=loan_id,
     )
