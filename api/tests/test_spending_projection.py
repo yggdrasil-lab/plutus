@@ -178,6 +178,14 @@ def test_reporting_window_validation_and_reference_date(memory_db: Session) -> N
     assert custom.effective_period is None
     assert custom.is_budget_cadence_window is False
 
+    custom_none_period = resolve_reporting_window(
+        ReportingWindow(start_date=date(2026, 10, 1), end_date=date(2026, 10, 15)),
+        reference_date=ref,
+    )
+    assert custom_none_period.start_date == date(2026, 10, 1)
+    assert custom_none_period.end_date == date(2026, 10, 15)
+    assert custom_none_period.period_label == "custom"
+
     with pytest.raises(InvalidWindowError, match="Invalid period"):
         resolve_reporting_window(ReportingWindow(period="fortnight"), reference_date=ref)
 
@@ -1473,3 +1481,78 @@ def test_http_burn_sync_runway_and_mcp_weekly_burn_contracts(
     assert runway_body["breakdown"]["weekly_burn_rate"] == 85.5
     assert runway_body["breakdown"]["variable_weekly_burn"] == 67.5
     assert runway_body["breakdown"]["recurring_weekly_burn"] == 18.0
+
+
+def test_project_burn_nzd_fx_guard_same_week_annual_smoothing_and_percentages(
+    memory_db: Session,
+) -> None:
+    """project_burn guards corrupted NZD FX rates, amortizes same-week annual charges, and populates share/limit fields."""
+    acct = _seed_account(memory_db, name="Primary Checking 1001", currency="NZD")
+    ref = date(2026, 11, 18)  # Wednesday; 4w lookback starts 2026-10-21
+    memory_db.add_all(
+        [
+            BudgetRule(
+                category="Travel",
+                weekly_limit=50.0,
+                monthly_limit=216.67,
+                budget_period="annual",
+                is_active=True,
+            ),
+            BudgetRule(
+                category="Education",
+                weekly_limit=20.0,
+                monthly_limit=86.67,
+                budget_period="annual",
+                is_active=True,
+            ),
+            Transaction(
+                account_id=acct.id,
+                transaction_date=ref,
+                merchant="Pacific Air",
+                amount=-2600.0,
+                currency="NZD",
+                category="Travel",
+                raw_hash="pb-edge-travel",
+            ),
+            Transaction(
+                account_id=acct.id,
+                transaction_date=ref - timedelta(days=120),
+                merchant="Skill Exam",
+                amount=-520.0,
+                currency="NZD",
+                category="Education",
+                raw_hash="pb-edge-edu",
+            ),
+            Transaction(
+                account_id=acct.id,
+                transaction_date=ref - timedelta(days=20),
+                merchant="FX Anomaly Row",
+                amount=-100.0,
+                currency="NZD",
+                exchange_rate=36.0,
+                category="General",
+                raw_hash="pb-edge-corrupt-nzd",
+            ),
+        ]
+    )
+    memory_db.commit()
+
+    burn = project_burn(memory_db, lookback_weeks=4, reference_date=ref)
+    assert burn.variable_weekly_burn == 85.0
+    assert burn.effective_weekly_burn == 85.0
+    assert burn.this_week_variable_spend == 60.0
+    assert burn.this_week_spend == 60.0
+
+    assert [c.category for c in burn.categories] == ["Travel", "General", "Education"]
+    by_cat = {c.category: c for c in burn.categories}
+    assert by_cat["Travel"].budget_period == "annual"
+    assert by_cat["Travel"].variable_weekly_burn == 50.0
+    assert by_cat["Travel"].suggested_monthly_limit == 216.67
+    assert by_cat["Travel"].suggested_annual_limit == 2600.0
+    assert by_cat["Travel"].variable_percentage == 58.8
+    assert by_cat["Travel"].total_percentage == 58.8
+    assert by_cat["General"].variable_weekly_burn == 25.0
+    assert by_cat["General"].variable_percentage == 29.4
+    assert by_cat["Education"].budget_period == "annual"
+    assert by_cat["Education"].suggested_annual_limit == 520.0
+    assert by_cat["Education"].variable_percentage == 11.8
