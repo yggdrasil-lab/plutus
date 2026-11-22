@@ -33,7 +33,7 @@ class Account(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     name: Mapped[str] = mapped_column(String(100), nullable=False)
-    account_type: Mapped[str] = mapped_column(String(30), nullable=False)  # checking, savings, brokerage, kiwisaver, crypto
+    account_type: Mapped[str] = mapped_column(String(30), nullable=False)  # checking, savings, brokerage, kiwisaver, crypto, credit_card, private_note
     tier: Mapped[str] = mapped_column(String(20), nullable=False, default="cash")  # cash, growth, locked
     institution: Mapped[str] = mapped_column(String(100), nullable=False)
     currency: Mapped[str] = mapped_column(String(3), nullable=False, default="NZD")

@@ -62,6 +62,9 @@ def hydrate_transaction(tx: Transaction) -> Transaction:
     tx.counterpart_account_name = (
         tx.counterpart_account.name if tx.counterpart_account else None
     )
+    tx.counterpart_account_type = (
+        tx.counterpart_account.account_type if tx.counterpart_account else None
+    )
     tx.loan_name = tx.loan.name if tx.loan else None
     tx.loan_type = tx.loan.loan_type if tx.loan else None
     linked = tx.linked_transaction
@@ -124,7 +127,8 @@ def _projected_to_transaction_read(item: ProjectedTransaction) -> TransactionRea
         notes=item.notes, linked_transaction_id=item.linked_transaction_id,
         linked_account_name=item.linked_account_name, linked_amount=item.linked_amount,
         linked_currency=item.linked_currency, counterpart_account_id=item.counterpart_account_id,
-        counterpart_account_name=item.counterpart_account_name, loan_id=item.loan_id,
+        counterpart_account_name=item.counterpart_account_name,
+        counterpart_account_type=item.counterpart_account_type, loan_id=item.loan_id,
         loan_name=item.loan_name, loan_type=item.loan_type,
         loan_payment_amount=item.loan_payment_amount, exchange_rate=item.exchange_rate,
         fee_amount=item.fee_amount, raw_hash=item.raw_hash, tags=list(item.tags),
@@ -177,55 +181,51 @@ def list_transactions(
     return [_projected_to_transaction_read(item) for item in projection.items]
 
 
-@router.patch("/{transaction_id}", response_model=TransactionRead)
-def update_transaction(
-    transaction_id: int,
-    payload: TransactionUpdate,
-    db: Session = Depends(get_db),
-):
-    """Update category, merchant, or notes of an existing transaction."""
-    tx = db.scalar(
-        select(Transaction)
-        .options(*_transaction_load_options())
-        .where(Transaction.id == transaction_id)
+def _apply_category_update(db: Session, tx: Transaction, raw_category: str) -> None:
+    """Apply category change and unlink paired transfer legs when moving off Transfers."""
+    cat = raw_category.strip()
+    if not cat:
+        raise HTTPException(status_code=400, detail="Category name cannot be empty")
+    was_transfer_or_linked = (
+        (tx.category or "").strip().lower() in TRANSFER_CATEGORIES
+        or tx.linked_transaction_id is not None
     )
-    if not tx:
-        raise HTTPException(status_code=404, detail="Transaction not found")
+    tx.category = cat
+    if cat.lower() in TRANSFER_CATEGORIES or not was_transfer_or_linked:
+        return
+    if tx.linked_transaction_id is not None:
+        partner = db.get(Transaction, tx.linked_transaction_id)
+        if partner is not None:
+            partner.linked_transaction_id = None
+            partner.fee_amount = None
+            partner.exchange_rate = _resolve_unlinked_fx_rate(db, partner)
+    tx.linked_transaction_id = None
+    tx.fee_amount = None
+    tx.exchange_rate = _resolve_unlinked_fx_rate(db, tx)
 
-    if payload.category is not None:
-        cat = payload.category.strip()
-        if not cat:
-            raise HTTPException(status_code=400, detail="Category name cannot be empty")
-        was_transfer_or_linked = (
-            (tx.category or "").strip().lower() in TRANSFER_CATEGORIES
-            or tx.linked_transaction_id is not None
+
+def _apply_counterpart_account_update(
+    db: Session, tx: Transaction, payload: TransactionUpdate
+) -> None:
+    """Validate and apply manual counterpart_account_id updates without creating mirror rows."""
+    if "counterpart_account_id" not in payload.model_fields_set:
+        return
+    target_id = payload.counterpart_account_id
+    if target_id is None:
+        tx.counterpart_account_id = None
+        return
+    if db.get(Account, target_id) is None:
+        raise HTTPException(status_code=404, detail="Counterpart account not found")
+    if target_id == tx.account_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Counterpart account cannot match transaction account",
         )
-        tx.category = cat
-        if cat.lower() not in TRANSFER_CATEGORIES and was_transfer_or_linked:
-            if tx.linked_transaction_id is not None:
-                partner = db.get(Transaction, tx.linked_transaction_id)
-                if partner is not None:
-                    partner.linked_transaction_id = None
-                    partner.fee_amount = None
-                    partner.exchange_rate = _resolve_unlinked_fx_rate(db, partner)
-            tx.linked_transaction_id = None
-            tx.fee_amount = None
-            tx.exchange_rate = _resolve_unlinked_fx_rate(db, tx)
+    tx.counterpart_account_id = target_id
 
-    if payload.merchant is not None:
-        m = payload.merchant.strip()
-        if m:
-            tx.merchant = m
 
-    if payload.notes is not None:
-        tx.notes = payload.notes
-
-    if payload.tags is not None:
-        tx.tags = json.dumps(normalize_tags(payload.tags))
-
-    if "recurrence" in payload.model_fields_set:
-        tx.recurrence = payload.recurrence
-
+def _apply_loan_update(db: Session, tx: Transaction, payload: TransactionUpdate) -> None:
+    """Validate and apply loan_id and loan_payment_amount updates."""
     old_loan_id = tx.loan_id
     if "loan_id" in payload.model_fields_set:
         if payload.loan_id is not None and db.get(Loan, payload.loan_id) is None:
@@ -235,7 +235,9 @@ def update_transaction(
         effective_loan_id = old_loan_id
 
     if "loan_payment_amount" in payload.model_fields_set:
-        if payload.loan_payment_amount is not None:
+        if payload.loan_payment_amount is None:
+            tx.loan_payment_amount = None
+        else:
             if effective_loan_id is None:
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -247,8 +249,6 @@ def update_transaction(
                     detail="loan_payment_amount cannot exceed the transaction amount.",
                 )
             tx.loan_payment_amount = float(payload.loan_payment_amount)
-        else:
-            tx.loan_payment_amount = None
     elif "loan_id" in payload.model_fields_set and (
         payload.loan_id is None or payload.loan_id != old_loan_id
     ):
@@ -257,9 +257,40 @@ def update_transaction(
     if "loan_id" in payload.model_fields_set:
         tx.loan_id = payload.loan_id
 
+
+@router.patch("/{transaction_id}", response_model=TransactionRead)
+def update_transaction(
+    transaction_id: int,
+    payload: TransactionUpdate,
+    db: Session = Depends(get_db),
+):
+    """Update category, merchant, notes, tags, recurrence, counterpart_account_id, or loan link."""
+    tx = db.scalar(
+        select(Transaction)
+        .options(*_transaction_load_options())
+        .where(Transaction.id == transaction_id)
+    )
+    if not tx:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+
+    if payload.category is not None:
+        _apply_category_update(db, tx, payload.category)
+    if payload.merchant is not None and payload.merchant.strip():
+        tx.merchant = payload.merchant.strip()
+    if payload.notes is not None:
+        tx.notes = payload.notes
+    if payload.tags is not None:
+        tx.tags = json.dumps(normalize_tags(payload.tags))
+    if "recurrence" in payload.model_fields_set:
+        tx.recurrence = payload.recurrence
+
+    _apply_counterpart_account_update(db, tx, payload)
+    _apply_loan_update(db, tx, payload)
+
     db.commit()
     hydrated = db.scalar(
         select(Transaction)
+        .execution_options(populate_existing=True)
         .options(*_transaction_load_options())
         .where(Transaction.id == transaction_id)
     )

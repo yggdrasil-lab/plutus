@@ -16,6 +16,7 @@ from app.schemas import (
     AssetSnapshotCreate,
     AssetSnapshotRead,
 )
+from app.services.account_payouts import build_account_reads
 from app.services.ingestion_service import upsert_account_snapshot
 
 router = APIRouter(prefix="/accounts", tags=["Accounts"])
@@ -30,7 +31,8 @@ def list_accounts(
     stmt = select(Account)
     if is_active is not None:
         stmt = stmt.where(Account.is_active == is_active)
-    return db.scalars(stmt.order_by(Account.tier, Account.name)).all()
+    accounts = list(db.scalars(stmt.order_by(Account.tier, Account.name)).all())
+    return build_account_reads(db, accounts)
 
 
 @router.post("", response_model=AccountRead, status_code=status.HTTP_201_CREATED)
@@ -52,7 +54,7 @@ def get_account(account_id: int, db: Session = Depends(get_db)):
     account = db.get(Account, account_id)
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
-    return account
+    return build_account_reads(db, [account])[0]
 
 
 @router.patch("/{account_id}", response_model=AccountRead)
@@ -89,7 +91,7 @@ def update_account(
 
     db.commit()
     db.refresh(account)
-    return account
+    return build_account_reads(db, [account])[0]
 
 
 @router.post("/{account_id}/snapshots", response_model=AssetSnapshotRead, status_code=status.HTTP_201_CREATED)
