@@ -10,7 +10,7 @@ import logging
 import math
 import mimetypes
 import re
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 import urllib.request
 from zoneinfo import ZoneInfo
 
@@ -746,21 +746,28 @@ def _invoke_receipt_llm(
         return None
 
 
-def parse_receipt_text_with_llm(raw_text: str) -> Optional[dict[str, Any]]:
-    """Invoke text LLM to extract structured line items from raw receipt text."""
-    messages = [
-        {
-            "role": "user",
-            "content": f"{RECEIPT_PARSING_PROMPT}\n\nReceipt text:\n{raw_text}",
-        }
-    ]
+def _invoke_text_prompt(
+    prompt: str,
+    content_label: str,
+    raw_text: str,
+    *,
+    raise_on_error: bool = False,
+) -> Optional[dict[str, Any]]:
+    """Invoke configured text LLM in JSON mode for receipt or payslip text."""
+    messages = [{"role": "user", "content": f"{prompt}\n\n{content_label}:\n{raw_text}"}]
     text_model = settings.resolved_llm_model or settings.resolved_receipt_llm_model
     return _invoke_receipt_llm(
         messages,
         model=text_model,
         timeout=60,
         response_format_json=True,
+        raise_on_error=raise_on_error,
     )
+
+
+def parse_receipt_text_with_llm(raw_text: str) -> Optional[dict[str, Any]]:
+    """Invoke text LLM to extract structured line items from raw receipt text."""
+    return _invoke_text_prompt(RECEIPT_PARSING_PROMPT, "Receipt text", raw_text)
 
 
 def parse_receipt_orders_text_with_llm(
@@ -769,18 +776,10 @@ def parse_receipt_orders_text_with_llm(
     raise_on_error: bool = True,
 ) -> Optional[dict[str, Any]]:
     """Invoke text LLM to extract one or multiple structured orders from email/document text."""
-    messages = [
-        {
-            "role": "user",
-            "content": f"{MULTI_ORDER_EMAIL_RECEIPT_PROMPT}\n\nEmail / Receipt content:\n{raw_text}",
-        }
-    ]
-    text_model = settings.resolved_llm_model or settings.resolved_receipt_llm_model
-    return _invoke_receipt_llm(
-        messages,
-        model=text_model,
-        timeout=60,
-        response_format_json=True,
+    return _invoke_text_prompt(
+        MULTI_ORDER_EMAIL_RECEIPT_PROMPT,
+        "Email / Receipt content",
+        raw_text,
         raise_on_error=raise_on_error,
     )
 
@@ -840,18 +839,10 @@ def parse_payslip_text_with_llm(
     raise_on_error: bool = True,
 ) -> Optional[dict[str, Any]]:
     """Invoke text LLM to extract structured payslip header fields from raw text."""
-    messages = [
-        {
-            "role": "user",
-            "content": f"{PAYSLIP_PARSING_PROMPT}\n\nPayslip content:\n{raw_text}",
-        }
-    ]
-    text_model = settings.resolved_llm_model or settings.resolved_receipt_llm_model
-    return _invoke_receipt_llm(
-        messages,
-        model=text_model,
-        timeout=60,
-        response_format_json=True,
+    return _invoke_text_prompt(
+        PAYSLIP_PARSING_PROMPT,
+        "Payslip content",
+        raw_text,
         raise_on_error=raise_on_error,
     )
 
@@ -1476,7 +1467,7 @@ def find_receipt_transaction_candidates(
     receipt: Receipt,
     limit: int = 5,
 ) -> list[TransactionCandidateRead]:
-    """Return top sorted candidate expense transactions for a receipt."""
+    """Return top sorted candidate matching transactions for a receipt."""
     scored = _evaluate_receipt_candidates(db, receipt)
     results: list[TransactionCandidateRead] = []
     for item in scored[:limit]:
@@ -1601,9 +1592,8 @@ def _find_duplicate_by_order_number(
     curr_upper: str,
     total_amount: float,
     document_type: str,
-    target_key: str,
 ) -> Optional[Receipt]:
-    """Match an existing Receipt of the same document_type by order_number/pay-period ref."""
+    """Match an existing non-payslip Receipt of the same document_type by order_number."""
     by_order = db.scalars(
         select(Receipt).where(
             Receipt.document_type == document_type,
@@ -1612,13 +1602,7 @@ def _find_duplicate_by_order_number(
         )
     ).all()
     for existing in by_order:
-        same_amt = abs(float(existing.total_amount) - total_amount) <= 0.05
-        same_payslip_merchant = (
-            document_type != "payslip"
-            or not target_key
-            or _normalize_merchant_key(existing.merchant) == target_key
-        )
-        if same_amt and same_payslip_merchant:
+        if abs(float(existing.total_amount) - total_amount) <= 0.05:
             return existing
     return None
 
@@ -1633,13 +1617,13 @@ def _find_semantic_duplicate_receipt(
     order_number: Optional[str],
     document_type: str = "receipt",
 ) -> Optional[Receipt]:
-    """Return an existing Receipt matching order_number or (merchant, date +/- 1d, total, currency)."""
+    """Return an existing Receipt matching order_number (non-payslip) or (merchant, date +/- 1d, total, currency)."""
     target_key = _normalize_merchant_key(merchant)
     curr_upper = currency.upper()
-    if order_number:
+    if order_number and document_type != "payslip":
         matched = _find_duplicate_by_order_number(
             db, order_number=order_number, curr_upper=curr_upper,
-            total_amount=total_amount, document_type=document_type, target_key=target_key,
+            total_amount=total_amount, document_type=document_type,
         )
         if matched is not None:
             return matched
@@ -1689,64 +1673,116 @@ def _resolve_email_fallback_date(received_at: Optional[datetime], local_tz: Zone
     return aware.astimezone(local_tz).date()
 
 
+def _compress_stored_media(media: _StoredReceiptMedia) -> _StoredReceiptMedia:
+    """Compress image attachment bytes to WebP while keeping PDF bytes raw."""
+    comp_bytes, comp_mime = compress_receipt_image(media.data, media.mime_type)
+    return _StoredReceiptMedia(comp_bytes, comp_mime, media.filename)
+
+
+def _decode_valid_email_attachment(
+    att: Any,
+    *,
+    min_pdf_bytes: int = MIN_RECEIPT_ATTACHMENT_BYTES,
+    min_image_bytes: int = MIN_RECEIPT_ATTACHMENT_BYTES,
+) -> Optional[tuple[bytes, str]]:
+    """Decode base64 attachment and enforce PDF/image MIME and minimum byte thresholds."""
+    if not att.content_base64:
+        return None
+    try:
+        raw_bytes = base64.b64decode(att.content_base64, validate=False)
+    except Exception:
+        return None
+    mime_type = infer_receipt_mime_type(att.filename, att.content_type)
+    if mime_type == "application/pdf":
+        return (raw_bytes, mime_type) if len(raw_bytes) >= min_pdf_bytes else None
+    if mime_type.startswith("image/"):
+        return (raw_bytes, mime_type) if len(raw_bytes) >= min_image_bytes else None
+    return None
+
+
+def _parse_single_attachment_doc(
+    raw_bytes: bytes,
+    filename: Optional[str],
+    mime_type: str,
+    *,
+    text_parser: Callable[[str], Optional[dict[str, Any]]],
+    fallback_parser: Callable[[bytes, Optional[str], str], Optional[dict[str, Any]]],
+    pdf_vision_fallback: Optional[Callable[[bytes], Optional[dict[str, Any]]]] = None,
+) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Parse one PDF or image attachment once via text-first then vision/fallback parser."""
+    if mime_type != "application/pdf":
+        return fallback_parser(raw_bytes, filename, mime_type), None
+    pdf_text = extract_pdf_text(raw_bytes)
+    raw_excerpt = pdf_text[:32000] if pdf_text else None
+    if pdf_text:
+        parsed_att = text_parser(pdf_text)
+        if parsed_att:
+            return parsed_att, raw_excerpt
+        if pdf_vision_fallback is not None:
+            return pdf_vision_fallback(raw_bytes), raw_excerpt
+    return fallback_parser(raw_bytes, filename, mime_type), raw_excerpt
+
+
+def _extract_from_valid_attachments(
+    attachments: list[Any],
+    *,
+    min_pdf_bytes: int,
+    attachment_parser: Callable[
+        [bytes, Optional[str], str], tuple[Optional[dict[str, Any]], Optional[str]]
+    ],
+    normalizer: Callable[[Optional[dict[str, Any]]], Any],
+) -> tuple[Any, Optional[_StoredReceiptMedia], Optional[_StoredReceiptMedia], Optional[str]]:
+    """Extract normalized payload from valid attachments and retain first attachment fallback."""
+    fallback_attachment: Optional[_StoredReceiptMedia] = None
+    raw_text_for_record: Optional[str] = None
+
+    for att in attachments:
+        decoded = _decode_valid_email_attachment(
+            att, min_pdf_bytes=min_pdf_bytes, min_image_bytes=MIN_RECEIPT_ATTACHMENT_BYTES
+        )
+        if decoded is None:
+            continue
+        raw_bytes, mime_type = decoded
+        media = _StoredReceiptMedia(raw_bytes, mime_type, att.filename)
+        if fallback_attachment is None:
+            fallback_attachment = media
+
+        parsed_att, pdf_excerpt = attachment_parser(raw_bytes, att.filename, mime_type)
+        if pdf_excerpt:
+            raw_text_for_record = pdf_excerpt
+        normalized = normalizer(parsed_att)
+        if normalized:
+            return normalized, _compress_stored_media(media), fallback_attachment, raw_text_for_record
+
+    return None, None, fallback_attachment, raw_text_for_record
+
+
 def _parse_single_attachment(
     raw_bytes: bytes,
     filename: Optional[str],
     mime_type: str,
 ) -> tuple[Optional[dict[str, Any]], Optional[str]]:
     """Parse one PDF or image receipt attachment via text-first then vision LLM."""
-    if mime_type != "application/pdf":
-        return parse_receipt_with_llm(raw_bytes, filename, mime_type), None
-    pdf_text = extract_pdf_text(raw_bytes)
-    raw_excerpt = pdf_text[:32000] if pdf_text else None
-    parsed_att = (
-        parse_receipt_orders_text_with_llm(pdf_text, raise_on_error=False)
-        if pdf_text
-        else None
+    return _parse_single_attachment_doc(
+        raw_bytes, filename, mime_type,
+        text_parser=lambda txt: parse_receipt_orders_text_with_llm(txt, raise_on_error=False),
+        fallback_parser=lambda b, f, m: parse_receipt_with_llm(b, f, m),
     )
-    if not parsed_att:
-        parsed_att = parse_receipt_with_llm(raw_bytes, filename, mime_type)
-    return parsed_att, raw_excerpt
 
 
 def _extract_receipt_orders_from_attachments(attachments: list[Any]) -> _AttachmentParseOutcome:
     """Parse orders from valid image/PDF attachments and retain first valid attachment for fallback."""
-    fallback_attachment: Optional[_StoredReceiptMedia] = None
-    raw_text_for_record: Optional[str] = None
-
-    for att in attachments:
-        if not att.content_base64:
-            continue
-        try:
-            raw_bytes = base64.b64decode(att.content_base64, validate=False)
-        except Exception:
-            continue
-        if len(raw_bytes) < MIN_RECEIPT_ATTACHMENT_BYTES:
-            continue
-        mime_type = infer_receipt_mime_type(att.filename, att.content_type)
-        if mime_type != "application/pdf" and not mime_type.startswith("image/"):
-            continue
-        if fallback_attachment is None:
-            fallback_attachment = _StoredReceiptMedia(raw_bytes, mime_type, att.filename)
-
-        parsed_att, pdf_excerpt = _parse_single_attachment(raw_bytes, att.filename, mime_type)
-        if pdf_excerpt:
-            raw_text_for_record = pdf_excerpt
-        extracted = _normalize_parsed_orders(parsed_att)
-        if extracted:
-            comp_bytes, comp_mime = compress_receipt_image(raw_bytes, mime_type)
-            return _AttachmentParseOutcome(
-                orders=extracted,
-                stored_media=_StoredReceiptMedia(comp_bytes, comp_mime, att.filename),
-                fallback_attachment=fallback_attachment,
-                raw_text=raw_text_for_record,
-            )
-
+    extracted, stored_media, fallback_att, raw_text = _extract_from_valid_attachments(
+        attachments,
+        min_pdf_bytes=MIN_RECEIPT_ATTACHMENT_BYTES,
+        attachment_parser=_parse_single_attachment,
+        normalizer=_normalize_parsed_orders,
+    )
     return _AttachmentParseOutcome(
-        orders=[],
-        stored_media=None,
-        fallback_attachment=fallback_attachment,
-        raw_text=raw_text_for_record,
+        orders=extracted or [],
+        stored_media=stored_media,
+        fallback_attachment=fallback_att,
+        raw_text=raw_text,
     )
 
 
@@ -1870,9 +1906,7 @@ def ingest_purchase_receipt_email(
     if not orders:
         orders, fallback_date, raw_text_for_record = _extract_orders_from_email_body(payload)
         if orders and stored_media is None and outcome.fallback_attachment is not None:
-            fb = outcome.fallback_attachment
-            comp_bytes, comp_mime = compress_receipt_image(fb.data, fb.mime_type)
-            stored_media = _StoredReceiptMedia(comp_bytes, comp_mime, fb.filename)
+            stored_media = _compress_stored_media(outcome.fallback_attachment)
 
     if not orders:
         raise ValueError("Could not extract any purchase orders from receipt email.")
@@ -2013,20 +2047,18 @@ def apply_parsed_payslip_fields(
     return True
 
 
-def _decode_valid_payslip_attachment(att: Any) -> Optional[tuple[bytes, str]]:
-    """Decode and size-check a PDF or image attachment for payslip extraction."""
-    if not att.content_base64:
-        return None
-    try:
-        raw_bytes = base64.b64decode(att.content_base64, validate=False)
-    except Exception:
-        return None
-    mime_type = infer_receipt_mime_type(att.filename, att.content_type)
-    if mime_type == "application/pdf":
-        return (raw_bytes, mime_type) if len(raw_bytes) >= MIN_PAYSLIP_PDF_BYTES else None
-    if mime_type.startswith("image/"):
-        return (raw_bytes, mime_type) if len(raw_bytes) >= MIN_RECEIPT_ATTACHMENT_BYTES else None
-    return None
+def _parse_single_payslip_attachment(
+    raw_bytes: bytes,
+    filename: Optional[str],
+    mime_type: str,
+) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Parse one PDF or image payslip attachment once via text-first then vision LLM."""
+    return _parse_single_attachment_doc(
+        raw_bytes, filename, mime_type,
+        text_parser=lambda txt: parse_payslip_text_with_llm(txt, raise_on_error=False),
+        fallback_parser=lambda b, f, m: parse_payslip_with_llm(b, f, m),
+        pdf_vision_fallback=lambda b: _invoke_vision_prompt(b, "application/pdf", PAYSLIP_PARSING_PROMPT),
+    )
 
 
 def _extract_payslip_from_attachments(
@@ -2034,37 +2066,17 @@ def _extract_payslip_from_attachments(
     fallback_date: date,
 ) -> _PayslipAttachmentOutcome:
     """Parse payslip fields from valid PDF/image attachments and retain first attachment fallback."""
-    fallback_attachment: Optional[_StoredReceiptMedia] = None
-    raw_text_for_record: Optional[str] = None
-
-    for att in attachments:
-        decoded = _decode_valid_payslip_attachment(att)
-        if decoded is None:
-            continue
-        raw_bytes, mime_type = decoded
-        if fallback_attachment is None:
-            fallback_attachment = _StoredReceiptMedia(raw_bytes, mime_type, att.filename)
-        if mime_type == "application/pdf":
-            pdf_text = extract_pdf_text(raw_bytes)
-            if pdf_text:
-                raw_text_for_record = pdf_text[:32000]
-
-        parsed_att = parse_payslip_with_llm(raw_bytes, att.filename, mime_type)
-        normalized = _normalize_parsed_payslip(parsed_att, fallback_date=fallback_date)
-        if normalized is not None:
-            comp_bytes, comp_mime = compress_receipt_image(raw_bytes, mime_type)
-            return _PayslipAttachmentOutcome(
-                payslip=normalized,
-                stored_media=_StoredReceiptMedia(comp_bytes, comp_mime, att.filename),
-                fallback_attachment=fallback_attachment,
-                raw_text=raw_text_for_record,
-            )
-
+    normalized, stored_media, fallback_att, raw_text = _extract_from_valid_attachments(
+        attachments,
+        min_pdf_bytes=MIN_PAYSLIP_PDF_BYTES,
+        attachment_parser=_parse_single_payslip_attachment,
+        normalizer=lambda parsed: _normalize_parsed_payslip(parsed, fallback_date=fallback_date),
+    )
     return _PayslipAttachmentOutcome(
-        payslip=None,
-        stored_media=None,
-        fallback_attachment=fallback_attachment,
-        raw_text=raw_text_for_record,
+        payslip=normalized,
+        stored_media=stored_media,
+        fallback_attachment=fallback_att,
+        raw_text=raw_text,
     )
 
 
@@ -2134,9 +2146,7 @@ def ingest_payslip_email(db: Session, payload: InboundEmailDispatchPayload) -> R
     if normalized is None:
         normalized, raw_text = _extract_payslip_from_email_body(sanitized_body, fallback_date)
         if stored_media is None and outcome.fallback_attachment is not None:
-            fb = outcome.fallback_attachment
-            comp_bytes, comp_mime = compress_receipt_image(fb.data, fb.mime_type)
-            stored_media = _StoredReceiptMedia(comp_bytes, comp_mime, fb.filename)
+            stored_media = _compress_stored_media(outcome.fallback_attachment)
 
     existing_dup = _find_semantic_duplicate_receipt(
         db, merchant=normalized.employer, receipt_date=normalized.pay_date,

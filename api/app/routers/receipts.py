@@ -286,7 +286,7 @@ def list_receipt_candidates(
     receipt_id: int,
     db: Session = Depends(get_db),
 ):
-    """Return top 5 sorted candidate expense transactions for linking to this receipt."""
+    """Return top 5 sorted candidate matching transactions for linking to this receipt."""
     receipt = db.get(Receipt, receipt_id)
     if not receipt:
         raise HTTPException(status_code=404, detail="Receipt not found")

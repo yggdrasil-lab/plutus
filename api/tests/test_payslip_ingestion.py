@@ -187,7 +187,7 @@ def test_payslip_email_pdf_ingests_skips_items_matches_inflow_and_hydrates_tx(
         return _FakeLlmResponse(llm_payslip_json)
 
     with (
-        patch("app.services.receipt_service.extract_pdf_text", return_value=extracted_pdf_text),
+        patch("app.services.receipt_service.extract_pdf_text", return_value=extracted_pdf_text) as mock_pdf,
         patch("app.services.receipt_service.urllib.request.urlopen", side_effect=fake_urlopen),
     ):
         resp = client.post(
@@ -210,6 +210,7 @@ def test_payslip_email_pdf_ingests_skips_items_matches_inflow_and_hydrates_tx(
                 ],
             },
         )
+    mock_pdf.assert_called_once()
 
     assert resp.status_code == 200
     body = resp.json()
@@ -816,3 +817,71 @@ def test_payslip_body_fallback_retains_pdf_and_forwarded_date_when_attachment_pa
     assert rec.image_data == raw_pdf
     assert rec.image_mime_type == "application/pdf"
     assert rec.image_filename == "advice.pdf"
+
+
+def test_payslip_semantic_dedup_does_not_collide_across_months_with_generic_period_label(
+    memory_db: Session,
+    client: TestClient,
+) -> None:
+    """Two payslips 30+ days apart with identical employer, net_pay, currency, and generic label create 2 Receipts."""
+    pdf_bytes = _make_synthetic_pdf_bytes(1024)
+    oct_slip = {
+        "employer": "Acme Corp",
+        "pay_date": "2026-10-15",
+        "pay_period_start": None,
+        "pay_period_end": None,
+        "currency": "NZD",
+        "net_pay": 4250.50,
+        "tax_amount": 1180.25,
+        "pay_period_label": "Fortnight Pay",
+    }
+    nov_slip = {
+        **oct_slip,
+        "pay_date": "2026-11-15",
+    }
+
+    with patch("app.services.receipt_service.parse_payslip_with_llm", return_value=oct_slip):
+        first = client.post(
+            "/integrations/email",
+            json={
+                "email_id": 801,
+                "message_id": "<slip-oct-generic@acme.example>",
+                "route_target": "plutus_payslip",
+                "subject": "Payslip Oct",
+                "attachments": [
+                    {
+                        "filename": "payslip.pdf",
+                        "content_type": "application/pdf",
+                        "size_bytes": len(pdf_bytes),
+                        "content_base64": base64.b64encode(pdf_bytes).decode("ascii"),
+                    }
+                ],
+            },
+        )
+
+    with patch("app.services.receipt_service.parse_payslip_with_llm", return_value=nov_slip):
+        second = client.post(
+            "/integrations/email",
+            json={
+                "email_id": 802,
+                "message_id": "<slip-nov-generic@acme.example>",
+                "route_target": "plutus_payslip",
+                "subject": "Payslip Nov",
+                "attachments": [
+                    {
+                        "filename": "payslip.pdf",
+                        "content_type": "application/pdf",
+                        "size_bytes": len(pdf_bytes),
+                        "content_base64": base64.b64encode(pdf_bytes).decode("ascii"),
+                    }
+                ],
+            },
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["receipt_id"] != second.json()["receipt_id"]
+    rows = memory_db.scalars(select(Receipt).order_by(Receipt.receipt_date.asc())).all()
+    assert len(rows) == 2
+    assert [r.receipt_date for r in rows] == [date(2026, 10, 15), date(2026, 11, 15)]
+    assert all(r.order_number == "Fortnight Pay" for r in rows)
