@@ -1,11 +1,12 @@
 """SQLite :memory: interface tests for Spending Projection core and /budgets/breakdown parity."""
 
 from collections.abc import Iterator
-from datetime import date
+from dataclasses import FrozenInstanceError, is_dataclass
+from datetime import date, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -14,6 +15,7 @@ from app.main import app
 from app.models import (
     Account,
     BudgetRule,
+    Category,
     Loan,
     Receipt,
     ReceiptItem,
@@ -24,10 +26,15 @@ from app.services.category_taxonomy import ensure_default_categories
 from app.services.fx_service import to_nzd_amount
 from app.services.spending_projection import (
     InvalidWindowError,
+    ProjectedSplit,
+    ProjectedTransaction,
     ReportingWindow,
+    TransactionProjection,
+    TransactionQuery,
     expand_expense_lines,
     get_active_recurring_commitment_allocations,
     project_cashflow_transactions,
+    project_transactions,
     project_window,
     resolve_reporting_window,
 )
@@ -494,15 +501,9 @@ def test_budgets_breakdown_http_400_and_midas_json_parity(
     assert groc["parent_category"] == "Food"
 
 
-def _effective_cashflow_amount_nzd(item) -> float:
-    """Compute Reporting Currency NZD magnitude for one ProjectedCashflowItem."""
-    tx = item.transaction
-    raw_amt = (
-        item.projected_amount
-        if item.projected_amount is not None
-        else float(tx.amount)
-    )
-    return round(to_nzd_amount(abs(raw_amt), tx.currency, tx.exchange_rate), 2)
+def _effective_cashflow_amount_nzd(item: ProjectedTransaction) -> float:
+    """Compute Reporting Currency NZD magnitude for one detached ProjectedTransaction."""
+    return round(to_nzd_amount(abs(item.amount), item.currency, item.exchange_rate), 2)
 
 
 def test_project_cashflow_transactions_validation_and_exact_window_parity(
@@ -782,3 +783,399 @@ def test_project_cashflow_transactions_validation_and_exact_window_parity(
     )
     assert round(sum(_effective_cashflow_amount_nzd(it) for it in cf_custom_in.items), 2) == wp_custom.total_income
     assert round(sum(_effective_cashflow_amount_nzd(it) for it in cf_custom_out.items), 2) == wp_custom.total_spend
+
+
+def _seed_loan(db: Session, name: str, loan_type: str) -> Loan:
+    """Create a synthetic loan fixture for projection tests."""
+    loan = Loan(
+        name=name, lender="Sample Lender", loan_type=loan_type,
+        principal_amount=1000.0, annual_interest_rate=0.0,
+        term_months=(0 if loan_type == "lent" else 12),
+        monthly_payment=(0.0 if loan_type == "lent" else 100.0),
+        currency="NZD", start_date=date(2026, 1, 1), is_active=True,
+    )
+    db.add(loan)
+    db.flush()
+    return loan
+
+
+def _seed_detached_snapshot_fixtures(db: Session) -> dict[str, int]:
+    """Seed linked transfer, dividend counterpart, split loan, and payslip fixtures."""
+    checking = _seed_account(db, name="Checking 1001", currency="NZD")
+    savings = _seed_account(db, name="Savings 2002", currency="NZD")
+    lent_loan = _seed_loan(db, "Friend Advance", "lent")
+    tx_out = Transaction(
+        account_id=checking.id, transaction_date=date(2026, 11, 10),
+        merchant="Sweep Out", amount=-250.0, currency="NZD", category="Transfers", raw_hash="det-out",
+    )
+    tx_in = Transaction(
+        account_id=savings.id, transaction_date=date(2026, 11, 10),
+        merchant="Sweep In", amount=250.0, currency="NZD", category="Transfers", raw_hash="det-in",
+    )
+    dividend = Transaction(
+        account_id=checking.id, counterpart_account_id=savings.id, transaction_date=date(2026, 11, 12),
+        merchant="Fund Dividend", amount=120.0, currency="NZD", category="Income", raw_hash="det-div",
+    )
+    split_tx = Transaction(
+        account_id=checking.id, transaction_date=date(2026, 11, 14),
+        merchant="Shared Errand", amount=-90.0, currency="NZD", category="General", raw_hash="det-split",
+    )
+    split_tx.splits = [
+        TransactionSplit(amount=-50.0, category="Debt & Loans", loan_id=lent_loan.id, tags='["loan"]'),
+        TransactionSplit(amount=-40.0, category="Groceries", tags='["food"]'),
+    ]
+    db.add_all([tx_out, tx_in, dividend, split_tx])
+    db.flush()
+    tx_in.linked_transaction_id = tx_out.id
+    slip = Receipt(
+        transaction_id=dividend.id, document_type="payslip", receipt_date=date(2026, 11, 12),
+        merchant="Fund Dividend", total_amount=120.0, currency="NZD", status="matched",
+    )
+    db.add(slip)
+    db.commit()
+    return {"tx_in_id": tx_in.id, "dividend_id": dividend.id, "split_id": split_tx.id, "slip_id": slip.id}
+
+
+def test_project_transactions_detached_frozen_snapshot_after_session_close(memory_db: Session) -> None:
+    """ProjectedTransaction and ProjectedSplit stay readable and immutable after db.close()."""
+    ids = _seed_detached_snapshot_fixtures(memory_db)
+    ref = date(2026, 11, 18)
+    ledger = project_transactions(
+        memory_db, TransactionQuery(window=ReportingWindow(period="month"), limit=50), reference_date=ref
+    )
+    inflows = project_transactions(
+        memory_db, TransactionQuery(window=ReportingWindow(period="month"), flow="inflow"), reference_date=ref
+    )
+    memory_db.close()
+
+    assert isinstance(ledger, TransactionProjection)
+    by_id = {it.id: it for it in ledger.items}
+    assert all(is_dataclass(it) and not hasattr(it, "transaction") for it in ledger.items)
+    assert by_id[ids["tx_in_id"]].linked_account_name == "Checking 1001"
+    assert by_id[ids["tx_in_id"]].linked_amount == -250.0
+    assert by_id[ids["dividend_id"]].counterpart_account_name == "Savings 2002"
+    assert by_id[ids["dividend_id"]].receipt_id == ids["slip_id"]
+    assert by_id[ids["dividend_id"]].receipt_document_type == "payslip"
+    split_row = by_id[ids["split_id"]]
+    assert split_row.is_split is True and isinstance(split_row.splits[0], ProjectedSplit)
+    assert split_row.splits[0].loan_name == "Friend Advance"
+    assert split_row.splits[0].loan_type == "lent"
+    assert inflows.items[0].account_name == "Checking 1001"
+    with pytest.raises(FrozenInstanceError):
+        split_row.amount = 0.0  # type: ignore[misc]
+
+
+def _seed_three_level_hierarchy_data(db: Session, acct_id: int) -> dict[str, int]:
+    """Seed Food -> Dining -> Fine Dining 3-level hierarchy and matching ledger rows."""
+    dining = db.scalar(select(Category).where(Category.name == "Dining"))
+    assert dining is not None
+    fine = Category(name="Fine Dining", parent_id=dining.id, is_active=True, sort_order=15)
+    db.add(fine)
+    db.flush()
+    txs = {
+        "food": Transaction(
+            account_id=acct_id, transaction_date=date(2026, 11, 17),
+            merchant="Food Hall", amount=-25.0, currency="NZD", category="Food", raw_hash="h-food",
+        ),
+        "dining": Transaction(
+            account_id=acct_id, transaction_date=date(2026, 11, 17),
+            merchant="Bistro", amount=-40.0, currency="NZD", category="Dining", raw_hash="h-dining",
+        ),
+        "fine": Transaction(
+            account_id=acct_id, transaction_date=date(2026, 11, 17),
+            merchant="Degustation", amount=-150.0, currency="NZD", category="Fine Dining", raw_hash="h-fine",
+        ),
+        "groc": Transaction(
+            account_id=acct_id, transaction_date=date(2026, 11, 17),
+            merchant="Market", amount=-60.0, currency="NZD", category="Groceries", raw_hash="h-groc",
+        ),
+        "split": Transaction(
+            account_id=acct_id, transaction_date=date(2026, 11, 17),
+            merchant="Tasting + Wine", amount=-80.0, currency="NZD", category="General", raw_hash="h-split",
+        ),
+        "rec_fine": Transaction(
+            account_id=acct_id, transaction_date=date(2026, 11, 1),
+            merchant="Supper Club Monthly", amount=-104.0, currency="NZD",
+            category="Fine Dining", recurrence="monthly", raw_hash="h-rec-fine",
+        ),
+    }
+    txs["split"].splits = [
+        TransactionSplit(amount=-50.0, category="Fine Dining"),
+        TransactionSplit(amount=-30.0, category="Alcohol"),
+    ]
+    db.add_all(txs.values())
+    db.commit()
+    return {k: v.id for k, v in txs.items()}
+
+
+def test_include_subclasses_root_and_three_level_child_category(memory_db: Session) -> None:
+    """Fix 1: include_subclasses=True traverses full subtree for both roots and child categories."""
+    acct = _seed_account(memory_db)
+    ids = _seed_three_level_hierarchy_data(memory_db, acct.id)
+    ref = date(2026, 11, 18)
+
+    for flow_mode in (None, "outflow"):
+        child_sub = project_transactions(
+            memory_db,
+            TransactionQuery(
+                window=ReportingWindow(period="week"), category="Dining",
+                include_subclasses=True, include_amortized=True, flow=flow_mode,
+            ),
+            reference_date=ref,
+        )
+        assert {it.id for it in child_sub.items} == {ids["dining"], ids["fine"], ids["split"], ids["rec_fine"]}
+        amort = [it for it in child_sub.items if it.is_amortized_commitment]
+        assert len(amort) == 1 and amort[0].id == ids["rec_fine"]
+
+        exact_dining = project_transactions(
+            memory_db,
+            TransactionQuery(
+                window=ReportingWindow(period="week"), category="Dining",
+                include_subclasses=False, flow=flow_mode,
+            ),
+            reference_date=ref,
+        )
+        assert {it.id for it in exact_dining.items} == {ids["dining"]}
+
+    root_sub = project_transactions(
+        memory_db,
+        TransactionQuery(window=ReportingWindow(period="week"), category="Food", include_subclasses=True),
+        reference_date=ref,
+    )
+    assert {it.id for it in root_sub.items} == {
+        ids["food"], ids["dining"], ids["fine"], ids["groc"], ids["split"]
+    }
+
+
+def _seed_exclusion_fixtures(db: Session, acct_id: int) -> dict[str, int]:
+    """Seed Tech, Annualized Dental, lent/borrowed loans, and split rows for budget exclusion tests."""
+    lent_loan = _seed_loan(db, "Friend Loan", "lent")
+    borrowed_loan = _seed_loan(db, "Auto Finance", "borrowed")
+    db.add(BudgetRule(category="Dental", weekly_limit=15.0, monthly_limit=65.0, budget_period="annual", is_active=True))
+    rows = {
+        "tech_var": Transaction(
+            account_id=acct_id, transaction_date=date(2026, 11, 16),
+            merchant="USB Hub", amount=-50.0, currency="NZD", category="Tech", raw_hash="ex-tv",
+        ),
+        "tech_oneoff": Transaction(
+            account_id=acct_id, transaction_date=date(2026, 11, 16),
+            merchant="Laptop", amount=-1200.0, currency="NZD", category="Tech",
+            recurrence="one-off", raw_hash="ex-to",
+        ),
+        "tech_refund": Transaction(
+            account_id=acct_id, transaction_date=date(2026, 11, 16),
+            merchant="Hub Refund", amount=15.0, currency="NZD", category="Tech", raw_hash="ex-tr",
+        ),
+        "dental": Transaction(
+            account_id=acct_id, transaction_date=date(2026, 11, 15),
+            merchant="City Dental", amount=-600.0, currency="NZD", category="Dental", raw_hash="ex-den",
+        ),
+        "lent": Transaction(
+            account_id=acct_id, transaction_date=date(2026, 11, 15),
+            merchant="Advance", amount=-400.0, currency="NZD", category="Debt & Loans",
+            loan_id=lent_loan.id, raw_hash="ex-lent",
+        ),
+        "borrowed": Transaction(
+            account_id=acct_id, transaction_date=date(2026, 11, 15),
+            merchant="Auto Payment", amount=-250.0, currency="NZD", category="Debt & Loans",
+            loan_id=borrowed_loan.id, raw_hash="ex-borr",
+        ),
+        "income": Transaction(
+            account_id=acct_id, transaction_date=date(2026, 11, 15),
+            merchant="Payroll", amount=3000.0, currency="NZD", category="Income", raw_hash="ex-inc",
+        ),
+    }
+    db.add_all(rows.values())
+    db.commit()
+    return {k: v.id for k, v in rows.items()}
+
+
+def test_excluded_from_period_budget_ledger_lent_annual_one_off_refunds(memory_db: Session) -> None:
+    """Fix 2: flow=None with include_amortized flags lent, Annualized, one-off, and positive refunds."""
+    acct = _seed_account(memory_db)
+    ids = _seed_exclusion_fixtures(memory_db, acct.id)
+    ref = date(2026, 11, 18)
+
+    mo_all = project_transactions(
+        memory_db, TransactionQuery(window=ReportingWindow(period="month"), include_amortized=True),
+        reference_date=ref,
+    )
+    excl_mo = {it.id: it.excluded_from_period_budget for it in mo_all.items}
+    assert excl_mo[ids["tech_var"]] is False
+    assert excl_mo[ids["tech_oneoff"]] is True
+    assert excl_mo[ids["tech_refund"]] is True
+    assert excl_mo[ids["dental"]] is True
+    assert excl_mo[ids["lent"]] is True
+    assert excl_mo[ids["borrowed"]] is False
+    assert excl_mo[ids["income"]] is False
+
+    all_res = project_transactions(
+        memory_db, TransactionQuery(window=ReportingWindow(period="all"), include_amortized=True),
+        reference_date=ref,
+    )
+    excl_all = {it.id: it.excluded_from_period_budget for it in all_res.items}
+    assert excl_all[ids["lent"]] is True
+    assert excl_all[ids["dental"]] is False
+
+    no_amort = project_transactions(
+        memory_db, TransactionQuery(window=ReportingWindow(period="month"), include_amortized=False),
+        reference_date=ref,
+    )
+    assert all(not it.excluded_from_period_budget for it in no_amort.items)
+
+
+def _seed_tagged_window_fixtures(db: Session, acct_id: int) -> dict[str, int]:
+    """Seed tagged regular, one-off, annual, transfer, receipt, and lent transactions."""
+    lent_loan = _seed_loan(db, "Friend Trip", "lent")
+    db.add(BudgetRule(category="Dental", weekly_limit=15.0, monthly_limit=65.0, budget_period="annual", is_active=True))
+    t_reg = Transaction(
+        account_id=acct_id, transaction_date=date(2026, 11, 10),
+        merchant="Flights", amount=-500.0, currency="NZD", category="Travel",
+        tags='["trip"]', raw_hash="tag-reg",
+    )
+    t_oneoff = Transaction(
+        account_id=acct_id, transaction_date=date(2026, 11, 11),
+        merchant="Camera", amount=-1200.0, currency="NZD", category="Tech",
+        recurrence="one-off", tags='["trip"]', raw_hash="tag-oneoff",
+    )
+    t_dental = Transaction(
+        account_id=acct_id, transaction_date=date(2026, 11, 12),
+        merchant="Travel Clinic", amount=-300.0, currency="NZD", category="Dental",
+        tags='["trip"]', raw_hash="tag-dental",
+    )
+    t_xfer = Transaction(
+        account_id=acct_id, transaction_date=date(2026, 11, 13),
+        merchant="FX Sweep", amount=-400.0, currency="NZD", category="Transfers",
+        tags='["trip"]', raw_hash="tag-xfer",
+    )
+    t_lent = Transaction(
+        account_id=acct_id, transaction_date=date(2026, 11, 14),
+        merchant="Lend Friend", amount=-250.0, currency="NZD", category="Debt & Loans",
+        loan_id=lent_loan.id, tags='["trip"]', raw_hash="tag-lent",
+    )
+    t_split = Transaction(
+        account_id=acct_id, transaction_date=date(2026, 11, 15),
+        merchant="Split Meal", amount=-100.0, currency="NZD", category="General",
+        tags='["trip"]', raw_hash="tag-split",
+    )
+    t_split.splits = [
+        TransactionSplit(amount=-60.0, category="Dining"),
+        TransactionSplit(amount=-40.0, category="Transfers"),
+    ]
+    t_rec = Transaction(
+        account_id=acct_id, transaction_date=date(2026, 11, 16),
+        merchant="Supermart", amount=-100.0, currency="NZD", category="Groceries",
+        tags='["trip"]', raw_hash="tag-rec",
+    )
+    db.add_all([t_reg, t_oneoff, t_dental, t_xfer, t_lent, t_split, t_rec])
+    db.flush()
+    rec = Receipt(
+        transaction_id=t_rec.id, merchant="Supermart", receipt_date=date(2026, 11, 16),
+        total_amount=100.0, currency="NZD", status="matched",
+    )
+    db.add(rec)
+    db.flush()
+    db.add_all([
+        ReceiptItem(receipt_id=rec.id, item_name="Snacks", unit_price=60.0, total_price=60.0, category="Groceries"),
+        ReceiptItem(receipt_id=rec.id, item_name="Cash Out", unit_price=40.0, total_price=40.0, category="Transfers"),
+    ])
+    db.commit()
+    return {"xfer_id": t_xfer.id, "lent_id": t_lent.id}
+
+
+def test_project_window_tags_excludes_transfers_and_lent_while_keeping_one_off_and_annual(
+    memory_db: Session,
+) -> None:
+    """Fix 3: project_window.tags excludes Transfers/lent; ?tag= ledger still returns tagged Transfers."""
+    acct = _seed_account(memory_db)
+    ids = _seed_tagged_window_fixtures(memory_db, acct.id)
+    ref = date(2026, 11, 18)
+
+    wp = project_window(memory_db, ReportingWindow(period="month"), reference_date=ref)
+    assert wp.total_tagged_spend == 2120.0  # 500 + 1200 + 300 + 60 + 60
+    assert len(wp.tags) == 1
+    trip = wp.tags[0]
+    assert trip.tag == "trip"
+    assert trip.total_spend == 2120.0
+    assert trip.transaction_count == 5
+    cat_names = {c.category for c in trip.categories}
+    assert cat_names == {"Travel", "Tech", "Dental", "Dining", "Groceries"}
+
+    ledger_tag = project_transactions(
+        memory_db, TransactionQuery(window=ReportingWindow(period="month"), tag="trip"), reference_date=ref
+    )
+    assert ids["xfer_id"] in {it.id for it in ledger_tag.items}
+    assert ids["lent_id"] in {it.id for it in ledger_tag.items}
+
+
+def test_http_summary_categories_summary_tags_and_ledger_contracts(
+    api_client: TestClient,
+    memory_db: Session,
+) -> None:
+    """Thin HTTP contract smoke tests for /summary/categories, /summary/tags, and /transactions."""
+    today = date.today()
+    sgd_acct = _seed_account(memory_db, name="SGD Cash", currency="SGD")
+    nzd_acct = _seed_account(memory_db, name="NZD Checking", currency="NZD")
+    lent_loan = _seed_loan(memory_db, "Travel Advance", "lent")
+    memory_db.add_all([
+        BudgetRule(category="Dental", weekly_limit=15.0, monthly_limit=65.0, budget_period="annual", is_active=True),
+        BudgetRule(category="Utilities", weekly_limit=50.0, monthly_limit=216.67, budget_period="monthly", is_active=True),
+    ])
+    t_sgd = Transaction(
+        account_id=sgd_acct.id, transaction_date=today, merchant="SGD Cafe", amount=-100.0,
+        currency="SGD", exchange_rate=1.30, category="Dining", tags='["asia-trip"]', raw_hash="http-sgd",
+    )
+    t_lent = Transaction(
+        account_id=nzd_acct.id, transaction_date=today, merchant="Lent Cash", amount=-300.0,
+        currency="NZD", category="Debt & Loans", loan_id=lent_loan.id, tags='["asia-trip"]', raw_hash="http-lent",
+    )
+    t_xfer = Transaction(
+        account_id=nzd_acct.id, transaction_date=today, merchant="FX Transfer", amount=-400.0,
+        currency="NZD", category="Transfers", tags='["asia-trip"]', raw_hash="http-xfer",
+    )
+    t_oneoff = Transaction(
+        account_id=nzd_acct.id, transaction_date=today, merchant="Gear", amount=-200.0,
+        currency="NZD", category="Tech", recurrence="one-off", tags='["asia-trip"]', raw_hash="http-oneoff",
+    )
+    t_rec = Transaction(
+        account_id=nzd_acct.id, transaction_date=today, merchant="Mart", amount=-100.0,
+        currency="NZD", category="Groceries", tags='["asia-trip"]', raw_hash="http-mart",
+    )
+    memory_db.add_all([t_sgd, t_lent, t_xfer, t_oneoff, t_rec])
+    memory_db.flush()
+    rec = Receipt(
+        transaction_id=t_rec.id, merchant="Mart", receipt_date=today, total_amount=100.0, currency="NZD", status="matched"
+    )
+    memory_db.add(rec)
+    memory_db.flush()
+    memory_db.add_all([
+        ReceiptItem(receipt_id=rec.id, item_name="Food", unit_price=60.0, total_price=60.0, category="Groceries"),
+        ReceiptItem(receipt_id=rec.id, item_name="ATM", unit_price=40.0, total_price=40.0, category="Transfers"),
+    ])
+    memory_db.commit()
+
+    bad_cat = api_client.get("/transactions/summary/categories?start_date=2026-11-20&end_date=2026-11-10")
+    assert bad_cat.status_code == 400
+
+    cat_sum = api_client.get(f"/transactions/summary/categories?start_date={today.isoformat()}&end_date={today.isoformat()}")
+    assert cat_sum.status_code == 200
+    assert cat_sum.json() == [
+        {"category": "Tech", "total_amount": -200.0, "count": 1},
+        {"category": "Dining", "total_amount": -130.0, "count": 1},
+        {"category": "Groceries", "total_amount": -60.0, "count": 1},
+    ]
+
+    bad_tag = api_client.get("/transactions/summary/tags?period=invalid")
+    assert bad_tag.status_code == 400
+    tag_sum = api_client.get("/transactions/summary/tags?period=month")
+    assert tag_sum.status_code == 200
+    tag_body = tag_sum.json()
+    assert tag_body["total_tagged_spend"] == 390.0  # 130 Dining + 200 Tech + 60 Groceries
+    assert tag_body["tags"][0]["transaction_count"] == 3
+
+    ledger_tag = api_client.get("/transactions?tag=asia-trip&period=month&include_amortized=true")
+    assert ledger_tag.status_code == 200
+    by_id = {row["id"]: row for row in ledger_tag.json()}
+    assert t_xfer.id in by_id
+    assert by_id[t_lent.id]["excluded_from_period_budget"] is True
+    assert by_id[t_oneoff.id]["excluded_from_period_budget"] is True
