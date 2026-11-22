@@ -1,11 +1,11 @@
 """Transactions and spending router."""
 
-from datetime import date, timedelta
+from datetime import date
 import json
 from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from sqlalchemy import and_, desc, func, or_, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
 from app.db import get_db
@@ -16,31 +16,22 @@ from app.schemas import (
     TagSpendingSummaryResponse,
     TransactionCreate,
     TransactionRead,
+    TransactionSplitRead,
     TransactionSplitsUpdate,
     TransactionUpdate,
 )
-from app.services.burn_service import (
-    TRANSFER_CATEGORIES,
-    expand_expense_lines_by_receipt,
-    to_nzd_amount,
-    weekly_to_monthly,
-)
-from app.services.category_taxonomy import get_category_parent_map, get_root_category
 from app.services.fx_service import get_exchange_rate
-from app.services.period_service import resolve_period_dates
 from app.services.receipt_service import reconcile_unlinked_receipts
-from app.services.recurrence_service import (
-    get_active_recurring_commitments,
-    get_period_amortized_recurrences,
-    is_recurrence_excluded_from_period,
-)
-from app.services.rules_engine import normalize_tags, parse_rule_tags
+from app.services.rules_engine import normalize_tags
 from app.services.spending_projection import (
-    FlowLiteral,
+    TRANSFER_CATEGORIES,
     InvalidWindowError,
-    ProjectedCashflowItem,
+    ProjectedSplit,
+    ProjectedTransaction,
     ReportingWindow,
-    project_cashflow_transactions,
+    TransactionQuery,
+    project_transactions,
+    project_window,
 )
 from app.services.statement_parser import generate_transaction_hash
 from app.services.transfer_service import reconcile_transfers
@@ -109,492 +100,43 @@ def _resolve_unlinked_fx_rate(db: Session, leg: Transaction) -> Optional[float]:
     return None
 
 
-def _category_matches_target(
-    cat: str,
-    target_cat: Optional[str],
-    include_subclasses: bool,
-    parent_map: Optional[dict[str, str]],
-) -> bool:
-    if not target_cat:
-        return True
-    effective_lower = (
-        get_root_category(cat, parent_map).lower()
-        if include_subclasses
-        else cat.lower()
-    )
-    return effective_lower == target_cat
-
-
-def _resolve_matched_category(
-    tx: Transaction,
-    matched_cats: set[str],
-    category: Optional[str],
-    target_cat: Optional[str],
-    include_subclasses: bool,
-) -> str:
-    if target_cat and include_subclasses:
-        return category.strip() if category else (tx.category or "General")
-    if len(matched_cats) == 1:
-        return next(iter(matched_cats))
-    return tx.category or "General"
-
-
-def _match_manual_splits(
-    tx: Transaction,
-    splits: list[TransactionSplit],
-    *,
-    target_cat: Optional[str],
-    target_tag: Optional[str],
-    include_subclasses: bool,
-    parent_map: Optional[dict[str, str]],
-) -> list[tuple[TransactionSplit, str, list[str]]]:
-    parent_tags = parse_rule_tags(tx.tags)
-    matched: list[tuple[TransactionSplit, str, list[str]]] = []
-    for split in splits:
-        s_cat = (split.category or tx.category or "General").strip() or "General"
-        s_tags = normalize_tags([*parent_tags, *parse_rule_tags(split.tags)])
-        if target_tag and target_tag not in s_tags:
-            continue
-        if not _category_matches_target(s_cat, target_cat, include_subclasses, parent_map):
-            continue
-        matched.append((split, s_cat, s_tags))
-    return matched
-
-
-def _filter_transaction_by_manual_splits(
-    tx: Transaction,
-    splits: list[TransactionSplit],
-    *,
-    category: Optional[str],
-    target_cat: Optional[str],
-    target_tag: Optional[str],
-    include_subclasses: bool,
-    parent_map: Optional[dict[str, str]],
-) -> Optional[TransactionRead]:
-    matched_splits = _match_manual_splits(
-        tx,
-        splits,
-        target_cat=target_cat,
-        target_tag=target_tag,
-        include_subclasses=include_subclasses,
-        parent_map=parent_map,
-    )
-    if not matched_splits:
-        return None
-    tx_cat_lower = (tx.category or "General").strip().lower()
-    matched_orig = round(sum(s.signed_amount() for s, _, _ in matched_splits), 2)
-    total_orig = round(sum(s.signed_amount() for s in splits), 2)
-    matched_cats = {s_cat for _, s_cat, _ in matched_splits}
-    matched_cat = _resolve_matched_category(tx, matched_cats, category, target_cat, include_subclasses)
-    merged_tags = normalize_tags(t for _, _, s_tags in matched_splits for t in s_tags)
-    is_partial = len(matched_splits) < len(splits) or abs(matched_orig - total_orig) > 0.01
-    if is_partial or (target_cat and matched_cat.lower() != tx_cat_lower):
-        split_notes = ", ".join(s.notes for s, _, _ in matched_splits if s.notes)
-        fallback = f"Split of {tx.currency} {abs(float(tx.amount)):.2f}" if is_partial else tx.notes
-        return TransactionRead.model_validate(tx).model_copy(
-            update={
-                "amount": matched_orig,
-                "category": matched_cat,
-                "tags": merged_tags,
-                "is_split": True,
-                "notes": split_notes or fallback,
-            }
-        )
-    return TransactionRead.model_validate(tx).model_copy(
-        update={"tags": merged_tags or parse_rule_tags(tx.tags), "is_split": len(splits) >= 2}
+def _projected_split_to_read(split: ProjectedSplit) -> TransactionSplitRead:
+    """Adapt a frozen ProjectedSplit snapshot into a TransactionSplitRead DTO."""
+    return TransactionSplitRead(
+        id=split.id,
+        transaction_id=split.transaction_id,
+        amount=split.amount,
+        category=split.category,
+        tags=list(split.tags),
+        loan_id=split.loan_id,
+        loan_name=split.loan_name,
+        loan_type=split.loan_type,
+        notes=split.notes,
     )
 
 
-def _filter_transaction_by_receipt_lines(
-    tx: Transaction,
-    *,
-    category: Optional[str],
-    target_cat: Optional[str],
-    target_tag: Optional[str],
-    include_subclasses: bool,
-    parent_map: Optional[dict[str, str]],
-) -> Optional[TransactionRead]:
-    tx_cat_lower = (tx.category or "General").strip().lower()
-    lines = expand_expense_lines_by_receipt(tx)
-    matched_lines = [
-        line
-        for line in lines
-        if (not target_tag or target_tag in line.effective_tags)
-        and _category_matches_target(line.category, target_cat, include_subclasses, parent_map)
-    ]
-    if not matched_lines:
-        return None
-    matched_nzd = round(sum(line.amount_nzd for line in matched_lines), 2)
-    total_tx_nzd = round(sum(line.amount_nzd for line in lines), 2)
-    matched_cats = {line.category for line in matched_lines}
-    matched_cat = _resolve_matched_category(tx, matched_cats, category, target_cat, include_subclasses)
-    merged_tags = normalize_tags(t for line in matched_lines for t in line.effective_tags)
-    is_partial = len(matched_lines) < len(lines) or abs(matched_nzd - total_tx_nzd) > 0.01
-    if is_partial or (target_cat and matched_cat.lower() != tx_cat_lower):
-        fx_unit = to_nzd_amount(1.0, tx.currency, tx.exchange_rate)
-        split_orig = round(matched_nzd / fx_unit, 2) if fx_unit > 0 else matched_nzd
-        names = ", ".join(line.item_name for line in matched_lines if line.item_name)
-        notes = f"Receipt split ({names}) of {tx.currency} {abs(float(tx.amount)):.2f}" if names else tx.notes
-        return TransactionRead.model_validate(tx).model_copy(
-            update={
-                "amount": -abs(split_orig),
-                "category": matched_cat,
-                "tags": merged_tags,
-                "is_receipt_split": True,
-                "notes": notes,
-            }
-        )
-    return TransactionRead.model_validate(tx).model_copy(
-        update={"tags": merged_tags or parse_rule_tags(tx.tags)}
+def _projected_to_transaction_read(item: ProjectedTransaction) -> TransactionRead:
+    """Adapt a frozen ProjectedTransaction snapshot into a TransactionRead DTO."""
+    return TransactionRead(
+        id=item.id, transaction_date=item.transaction_date, account_id=item.account_id,
+        account_name=item.account_name, amount=item.amount, currency=item.currency,
+        merchant=item.merchant, category=item.category, raw_description=item.raw_description,
+        notes=item.notes, linked_transaction_id=item.linked_transaction_id,
+        linked_account_name=item.linked_account_name, linked_amount=item.linked_amount,
+        linked_currency=item.linked_currency, counterpart_account_id=item.counterpart_account_id,
+        counterpart_account_name=item.counterpart_account_name, loan_id=item.loan_id,
+        loan_name=item.loan_name, loan_type=item.loan_type,
+        loan_payment_amount=item.loan_payment_amount, exchange_rate=item.exchange_rate,
+        fee_amount=item.fee_amount, raw_hash=item.raw_hash, tags=list(item.tags),
+        recurrence=item.recurrence, has_receipt=item.has_receipt, receipt_id=item.receipt_id,
+        receipt_document_type=item.receipt_document_type, is_receipt_split=item.is_receipt_split,
+        splits=[_projected_split_to_read(s) for s in item.splits], is_split=item.is_split,
+        is_amortized_commitment=item.is_amortized_commitment,
+        amortized_period_amount_nzd=item.amortized_period_amount_nzd,
+        amortized_cadence=item.amortized_cadence,
+        excluded_from_period_budget=item.excluded_from_period_budget,
+        created_at=item.created_at,
     )
-
-
-def _matches_receipt_transaction_filter(
-    tx: Transaction,
-    *,
-    category: Optional[str],
-    target_cat: Optional[str],
-    target_tag: Optional[str],
-    include_subclasses: bool,
-    parent_map: Optional[dict[str, str]] = None,
-) -> Optional[TransactionRead]:
-    """Filter a transaction by category and/or tag, expanding manual splits or receipt items."""
-    splits = list(getattr(tx, "splits", None) or [])
-    if splits:
-        return _filter_transaction_by_manual_splits(
-            tx,
-            splits,
-            category=category,
-            target_cat=target_cat,
-            target_tag=target_tag,
-            include_subclasses=include_subclasses,
-            parent_map=parent_map,
-        )
-    tx_cat_lower = (tx.category or "General").strip().lower()
-    is_expandable = (
-        float(tx.amount) < 0
-        and tx.receipt is not None
-        and bool(tx.receipt.items)
-        and tx_cat_lower not in TRANSFER_CATEGORIES
-    )
-    if not is_expandable:
-        if target_tag and target_tag not in parse_rule_tags(tx.tags):
-            return None
-        if not _category_matches_target(tx.category or "General", target_cat, include_subclasses, parent_map):
-            return None
-        return TransactionRead.model_validate(tx)
-    return _filter_transaction_by_receipt_lines(
-        tx,
-        category=category,
-        target_cat=target_cat,
-        target_tag=target_tag,
-        include_subclasses=include_subclasses,
-        parent_map=parent_map,
-    )
-
-
-def _collect_amortized_commitments(
-    db: Session,
-    *,
-    ref_date: date,
-    effective_period: Optional[str],
-    target_cat: str,
-    include_subclasses: bool,
-    account_id: Optional[int],
-    amortized_recurrences: frozenset[str],
-    parent_map: Optional[dict[str, str]] = None,
-) -> list[TransactionRead]:
-    """Build TransactionRead entries for active recurring commitments amortized into a period."""
-    is_monthly = effective_period in ("month", "last_month")
-    cadence = "month" if is_monthly else "week"
-    amortized_results: list[TransactionRead] = []
-
-    for rec_tx, weekly_nzd in get_active_recurring_commitments(db, ref_date, eager_load=True):
-        if account_id is not None and rec_tx.account_id != account_id:
-            continue
-        rec = (rec_tx.recurrence or "").strip().lower()
-        if rec not in amortized_recurrences:
-            continue
-        rec_cat = rec_tx.category or "General"
-        effective_rec_lower = (
-            get_root_category(rec_cat, parent_map).lower()
-            if include_subclasses
-            else rec_cat.strip().lower()
-        )
-        if effective_rec_lower != target_cat:
-            continue
-
-        hydrate_transaction(rec_tx)
-        amortized_nzd = weekly_to_monthly(weekly_nzd) if is_monthly else weekly_nzd
-        amortized_results.append(
-            TransactionRead.model_validate(rec_tx).model_copy(
-                update={
-                    "is_amortized_commitment": True,
-                    "amortized_period_amount_nzd": amortized_nzd,
-                    "amortized_cadence": cadence,
-                }
-            )
-        )
-
-    amortized_results.sort(
-        key=lambda item: (
-            -float(item.amortized_period_amount_nzd or 0.0),
-            -item.transaction_date.toordinal(),
-            -item.id,
-        )
-    )
-    return amortized_results
-
-
-def _projected_item_to_read(item: ProjectedCashflowItem) -> TransactionRead:
-    """Hydrate a ProjectedCashflowItem into TransactionRead with projection overrides."""
-    tx = hydrate_transaction(item.transaction)
-    updates: dict[str, object] = {}
-    if item.projected_amount is not None:
-        updates["amount"] = item.projected_amount
-    if item.projected_category is not None:
-        updates["category"] = item.projected_category
-    if item.projected_tags is not None:
-        updates["tags"] = list(item.projected_tags)
-    if item.projected_notes is not None:
-        updates["notes"] = item.projected_notes
-    if item.is_split is not None:
-        updates["is_split"] = item.is_split
-    if item.is_receipt_split:
-        updates["is_receipt_split"] = True
-    if item.excluded_from_period_budget:
-        updates["excluded_from_period_budget"] = True
-    if item.is_amortized_commitment:
-        updates["is_amortized_commitment"] = True
-        updates["amortized_period_amount_nzd"] = item.amortized_period_amount_nzd
-        updates["amortized_cadence"] = item.amortized_cadence
-    dto = TransactionRead.model_validate(tx)
-    return dto.model_copy(update=updates) if updates else dto
-
-
-def _list_cashflow_transactions(
-    db: Session,
-    response: Response,
-    *,
-    flow: FlowLiteral,
-    period: Optional[str],
-    start_date: Optional[date],
-    end_date: Optional[date],
-    category: Optional[str],
-    include_subclasses: bool,
-    include_amortized: bool,
-    account_id: Optional[int],
-    loan_id: Optional[int],
-    tag: Optional[str],
-    offset: int,
-    limit: int,
-) -> list[TransactionRead]:
-    """Execute Spending Projection cashflow query and expose X-Total-Count."""
-    try:
-        result = project_cashflow_transactions(
-            db,
-            ReportingWindow(period=period, start_date=start_date, end_date=end_date),
-            flow=flow,
-            category=category,
-            include_subclasses=include_subclasses,
-            include_amortized=include_amortized,
-            account_id=account_id,
-            loan_id=loan_id,
-            tag=tag,
-            offset=offset,
-            limit=limit,
-        )
-    except InvalidWindowError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    response.headers["X-Total-Count"] = str(result.total_count)
-    return [_projected_item_to_read(item) for item in result.items]
-
-
-def _filter_legacy_rows(
-    rows,
-    *,
-    effective_period: Optional[str],
-    category: Optional[str],
-    target_cat: Optional[str],
-    target_tag: Optional[str],
-    include_subclasses: bool,
-    should_include_amortized: bool,
-    amortized_tx_ids: set[int],
-    parent_map: Optional[dict[str, str]],
-) -> list[TransactionRead]:
-    """Hydrate, filter, and flag legacy rows matching category or tag filters."""
-    matching: list[TransactionRead] = []
-    for tx in rows:
-        if tx.id in amortized_tx_ids:
-            continue
-        hydrate_transaction(tx)
-        dto = _matches_receipt_transaction_filter(
-            tx,
-            category=category,
-            target_cat=target_cat,
-            target_tag=target_tag,
-            include_subclasses=include_subclasses,
-            parent_map=parent_map,
-        )
-        if dto is None:
-            continue
-        if should_include_amortized and (
-            float(dto.amount) >= 0
-            or is_recurrence_excluded_from_period(effective_period, tx.recurrence)
-        ):
-            dto = dto.model_copy(update={"excluded_from_period_budget": True})
-        matching.append(dto)
-    return matching
-
-
-def _list_legacy_filtered_transactions(
-    db: Session,
-    response: Response,
-    ordered_stmt,
-    *,
-    ref_date: date,
-    effective_period: Optional[str],
-    category: Optional[str],
-    target_cat: Optional[str],
-    target_tag: Optional[str],
-    include_subclasses: bool,
-    include_amortized: bool,
-    account_id: Optional[int],
-    amortized_recurrences: frozenset[str],
-    offset: int,
-    limit: int,
-) -> list[TransactionRead]:
-    """Legacy category/tag-filtered transaction listing preserved when flow is None."""
-    parent_map = get_category_parent_map(db) if include_subclasses else None
-    should_include_amortized = bool(
-        include_amortized
-        and target_cat
-        and target_cat not in TRANSFER_CATEGORIES
-        and not target_tag
-        and amortized_recurrences
-    )
-    amortized_results = (
-        _collect_amortized_commitments(
-            db,
-            ref_date=ref_date,
-            effective_period=effective_period,
-            target_cat=target_cat or "",
-            include_subclasses=include_subclasses,
-            account_id=account_id,
-            amortized_recurrences=amortized_recurrences,
-            parent_map=parent_map,
-        )
-        if should_include_amortized
-        else []
-    )
-    amortized_tx_ids = {item.id for item in amortized_results}
-    max_actual = max(0, limit - len(amortized_results)) if should_include_amortized else limit
-    matching = _filter_legacy_rows(
-        db.scalars(ordered_stmt).unique().all(),
-        effective_period=effective_period,
-        category=category,
-        target_cat=target_cat,
-        target_tag=target_tag,
-        include_subclasses=include_subclasses,
-        should_include_amortized=should_include_amortized,
-        amortized_tx_ids=amortized_tx_ids,
-        parent_map=parent_map,
-    )
-    response.headers["X-Total-Count"] = str(len(matching))
-    sliced = matching[offset : offset + max_actual] if max_actual > 0 else []
-    if should_include_amortized and offset == 0:
-        return sliced + amortized_results[:limit]
-    return sliced
-
-
-def _list_legacy_transactions(
-    db: Session,
-    response: Response,
-    *,
-    start_date: Optional[date],
-    end_date: Optional[date],
-    category: Optional[str],
-    include_subclasses: bool,
-    include_amortized: bool,
-    tag: Optional[str],
-    period: Optional[str],
-    account_id: Optional[int],
-    loan_id: Optional[int],
-    offset: int,
-    limit: int,
-) -> list[TransactionRead]:
-    """Preserve legacy GET /transactions listing semantics when flow is omitted."""
-    effective_period = None if (start_date is not None or end_date is not None) else period
-    resolved_start, resolved_end = resolve_period_dates(effective_period, start_date, end_date)
-    ref_date = resolved_end or date.today()
-    amortized_recurrences = get_period_amortized_recurrences(effective_period)
-    stmt = _build_legacy_base_statement(
-        start_date=resolved_start,
-        end_date=resolved_end,
-        account_id=account_id,
-        loan_id=loan_id,
-    )
-    ordered_stmt = stmt.order_by(desc(Transaction.transaction_date), desc(Transaction.id))
-    target_cat = category.strip().lower() if category else None
-    target_tag = tag.strip().lower().lstrip("#").replace(" ", "-") if tag else None
-
-    if target_cat or target_tag:
-        return _list_legacy_filtered_transactions(
-            db,
-            response,
-            ordered_stmt,
-            ref_date=ref_date,
-            effective_period=effective_period,
-            category=category,
-            target_cat=target_cat,
-            target_tag=target_tag,
-            include_subclasses=include_subclasses,
-            include_amortized=include_amortized,
-            account_id=account_id,
-            amortized_recurrences=amortized_recurrences,
-            offset=offset,
-            limit=limit,
-        )
-
-    total_count = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
-    response.headers["X-Total-Count"] = str(total_count)
-    txs = db.scalars(ordered_stmt.offset(offset).limit(limit)).unique().all()
-    for tx in txs:
-        hydrate_transaction(tx)
-    return [TransactionRead.model_validate(tx) for tx in txs]
-
-
-def _build_legacy_base_statement(
-    *,
-    start_date: Optional[date],
-    end_date: Optional[date],
-    account_id: Optional[int],
-    loan_id: Optional[int],
-):
-    """Build base Transaction query with account, loan, and date predicates."""
-    stmt = select(Transaction).options(*_transaction_load_options(include_receipt_items=True))
-    if account_id is not None:
-        stmt = stmt.where(
-            or_(
-                Transaction.account_id == account_id,
-                and_(
-                    Transaction.counterpart_account_id == account_id,
-                    Transaction.linked_transaction_id.is_(None),
-                ),
-            )
-        )
-    if loan_id is not None:
-        stmt = stmt.where(
-            or_(
-                Transaction.loan_id == loan_id,
-                Transaction.splits.any(TransactionSplit.loan_id == loan_id),
-            )
-        )
-    if start_date:
-        stmt = stmt.where(Transaction.transaction_date >= start_date)
-    if end_date:
-        stmt = stmt.where(Transaction.transaction_date <= end_date)
-    return stmt
 
 
 @router.get("", response_model=list[TransactionRead])
@@ -621,38 +163,18 @@ def list_transactions(
     db: Session = Depends(get_db),
 ):
     """List transactions with optional flow projection, date range, period, account_id, loan_id, category, and tag filters."""
-    if flow is not None:
-        return _list_cashflow_transactions(
-            db,
-            response,
-            flow=flow,
-            period=period,
-            start_date=start_date,
-            end_date=end_date,
-            category=category,
-            include_subclasses=include_subclasses,
-            include_amortized=include_amortized,
-            account_id=account_id,
-            loan_id=loan_id,
-            tag=tag,
-            offset=offset,
-            limit=limit,
-        )
-    return _list_legacy_transactions(
-        db,
-        response,
-        start_date=start_date,
-        end_date=end_date,
-        category=category,
-        include_subclasses=include_subclasses,
-        include_amortized=include_amortized,
-        tag=tag,
-        period=period,
-        account_id=account_id,
-        loan_id=loan_id,
-        offset=offset,
-        limit=limit,
+    query = TransactionQuery(
+        window=ReportingWindow(period=period, start_date=start_date, end_date=end_date),
+        category=category, tag=tag, flow=flow, include_subclasses=include_subclasses,
+        include_amortized=include_amortized, account_id=account_id, loan_id=loan_id,
+        limit=limit, offset=offset,
     )
+    try:
+        projection = project_transactions(db, query)
+    except InvalidWindowError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    response.headers["X-Total-Count"] = str(projection.total_count)
+    return [_projected_to_transaction_read(item) for item in projection.items]
 
 
 @router.patch("/{transaction_id}", response_model=TransactionRead)
@@ -921,29 +443,25 @@ def get_category_summary(
     end_date: date = Query(...),
     db: Session = Depends(get_db),
 ):
-    """Get aggregated spending by category for a given date window."""
-    stmt = (
-        select(
-            Transaction.category,
-            func.sum(Transaction.amount).label("total_amount"),
-            func.count(Transaction.id).label("count"),
+    """Get aggregated Reporting Currency spending by category for a given date window."""
+    try:
+        projection = project_window(
+            db,
+            ReportingWindow(start_date=start_date, end_date=end_date),
         )
-        .where(
-            Transaction.transaction_date >= start_date,
-            Transaction.transaction_date <= end_date,
-        )
-        .group_by(Transaction.category)
-        .order_by(func.sum(Transaction.amount))
-    )
-    results = db.execute(stmt).all()
-    return [
+    except InvalidWindowError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    items = [
         {
-            "category": row.category,
-            "total_amount": float(row.total_amount or 0.0),
-            "count": row.count,
+            "category": item.category,
+            "total_amount": 0.0 if item.total_spend == 0 else round(-item.total_spend, 2),
+            "count": item.transaction_count,
         }
-        for row in results
+        for item in projection.categories
+        if not item.is_transfer and item.transaction_count > 0
     ]
+    items.sort(key=lambda row: (row["total_amount"], row["category"]))
+    return items
 
 
 @router.get("/summary/tags", response_model=TagSpendingSummaryResponse)
@@ -956,103 +474,29 @@ def get_tag_spending_summary(
     end_date: Optional[date] = Query(default=None),
     db: Session = Depends(get_db),
 ):
-    """Aggregate NZD expense totals and per-category breakdowns for every tag.
-
-    Matched receipt items inherit tags from their parent transaction and combine
-    them with any item-level tags so multi-category receipts split cleanly by tag.
-    """
+    """Aggregate NZD expense totals and per-category breakdowns for every tag."""
     effective_period = None if (start_date is not None or end_date is not None) else period
-    start_date, end_date = resolve_period_dates(effective_period, start_date, end_date)
-
-    stmt = (
-        select(Transaction)
-        .options(
-            joinedload(Transaction.receipt).joinedload(Receipt.items),
-            joinedload(Transaction.splits).joinedload(TransactionSplit.loan),
+    try:
+        projection = project_window(
+            db,
+            ReportingWindow(period=effective_period, start_date=start_date, end_date=end_date),
         )
-        .where(
-            or_(
-                Transaction.amount < 0,
-                Transaction.splits.any(TransactionSplit.amount < 0),
-            ),
-            or_(
-                func.lower(Transaction.category).not_in(TRANSFER_CATEGORIES),
-                Transaction.splits.any(),
-            ),
-        )
-    )
-    if start_date:
-        stmt = stmt.where(Transaction.transaction_date >= start_date)
-    if end_date:
-        stmt = stmt.where(Transaction.transaction_date <= end_date)
-
-    rows = (
-        db.scalars(stmt.order_by(desc(Transaction.transaction_date), desc(Transaction.id)))
-        .unique()
-        .all()
-    )
-
-    total_tagged_spend = 0.0
-    tag_map: dict[str, dict] = {}
-    for tx in rows:
-        for line in expand_expense_lines_by_receipt(tx):
-            if not line.effective_tags:
-                continue
-            total_tagged_spend += line.amount_nzd
-
-            for tag_key in line.effective_tags:
-                bucket = tag_map.setdefault(
-                    tag_key,
-                    {
-                        "spend": 0.0,
-                        "tx_ids": set(),
-                        "first_date": tx.transaction_date,
-                        "last_date": tx.transaction_date,
-                        "categories": {},
-                    },
-                )
-                bucket["spend"] += line.amount_nzd
-                bucket["tx_ids"].add(tx.id)
-                if tx.transaction_date < bucket["first_date"]:
-                    bucket["first_date"] = tx.transaction_date
-                if tx.transaction_date > bucket["last_date"]:
-                    bucket["last_date"] = tx.transaction_date
-
-                cat_bucket = bucket["categories"].setdefault(
-                    line.category, {"spend": 0.0, "tx_ids": set()}
-                )
-                cat_bucket["spend"] += line.amount_nzd
-                cat_bucket["tx_ids"].add(tx.id)
-
-    tag_items: list[TagSpendingSummaryItem] = []
-    for tag_key, bucket in tag_map.items():
-        tag_total = round(bucket["spend"], 2)
-        cat_items = [
-            TagCategoryBreakdownItem(
-                category=cat_name,
-                total_spend=round(cat_data["spend"], 2),
-                transaction_count=len(cat_data["tx_ids"]),
-                percentage=round(cat_data["spend"] / tag_total * 100.0, 1) if tag_total > 0 else 0.0,
-            )
-            for cat_name, cat_data in bucket["categories"].items()
-        ]
-        cat_items.sort(key=lambda item: (-item.total_spend, item.category))
-        tag_items.append(
-            TagSpendingSummaryItem(
-                tag=tag_key,
-                total_spend=tag_total,
-                transaction_count=len(bucket["tx_ids"]),
-                first_date=bucket["first_date"],
-                last_date=bucket["last_date"],
-                categories=cat_items,
-            )
-        )
-
-    tag_items.sort(key=lambda item: (-item.total_spend, item.tag))
+    except InvalidWindowError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return TagSpendingSummaryResponse(
-        period=period or "custom",
-        start_date=start_date,
-        end_date=end_date,
-        total_tagged_spend=round(total_tagged_spend, 2),
-        tags=tag_items,
+        period=projection.period,
+        start_date=projection.start_date,
+        end_date=projection.end_date,
+        total_tagged_spend=projection.total_tagged_spend,
+        tags=[
+            TagSpendingSummaryItem(
+                tag=t.tag,
+                total_spend=t.total_spend,
+                transaction_count=t.transaction_count,
+                first_date=t.first_date,
+                last_date=t.last_date,
+                categories=[TagCategoryBreakdownItem(**vars(c)) for c in t.categories],
+            )
+            for t in projection.tags
+        ],
     )

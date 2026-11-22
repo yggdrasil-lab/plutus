@@ -212,13 +212,21 @@ def get_descendant_category_names(
     root_category: str,
     parent_map: Optional[dict[str, str]] = None,
 ) -> set[str]:
-    """Return lowercase names for root_category and all subclasses inheriting from it."""
-    root_lower = (root_category or "").strip().lower()
-    if not root_lower:
+    """Return lowercase names for root_category and all descendants at any depth."""
+    target_lower = (root_category or "").strip().lower()
+    if not target_lower:
         return set()
     active = CATEGORY_PARENTS if parent_map is None else parent_map
-    descendants: set[str] = {root_lower}
+    _, lower_to_parent = _build_lookup_tables(active)
+    descendants: set[str] = {target_lower}
     for child in active:
-        if get_root_category(child, active).lower() == root_lower:
-            descendants.add(child.lower())
+        curr = child.strip().lower()
+        seen: set[str] = set()
+        while curr and curr not in seen:
+            if curr == target_lower:
+                descendants.add(child.strip().lower())
+                break
+            seen.add(curr)
+            parent = lower_to_parent.get(curr)
+            curr = parent.strip().lower() if parent else ""
     return descendants
