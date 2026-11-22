@@ -18,19 +18,15 @@ from app.schemas import (
     RecurringCommitmentRead,
     SpendingBreakdownResponse,
 )
-from app.services.burn_service import (
-    annual_to_weekly,
-    calculate_category_average_burn,
-    calculate_weekly_burn_summary,
-    list_recurring_commitment_details,
-    monthly_to_weekly,
-    sync_budgets_from_average_burn,
-    weekly_to_monthly,
-)
 from app.services.spending_projection import (
+    MIN_SIGNIFICANT_WEEKLY_BURN_NZD,
     InvalidWindowError,
     ReportingWindow,
+    annual_to_weekly,
+    monthly_to_weekly,
+    project_burn,
     project_window,
+    weekly_to_monthly,
 )
 
 router = APIRouter(prefix="/budgets", tags=["Budgets & Spending Awareness"])
@@ -178,33 +174,45 @@ def get_average_burn_report(
     db: Session = Depends(get_db),
 ):
     """Compute average weekly burn across categories from trailing variable spend and recurring items."""
-    today = date.today()
-    summary = calculate_weekly_burn_summary(db, today, lookback_weeks=lookback_weeks)
-    estimates = calculate_category_average_burn(db, today, lookback_weeks=lookback_weeks)
-    commitments = list_recurring_commitment_details(db, today)
+    burn = project_burn(db, lookback_weeks=lookback_weeks, reference_date=date.today())
     return AverageBurnReportResponse(
-        lookback_weeks=lookback_weeks,
-        as_of_date=today,
-        variable_weekly_burn=summary.variable_weekly_burn,
-        recurring_weekly_burn=summary.recurring_weekly_burn,
-        effective_weekly_burn=summary.effective_weekly_burn,
-        categories=[
-            CategoryBurnEstimateRead(
-                category=item.category,
-                parent_category=item.parent_category,
-                variable_weekly_burn=item.variable_weekly_burn,
-                recurring_weekly_burn=item.recurring_weekly_burn,
-                average_weekly_burn=item.average_weekly_burn,
-                suggested_monthly_limit=item.suggested_monthly_limit,
-                suggested_annual_limit=item.suggested_annual_limit,
-                budget_period=item.budget_period,
-                variable_percentage=item.variable_percentage,
-                total_percentage=item.total_percentage,
-            )
-            for item in estimates
-        ],
-        recurring_commitments=[RecurringCommitmentRead(**vars(c)) for c in commitments],
+        lookback_weeks=burn.lookback_weeks,
+        as_of_date=burn.as_of_date,
+        variable_weekly_burn=burn.variable_weekly_burn,
+        recurring_weekly_burn=burn.recurring_weekly_burn,
+        effective_weekly_burn=burn.effective_weekly_burn,
+        categories=[CategoryBurnEstimateRead(**vars(item)) for item in burn.categories],
+        recurring_commitments=[RecurringCommitmentRead(**vars(c)) for c in burn.recurring_commitments],
     )
+
+
+def _upsert_budget_rules_from_burn(db: Session, lookback_weeks: int) -> list[BudgetRule]:
+    """Upsert active category BudgetRules directly from projected average weekly burn."""
+    burn = project_burn(db, lookback_weeks=lookback_weeks, reference_date=date.today())
+    existing_rules = {
+        rule.category.lower(): rule
+        for rule in db.scalars(select(BudgetRule)).all()
+    }
+    for est in burn.categories:
+        if est.average_weekly_burn < MIN_SIGNIFICANT_WEEKLY_BURN_NZD:
+            continue
+        existing = existing_rules.get(est.category.lower())
+        if existing:
+            existing.weekly_limit = est.average_weekly_burn
+            existing.monthly_limit = est.suggested_monthly_limit
+            existing.is_active = True
+        else:
+            db.add(
+                BudgetRule(
+                    category=est.category,
+                    weekly_limit=est.average_weekly_burn,
+                    monthly_limit=est.suggested_monthly_limit,
+                    budget_period=est.budget_period or "monthly",
+                    is_active=True,
+                )
+            )
+    db.commit()
+    return list(db.scalars(select(BudgetRule).order_by(BudgetRule.category)).all())
 
 
 @router.post("/sync-from-burn", response_model=list[BudgetRuleRead])
@@ -213,7 +221,7 @@ def sync_budgets_from_burn(
     db: Session = Depends(get_db),
 ):
     """Auto-calculate and upsert weekly/monthly BudgetRules from actual average weekly burn."""
-    return sync_budgets_from_average_burn(db, date.today(), lookback_weeks=lookback_weeks)
+    return _upsert_budget_rules_from_burn(db, lookback_weeks)
 
 
 @router.get("/breakdown", response_model=SpendingBreakdownResponse)

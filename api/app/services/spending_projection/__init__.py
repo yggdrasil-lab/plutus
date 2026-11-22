@@ -8,6 +8,8 @@ from app.services.spending_projection._lines import (
 from app.services.spending_projection._types import (
     BUDGET_CADENCE_PERIODS,
     DAYS_PER_YEAR,
+    DEFAULT_WEEKLY_BURN_NZD,
+    MIN_SIGNIFICANT_WEEKLY_BURN_NZD,
     MONTHLY_CADENCE_PERIODS,
     MONTHS_PER_YEAR,
     RECURRENCE_LOOKBACK_DAYS,
@@ -16,7 +18,9 @@ from app.services.spending_projection._types import (
     VALID_PERIODS,
     WEEKLY_CADENCE_PERIODS,
     WEEKS_PER_YEAR,
+    BurnProjection,
     CashflowProjectionResult,
+    CategoryBurnEstimate,
     CategoryProjection,
     ExpenseLine,
     FlowLiteral,
@@ -27,12 +31,14 @@ from app.services.spending_projection._types import (
     ProjectedSplit,
     ProjectedTransaction,
     RecurringCommitmentAllocation,
+    RecurringCommitmentDetail,
     ReportingWindow,
     ResolvedWindow,
     TagCategoryProjection,
     TagProjection,
     TransactionProjection,
     TransactionQuery,
+    WeeklyCategoryBurn,
     WindowProjection,
 )
 from app.services.spending_projection._window import (
@@ -45,6 +51,7 @@ from app.services.spending_projection._window import (
     weekly_to_annual,
     weekly_to_monthly,
 )
+from app.services.spending_projection.burn import project_burn
 from app.services.spending_projection.transactions import (
     project_cashflow_transactions,
     project_transactions,
@@ -53,13 +60,17 @@ from app.services.spending_projection.window import project_window
 
 __all__ = [
     "BUDGET_CADENCE_PERIODS",
+    "BurnProjection",
     "CashflowProjectionResult",
+    "CategoryBurnEstimate",
     "CategoryProjection",
     "DAYS_PER_YEAR",
+    "DEFAULT_WEEKLY_BURN_NZD",
     "ExpenseLine",
     "FlowLiteral",
     "GroupByLiteral",
     "InvalidWindowError",
+    "MIN_SIGNIFICANT_WEEKLY_BURN_NZD",
     "MONTHLY_CADENCE_PERIODS",
     "MONTHS_PER_YEAR",
     "PeriodLiteral",
@@ -69,6 +80,7 @@ __all__ = [
     "RECURRENCE_LOOKBACK_DAYS",
     "RECURRENCE_WEEKLY_FACTOR",
     "RecurringCommitmentAllocation",
+    "RecurringCommitmentDetail",
     "ReportingWindow",
     "ResolvedWindow",
     "TRANSFER_CATEGORIES",
@@ -79,6 +91,7 @@ __all__ = [
     "VALID_PERIODS",
     "WEEKLY_CADENCE_PERIODS",
     "WEEKS_PER_YEAR",
+    "WeeklyCategoryBurn",
     "WindowProjection",
     "annual_to_weekly",
     "expand_expense_buckets",
@@ -87,6 +100,7 @@ __all__ = [
     "get_period_amortized_recurrences",
     "is_recurrence_excluded_from_period",
     "monthly_to_weekly",
+    "project_burn",
     "project_cashflow_transactions",
     "project_transactions",
     "project_window",

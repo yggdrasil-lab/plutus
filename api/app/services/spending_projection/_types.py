@@ -28,6 +28,8 @@ TRANSFER_CATEGORIES: tuple[str, ...] = ("transfers", "transfer")
 WEEKS_PER_YEAR = 52.0
 MONTHS_PER_YEAR = 12.0
 DAYS_PER_YEAR = 365
+DEFAULT_WEEKLY_BURN_NZD = 1000.0
+MIN_SIGNIFICANT_WEEKLY_BURN_NZD = 1.0
 
 RECURRENCE_WEEKLY_FACTOR: dict[str, float] = {
     "weekly": 1.0,
@@ -245,6 +247,66 @@ class TransactionProjection:
 
 ProjectedCashflowItem = ProjectedTransaction
 CashflowProjectionResult = TransactionProjection
+
+
+@dataclass(frozen=True)
+class CategoryBurnEstimate:
+    """Average weekly burn breakdown and budget limit suggestions for one category."""
+
+    category: str
+    parent_category: str | None
+    variable_weekly_burn: float
+    recurring_weekly_burn: float
+    average_weekly_burn: float
+    suggested_monthly_limit: float
+    suggested_annual_limit: float = 0.0
+    budget_period: str = "monthly"
+    variable_percentage: float = 0.0
+    total_percentage: float = 0.0
+
+
+@dataclass(frozen=True)
+class RecurringCommitmentDetail:
+    """Itemized active recurring commitment allocation normalized to weekly and monthly NZD."""
+
+    transaction_id: int
+    merchant: str
+    category: str
+    recurrence: str
+    last_charged_date: date
+    original_amount: float
+    currency: str
+    amount_nzd: float
+    weekly_nzd: float
+    monthly_nzd: float
+    percentage_of_recurring: float
+
+
+@dataclass(frozen=True)
+class WeeklyCategoryBurn:
+    """Current-week projected NZD spend for one category, reconciled with this_week_spend."""
+
+    category: str
+    spend_nzd: float
+
+
+@dataclass(frozen=True)
+class BurnProjection:
+    """Immutable trailing weekly burn, category estimate, commitment, and current-week snapshot."""
+
+    as_of_date: date
+    lookback_weeks: int
+    start_of_week: date
+    variable_weekly_burn: float
+    recurring_weekly_burn: float
+    observed_weekly_burn: float
+    effective_weekly_burn: float
+    weekly_budget_target: float
+    this_week_variable_spend: float
+    this_week_spend: float
+    this_week_categories: tuple[WeeklyCategoryBurn, ...]
+    categories: tuple[CategoryBurnEstimate, ...]
+    recurring_commitments: tuple[RecurringCommitmentDetail, ...]
 
 
 @dataclass(frozen=True)

@@ -16,9 +16,7 @@ from app.schemas import (
     RunwayTierBreakdown,
 )
 from app.services.burn_service import (
-    calculate_weekly_burn_summary,
     get_active_categories,
-    get_effective_weekly_burn,
     get_latest_account_balances,
     resolve_tier_labels,
 )
@@ -30,10 +28,48 @@ from app.services.runway import (
     calculate_time_banked,
     calculate_weekly_growth_rate,
 )
+from app.services.spending_projection import BurnProjection, project_burn
 
 router = APIRouter(prefix="/runway", tags=["Runway & Freedom Clock"])
 
 BASELINE_ANNUAL_RETURN = 0.05
+
+
+def _build_runway_breakdown(
+    db: Session,
+    *,
+    today: date,
+    balances: dict[str, float],
+    burn: BurnProjection,
+    expected_return: float,
+) -> tuple[RunwayTierBreakdown, float, float, bool]:
+    """Compute runway horizons, net worth, and tier breakdown from balances, burn, and loans."""
+    weekly_burn = burn.effective_weekly_burn
+    cash_bal, growth_bal, locked_bal = balances["cash"], balances["growth"], balances["locked"]
+    total_liquid = cash_bal + growth_bal
+
+    emergency_weeks = calculate_emergency_runway(cash_bal, weekly_burn)
+    growth_weeks, is_perpetual = calculate_compounding_runway(
+        accessible_assets=total_liquid, weekly_burn=weekly_burn, annual_real_return=expected_return
+    )
+    perpetual_income = round(total_liquid * calculate_weekly_growth_rate(expected_return), 2)
+    primary_weeks = 9999.0 if is_perpetual else (growth_weeks or emergency_weeks)
+    primary_years = round(primary_weeks / 52.0, 2) if not is_perpetual else 999.0
+    locked_weeks = round(locked_bal / weekly_burn, 1) if weekly_burn > 0 else 0.0
+
+    loans = load_loans_with_transactions(db, active_only=True)
+    total_liabilities = float(summarize_loans(loans, today)["total_liabilities"])
+    net_worth = round(total_liquid + locked_bal - total_liabilities, 2)
+    breakdown = RunwayTierBreakdown(
+        cash_balance=cash_bal, growth_balance=growth_bal, locked_balance=locked_bal,
+        total_liquid_balance=total_liquid, total_liabilities=total_liabilities, net_worth=net_worth,
+        emergency_weeks=emergency_weeks, growth_weeks=growth_weeks, locked_weeks=locked_weeks,
+        is_perpetual=is_perpetual, perpetual_threshold_weekly_income=perpetual_income,
+        weekly_burn_rate=weekly_burn, variable_weekly_burn=burn.variable_weekly_burn,
+        recurring_weekly_burn=burn.recurring_weekly_burn,
+        this_week_variable_spend=burn.this_week_variable_spend, tier_labels=resolve_tier_labels(db),
+    )
+    return breakdown, primary_weeks, primary_years, is_perpetual
 
 
 @router.get("", response_model=RunwayResponse)
@@ -51,65 +87,18 @@ def get_current_runway(
     today = as_of or date.today()
     expected_return = annual_return if annual_return is not None else BASELINE_ANNUAL_RETURN
     balances = get_latest_account_balances(db)
-    burn_summary = calculate_weekly_burn_summary(db, today)
-
-    weekly_burn = burn_summary.effective_weekly_burn
-    this_week_spend = burn_summary.this_week_spend
-    target_budget = burn_summary.weekly_budget_target
-
-    cash_bal = balances["cash"]
-    growth_bal = balances["growth"]
-    locked_bal = balances["locked"]
-    total_liquid = cash_bal + growth_bal
-
-    emergency_weeks = calculate_emergency_runway(cash_bal, weekly_burn)
-    growth_weeks, is_perpetual = calculate_compounding_runway(
-        accessible_assets=total_liquid,
-        weekly_burn=weekly_burn,
-        annual_real_return=expected_return,
+    burn = project_burn(db, reference_date=today)
+    breakdown, primary_weeks, primary_years, is_perpetual = _build_runway_breakdown(
+        db, today=today, balances=balances, burn=burn, expected_return=expected_return
     )
-
-    weekly_g = calculate_weekly_growth_rate(expected_return)
-    perpetual_threshold_income = round(total_liquid * weekly_g, 2)
-
-    primary_weeks = 9999.0 if is_perpetual else (growth_weeks or emergency_weeks)
-    primary_years = round(primary_weeks / 52.0, 2) if not is_perpetual else 999.0
-
-    time_banked = calculate_time_banked(target_budget, this_week_spend)
-    locked_weeks = round(locked_bal / weekly_burn, 1) if weekly_burn > 0 else 0.0
-
-    loans = load_loans_with_transactions(db, active_only=True)
-    loan_summary = summarize_loans(loans, today)
-    total_liabilities = float(loan_summary["total_liabilities"])
-    net_worth = round(total_liquid + locked_bal - total_liabilities, 2)
-
-    breakdown = RunwayTierBreakdown(
-        cash_balance=cash_bal,
-        growth_balance=growth_bal,
-        locked_balance=locked_bal,
-        total_liquid_balance=total_liquid,
-        total_liabilities=total_liabilities,
-        net_worth=net_worth,
-        emergency_weeks=emergency_weeks,
-        growth_weeks=growth_weeks,
-        locked_weeks=locked_weeks,
-        is_perpetual=is_perpetual,
-        perpetual_threshold_weekly_income=perpetual_threshold_income,
-        weekly_burn_rate=weekly_burn,
-        variable_weekly_burn=burn_summary.variable_weekly_burn,
-        recurring_weekly_burn=burn_summary.recurring_weekly_burn,
-        this_week_variable_spend=burn_summary.this_week_variable_spend,
-        tier_labels=resolve_tier_labels(db),
-    )
-
     return RunwayResponse(
         as_of_date=today,
         primary_runway_weeks=primary_weeks,
         primary_runway_years=primary_years,
         is_perpetual=is_perpetual,
-        time_banked_this_week=time_banked,
-        weekly_spend_this_week=this_week_spend,
-        weekly_budget_target=target_budget,
+        time_banked_this_week=calculate_time_banked(burn.weekly_budget_target, burn.this_week_spend),
+        weekly_spend_this_week=burn.this_week_spend,
+        weekly_budget_target=burn.weekly_budget_target,
         breakdown=breakdown,
         categories=get_active_categories(db),
     )
@@ -123,7 +112,7 @@ def simulate_runway_scenario(
     """Simulate what-if changes to weekly burn rate, expected growth, or lump sum capital."""
     today = date.today()
     balances = get_latest_account_balances(db)
-    weekly_burn, _, _ = get_effective_weekly_burn(db, today)
+    weekly_burn = project_burn(db, reference_date=today).effective_weekly_burn
 
     baseline_liquid = balances["cash"] + balances["growth"]
     locked_bal = balances["locked"]
@@ -182,7 +171,7 @@ def trigger_runway_synthesis(
     """Force on-demand research-grounded AI synthesis of financial freedom scenario and recommendations."""
     today = date.today()
     balances = get_latest_account_balances(db)
-    weekly_burn, _, _ = get_effective_weekly_burn(db, today)
+    weekly_burn = project_burn(db, reference_date=today).effective_weekly_burn
 
     cash_bal = balances["cash"]
     growth_bal = balances["growth"]
