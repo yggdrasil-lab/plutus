@@ -331,6 +331,13 @@ class Receipt(Base):
         nullable=True,
         index=True,
     )
+    document_type: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="receipt",
+        server_default="receipt",
+        index=True,
+    )
     receipt_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
     merchant: Mapped[str] = mapped_column(String(150), nullable=False, index=True)
     total_amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)

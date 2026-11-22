@@ -7,6 +7,7 @@ from html.parser import HTMLParser
 import io
 import json
 import logging
+import math
 import mimetypes
 import re
 from typing import Any, Optional
@@ -45,6 +46,7 @@ from app.services.rules_engine import (
 logger = logging.getLogger(__name__)
 
 MIN_RECEIPT_ATTACHMENT_BYTES = 15 * 1024
+MIN_PAYSLIP_PDF_BYTES = 512
 _TRACKING_URL_RE = re.compile(r"https?://\S{40,}", re.IGNORECASE)
 _INVISIBLE_FORMAT_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff\u00ad\u034f]")
 _ORIG_FX_DESC_RE = re.compile(
@@ -179,6 +181,28 @@ Respond STRICTLY with valid JSON following this exact schema:
     }}
   ]
 }}"""
+
+PAYSLIP_PARSING_PROMPT = """You are a specialized payroll and payslip extraction engine.
+Extract structured header details from this payslip document or payroll notification.
+
+Rules:
+1. Extract "Net Pay" or "Total Banked" (the actual take-home cash deposited to the employee's bank account) as `net_pay`. NEVER use Gross Earnings, Taxable Earnings, Year-To-Date (YTD) totals, or Annual Salary for `net_pay`.
+2. Prefer `Pay Date` / `Date Paid` / `Payment Date` for `pay_date` (YYYY-MM-DD) over `Pay Period End` whenever a payment date is present.
+3. Extract PAYE / income tax deducted for this pay run into `tax_amount` (or null if not shown).
+4. Return a 3-letter ISO currency code for `currency` (e.g. NZD, AUD, USD, SGD, EUR, GBP). Default `currency` to "NZD" when New Zealand payroll markers (such as KiwiSaver, PAYE, IRD, or NZ bank accounts) appear without an explicit ISO currency code.
+5. Extract `pay_period_start` (YYYY-MM-DD or null), `pay_period_end` (YYYY-MM-DD or null), and a concise `pay_period_label` (e.g. "2026-11-01 to 2026-11-30" or "Nov 2026", or null).
+
+Respond STRICTLY with valid JSON following this exact schema:
+{
+  "employer": "Employer Name",
+  "pay_date": "YYYY-MM-DD",
+  "pay_period_start": "YYYY-MM-DD or null",
+  "pay_period_end": "YYYY-MM-DD or null",
+  "currency": "NZD",
+  "net_pay": 0.00,
+  "tax_amount": 0.00,
+  "pay_period_label": "Period label or null"
+}"""
 
 
 def classify_line_item(item_name: str) -> tuple[str, Optional[str], Optional[str], Optional[str]]:
@@ -761,6 +785,31 @@ def parse_receipt_orders_text_with_llm(
     )
 
 
+def _invoke_vision_prompt(
+    content: bytes,
+    mime_type: str,
+    prompt: str,
+) -> Optional[dict[str, Any]]:
+    """Prepare image/PDF bytes as a multimodal data URI and invoke the vision LLM."""
+    llm_bytes, llm_mime = prepare_image_for_llm(content, mime_type)
+    b64_data = base64.b64encode(llm_bytes).decode("ascii")
+    data_uri = f"data:{llm_mime};base64,{b64_data}"
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": data_uri}},
+            ],
+        }
+    ]
+    return _invoke_receipt_llm(
+        messages,
+        model=settings.resolved_receipt_llm_model,
+        timeout=105,
+    )
+
+
 def parse_receipt_with_llm(
     content: bytes,
     filename: Optional[str],
@@ -768,23 +817,7 @@ def parse_receipt_with_llm(
 ) -> Optional[dict[str, Any]]:
     """Extract structured receipt fields from an image, PDF, or text document."""
     if mime_type.startswith("image/"):
-        llm_bytes, llm_mime = prepare_image_for_llm(content, mime_type)
-        b64_data = base64.b64encode(llm_bytes).decode("ascii")
-        data_uri = f"data:{llm_mime};base64,{b64_data}"
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": RECEIPT_PARSING_PROMPT},
-                    {"type": "image_url", "image_url": {"url": data_uri}},
-                ],
-            }
-        ]
-        return _invoke_receipt_llm(
-            messages,
-            model=settings.resolved_receipt_llm_model,
-            timeout=105,
-        )
+        return _invoke_vision_prompt(content, mime_type, RECEIPT_PARSING_PROMPT)
 
     if mime_type == "application/pdf" or (filename and filename.lower().endswith(".pdf")):
         pdf_text = extract_pdf_text(content)
@@ -799,6 +832,57 @@ def parse_receipt_with_llm(
     if not raw_text.strip():
         return None
     return parse_receipt_text_with_llm(raw_text)
+
+
+def parse_payslip_text_with_llm(
+    raw_text: str,
+    *,
+    raise_on_error: bool = True,
+) -> Optional[dict[str, Any]]:
+    """Invoke text LLM to extract structured payslip header fields from raw text."""
+    messages = [
+        {
+            "role": "user",
+            "content": f"{PAYSLIP_PARSING_PROMPT}\n\nPayslip content:\n{raw_text}",
+        }
+    ]
+    text_model = settings.resolved_llm_model or settings.resolved_receipt_llm_model
+    return _invoke_receipt_llm(
+        messages,
+        model=text_model,
+        timeout=60,
+        response_format_json=True,
+        raise_on_error=raise_on_error,
+    )
+
+
+def parse_payslip_with_llm(
+    content: bytes,
+    filename: Optional[str],
+    mime_type: str,
+) -> Optional[dict[str, Any]]:
+    """Extract structured payslip fields from an image, PDF, or text document."""
+    if mime_type.startswith("image/"):
+        return _invoke_vision_prompt(content, mime_type, PAYSLIP_PARSING_PROMPT)
+
+    is_pdf = mime_type == "application/pdf" or (
+        filename is not None and filename.lower().endswith(".pdf")
+    )
+    if is_pdf:
+        pdf_text = extract_pdf_text(content)
+        if pdf_text:
+            parsed = parse_payslip_text_with_llm(pdf_text, raise_on_error=False)
+            if parsed:
+                return parsed
+        return _invoke_vision_prompt(content, "application/pdf", PAYSLIP_PARSING_PROMPT)
+
+    try:
+        raw_text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if not raw_text.strip():
+        return None
+    return parse_payslip_text_with_llm(raw_text, raise_on_error=False)
 
 
 class _ReceiptHTMLSanitizer(HTMLParser):
@@ -1268,139 +1352,120 @@ def _resolve_tx_to_receipt_fx_rate(
     return None
 
 
+def _resolve_candidate_window(receipt: Receipt, is_payslip: bool) -> tuple[date, date]:
+    """Return inclusive transaction search bounds for a receipt or payslip."""
+    r_date = receipt.receipt_date
+    if is_payslip:
+        return r_date - timedelta(days=7), r_date + timedelta(days=14)
+    if receipt.order_number or receipt.source_email_message_id:
+        return r_date - timedelta(days=3), r_date + timedelta(days=21)
+    return r_date - timedelta(days=1), r_date + timedelta(days=7)
+
+
+def _score_fx_estimated_candidate(
+    db: Session,
+    tx: Transaction,
+    *,
+    tx_amt: float,
+    target_amt: float,
+    rec_curr: str,
+    has_overlap: bool,
+    sim_score: float,
+    date_diff: int,
+    orig_amt: Optional[float],
+    orig_curr: Optional[str],
+) -> Optional[_ScoredCandidate]:
+    """Score cross-currency transaction candidate using cached/daily FX conversion."""
+    rate = _resolve_tx_to_receipt_fx_rate(db, tx, rec_curr)
+    if rate is None or rate <= 0 or target_amt <= 0:
+        return None
+    est_amt = round(tx_amt * rate, 2)
+    rel_err = abs(est_amt - target_amt) / target_amt
+    if rel_err > 0.05:
+        return None
+    base_conf = 0.85 if has_overlap else 0.68
+    conf = round(max(0.40, min(0.89, base_conf - rel_err * 3.0 - 0.005 * min(date_diff, 14))), 2)
+    return _ScoredCandidate(
+        tx=tx, tier_rank=1, match_reason="fx_estimated", confidence=conf,
+        has_merchant_overlap=has_overlap, sim_score=sim_score, date_diff=date_diff,
+        amt_diff=abs(est_amt - target_amt), original_amount=orig_amt,
+        original_currency=orig_curr, estimated_receipt_amount=est_amt,
+    )
+
+
+def _score_candidate_transaction(
+    db: Session,
+    tx: Transaction,
+    *,
+    target_amt: float,
+    r_date: date,
+    rec_curr: str,
+    receipt_merchant: str,
+) -> Optional[_ScoredCandidate]:
+    """Score one candidate transaction against a receipt or payslip across currency tiers."""
+    tx_curr = (tx.currency or "NZD").strip().upper()
+    tx_amt = abs(float(tx.amount))
+    date_diff = abs((tx.transaction_date - r_date).days)
+    has_overlap, sim_score = _merchant_similarity(receipt_merchant, tx.merchant, tx.raw_description)
+    orig_amt, orig_curr = parse_original_fx_from_description(tx.raw_description) or (None, None)
+    if tx_curr == rec_curr and abs(tx_amt - target_amt) <= 0.05:
+        amt_diff = abs(tx_amt - target_amt)
+        conf = round(max(0.50, min(0.99, (0.96 if has_overlap else 0.78) - 0.01 * min(date_diff, 14) - 0.5 * amt_diff)), 2)
+        return _ScoredCandidate(
+            tx=tx, tier_rank=3, match_reason="exact_same_currency", confidence=conf,
+            has_merchant_overlap=has_overlap, sim_score=sim_score, date_diff=date_diff,
+            amt_diff=amt_diff, original_amount=orig_amt, original_currency=orig_curr,
+            estimated_receipt_amount=round(tx_amt, 2),
+        )
+    if orig_curr == rec_curr and orig_amt is not None and abs(orig_amt - target_amt) <= 0.05:
+        amt_diff = abs(orig_amt - target_amt)
+        conf = round(max(0.45, min(0.98, (0.93 if has_overlap else 0.65) - 0.008 * min(date_diff, 14) - 0.5 * amt_diff)), 2)
+        return _ScoredCandidate(
+            tx=tx, tier_rank=2, match_reason="original_fx_description", confidence=conf,
+            has_merchant_overlap=has_overlap, sim_score=sim_score, date_diff=date_diff,
+            amt_diff=amt_diff, original_amount=orig_amt, original_currency=orig_curr,
+            estimated_receipt_amount=round(orig_amt, 2),
+        )
+    if tx_curr == rec_curr:
+        return None
+    return _score_fx_estimated_candidate(
+        db, tx, tx_amt=tx_amt, target_amt=target_amt, rec_curr=rec_curr,
+        has_overlap=has_overlap, sim_score=sim_score, date_diff=date_diff,
+        orig_amt=orig_amt, orig_curr=orig_curr,
+    )
+
+
 def _evaluate_receipt_candidates(
     db: Session,
     receipt: Receipt,
 ) -> list[_ScoredCandidate]:
-    """Score unlinked expense transactions within the receipt date window."""
+    """Score unlinked transactions matching the receipt/payslip sign within its date window."""
     target_amt = float(receipt.total_amount)
     r_date = receipt.receipt_date
     rec_curr = (receipt.currency or "NZD").strip().upper()
-
-    if receipt.order_number or receipt.source_email_message_id:
-        date_min = r_date - timedelta(days=3)
-        date_max = r_date + timedelta(days=21)
-    else:
-        date_min = r_date - timedelta(days=1)
-        date_max = r_date + timedelta(days=7)
+    is_payslip = getattr(receipt, "document_type", "receipt") == "payslip"
+    date_min, date_max = _resolve_candidate_window(receipt, is_payslip)
+    sign_filter = Transaction.amount > 0 if is_payslip else Transaction.amount < 0
 
     linked_tx_subq = select(Receipt.transaction_id).where(
-        Receipt.transaction_id.isnot(None),
-        Receipt.id != receipt.id,
+        Receipt.transaction_id.isnot(None), Receipt.id != receipt.id
     )
     stmt = (
         select(Transaction)
         .options(joinedload(Transaction.account))
-        .where(Transaction.amount < 0)
-        .where(Transaction.transaction_date >= date_min)
-        .where(Transaction.transaction_date <= date_max)
-        .where(~Transaction.id.in_(linked_tx_subq))
+        .where(sign_filter, Transaction.transaction_date >= date_min)
+        .where(Transaction.transaction_date <= date_max, ~Transaction.id.in_(linked_tx_subq))
     )
-    txs = db.scalars(stmt).all()
-
-    candidates: list[_ScoredCandidate] = []
-    for tx in txs:
-        tx_curr = (tx.currency or "NZD").strip().upper()
-        tx_amt = abs(float(tx.amount))
-        date_diff = abs((tx.transaction_date - r_date).days)
-        has_overlap, sim_score = _merchant_similarity(
-            receipt.merchant,
-            tx.merchant,
-            tx.raw_description,
-        )
-        orig_fx = parse_original_fx_from_description(tx.raw_description)
-        orig_amt, orig_curr = orig_fx if orig_fx else (None, None)
-
-        if tx_curr == rec_curr and abs(tx_amt - target_amt) <= 0.05:
-            amt_diff = abs(tx_amt - target_amt)
-            base_conf = 0.96 if has_overlap else 0.78
-            conf = round(
-                max(0.50, min(0.99, base_conf - 0.01 * min(date_diff, 14) - 0.5 * amt_diff)),
-                2,
-            )
-            candidates.append(
-                _ScoredCandidate(
-                    tx=tx,
-                    tier_rank=3,
-                    match_reason="exact_same_currency",
-                    confidence=conf,
-                    has_merchant_overlap=has_overlap,
-                    sim_score=sim_score,
-                    date_diff=date_diff,
-                    amt_diff=amt_diff,
-                    original_amount=orig_amt,
-                    original_currency=orig_curr,
-                    estimated_receipt_amount=round(tx_amt, 2),
-                )
-            )
-            continue
-
-        if (
-            orig_curr == rec_curr
-            and orig_amt is not None
-            and abs(orig_amt - target_amt) <= 0.05
-        ):
-            amt_diff = abs(orig_amt - target_amt)
-            base_conf = 0.93 if has_overlap else 0.65
-            conf = round(
-                max(0.45, min(0.98, base_conf - 0.008 * min(date_diff, 14) - 0.5 * amt_diff)),
-                2,
-            )
-            candidates.append(
-                _ScoredCandidate(
-                    tx=tx,
-                    tier_rank=2,
-                    match_reason="original_fx_description",
-                    confidence=conf,
-                    has_merchant_overlap=has_overlap,
-                    sim_score=sim_score,
-                    date_diff=date_diff,
-                    amt_diff=amt_diff,
-                    original_amount=orig_amt,
-                    original_currency=orig_curr,
-                    estimated_receipt_amount=round(orig_amt, 2),
-                )
-            )
-            continue
-
-        if tx_curr != rec_curr and target_amt > 0:
-            rate = _resolve_tx_to_receipt_fx_rate(db, tx, rec_curr)
-            if rate is not None and rate > 0:
-                est_amt = round(tx_amt * rate, 2)
-                rel_err = abs(est_amt - target_amt) / target_amt
-                if rel_err <= 0.05:
-                    base_conf = 0.85 if has_overlap else 0.68
-                    conf = round(
-                        max(
-                            0.40,
-                            min(0.89, base_conf - rel_err * 3.0 - 0.005 * min(date_diff, 14)),
-                        ),
-                        2,
-                    )
-                    candidates.append(
-                        _ScoredCandidate(
-                            tx=tx,
-                            tier_rank=1,
-                            match_reason="fx_estimated",
-                            confidence=conf,
-                            has_merchant_overlap=has_overlap,
-                            sim_score=sim_score,
-                            date_diff=date_diff,
-                            amt_diff=abs(est_amt - target_amt),
-                            original_amount=orig_amt,
-                            original_currency=orig_curr,
-                            estimated_receipt_amount=est_amt,
-                        )
-                    )
-
+    candidates = [
+        scored
+        for tx in db.scalars(stmt).all()
+        if (scored := _score_candidate_transaction(
+            db, tx, target_amt=target_amt, r_date=r_date,
+            rec_curr=rec_curr, receipt_merchant=receipt.merchant,
+        )) is not None
+    ]
     candidates.sort(
-        key=lambda c: (
-            c.tier_rank,
-            1 if c.has_merchant_overlap else 0,
-            c.confidence,
-            -c.date_diff,
-            -c.amt_diff,
-        ),
+        key=lambda c: (c.tier_rank, 1 if c.has_merchant_overlap else 0, c.confidence, -c.date_diff, -c.amt_diff),
         reverse=True,
     )
     return candidates
@@ -1529,6 +1594,35 @@ def _normalize_parsed_orders(parsed: Optional[dict[str, Any]]) -> list[dict[str,
     return valid
 
 
+def _find_duplicate_by_order_number(
+    db: Session,
+    *,
+    order_number: str,
+    curr_upper: str,
+    total_amount: float,
+    document_type: str,
+    target_key: str,
+) -> Optional[Receipt]:
+    """Match an existing Receipt of the same document_type by order_number/pay-period ref."""
+    by_order = db.scalars(
+        select(Receipt).where(
+            Receipt.document_type == document_type,
+            func.lower(Receipt.order_number) == order_number.lower(),
+            func.upper(Receipt.currency) == curr_upper,
+        )
+    ).all()
+    for existing in by_order:
+        same_amt = abs(float(existing.total_amount) - total_amount) <= 0.05
+        same_payslip_merchant = (
+            document_type != "payslip"
+            or not target_key
+            or _normalize_merchant_key(existing.merchant) == target_key
+        )
+        if same_amt and same_payslip_merchant:
+            return existing
+    return None
+
+
 def _find_semantic_duplicate_receipt(
     db: Session,
     *,
@@ -1537,27 +1631,25 @@ def _find_semantic_duplicate_receipt(
     total_amount: float,
     currency: str,
     order_number: Optional[str],
+    document_type: str = "receipt",
 ) -> Optional[Receipt]:
     """Return an existing Receipt matching order_number or (merchant, date +/- 1d, total, currency)."""
-    if order_number:
-        by_order = db.scalars(
-            select(Receipt).where(
-                func.lower(Receipt.order_number) == order_number.lower(),
-                func.upper(Receipt.currency) == currency.upper(),
-            )
-        ).all()
-        for existing in by_order:
-            if abs(float(existing.total_amount) - total_amount) <= 0.05:
-                return existing
-
     target_key = _normalize_merchant_key(merchant)
-    window_start = receipt_date - timedelta(days=1)
-    window_end = receipt_date + timedelta(days=1)
+    curr_upper = currency.upper()
+    if order_number:
+        matched = _find_duplicate_by_order_number(
+            db, order_number=order_number, curr_upper=curr_upper,
+            total_amount=total_amount, document_type=document_type, target_key=target_key,
+        )
+        if matched is not None:
+            return matched
+
     nearby = db.scalars(
         select(Receipt).where(
-            Receipt.receipt_date >= window_start,
-            Receipt.receipt_date <= window_end,
-            func.upper(Receipt.currency) == currency.upper(),
+            Receipt.document_type == document_type,
+            Receipt.receipt_date >= receipt_date - timedelta(days=1),
+            Receipt.receipt_date <= receipt_date + timedelta(days=1),
+            func.upper(Receipt.currency) == curr_upper,
         )
     ).all()
     for existing in nearby:
@@ -1794,6 +1886,270 @@ def ingest_purchase_receipt_email(
         )
         for order in orders
     ]
+
+
+@dataclass(frozen=True)
+class _NormalizedPayslip:
+    """Validated structured payslip fields ready for Receipt persistence."""
+
+    employer: str
+    pay_date: date
+    net_pay: float
+    currency: str
+    tax_amount: Optional[float]
+    pay_period_ref: Optional[str]
+    notes: Optional[str]
+
+
+@dataclass(frozen=True)
+class _PayslipAttachmentOutcome:
+    """Outcome of attachment-first payslip extraction including fallback media."""
+
+    payslip: Optional[_NormalizedPayslip]
+    stored_media: Optional[_StoredReceiptMedia]
+    fallback_attachment: Optional[_StoredReceiptMedia]
+    raw_text: Optional[str]
+
+
+def _clean_payslip_text(value: Any) -> Optional[str]:
+    """Return stripped text or None for empty/sentinel LLM string values."""
+    if value is None:
+        return None
+    cleaned = str(value).strip()
+    if not cleaned or cleaned.lower() in ("null", "none", "n/a"):
+        return None
+    return cleaned
+
+
+def _derive_payslip_period_fields(
+    parsed: dict[str, Any],
+) -> tuple[Optional[str], Optional[str]]:
+    """Build canonical pay_period_ref (order_number) and human summary notes."""
+    start_str = _clean_payslip_text(parsed.get("pay_period_start"))
+    end_str = _clean_payslip_text(parsed.get("pay_period_end"))
+    label = _clean_payslip_text(parsed.get("pay_period_label"))
+
+    range_str = f"{start_str} to {end_str}" if (start_str and end_str) else (end_str or start_str)
+    pay_period_ref = normalize_order_number(range_str or label)
+
+    if label and range_str and label.lower() != range_str.lower():
+        notes = f"Pay period: {label} ({range_str})"
+    elif label or range_str:
+        notes = f"Pay period: {label or range_str}"
+    else:
+        notes = None
+    return pay_period_ref, notes
+
+
+def _normalize_parsed_payslip(
+    parsed: Any,
+    *,
+    fallback_date: date,
+    fallback_currency: str = "NZD",
+) -> Optional[_NormalizedPayslip]:
+    """Validate employer non-empty and net_pay > 0, returning immutable payslip fields."""
+    if not isinstance(parsed, dict):
+        return None
+    employer = str(parsed.get("employer") or "").strip()[:150]
+    if not employer:
+        return None
+
+    try:
+        net_pay = round(float(parsed.get("net_pay")), 2)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(net_pay) or net_pay <= 0:
+        return None
+
+    tax_amount: Optional[float] = None
+    raw_tax = parsed.get("tax_amount")
+    if raw_tax is not None and str(raw_tax).strip() != "":
+        try:
+            parsed_tax = round(float(raw_tax), 2)
+        except (TypeError, ValueError):
+            parsed_tax = None
+        if parsed_tax is not None and math.isfinite(parsed_tax) and parsed_tax >= 0:
+            tax_amount = parsed_tax
+
+    pay_period_ref, notes = _derive_payslip_period_fields(parsed)
+    return _NormalizedPayslip(
+        employer=employer,
+        pay_date=_resolve_order_date(parsed.get("pay_date"), fallback_date),
+        net_pay=net_pay,
+        currency=normalize_receipt_currency(parsed.get("currency"), fallback=fallback_currency),
+        tax_amount=tax_amount,
+        pay_period_ref=pay_period_ref,
+        notes=notes,
+    )
+
+
+def apply_parsed_payslip_fields(
+    receipt: Receipt,
+    parsed: Optional[dict[str, Any]],
+    db: Session,
+) -> bool:
+    """Populate header fields on an existing payslip Receipt while skipping line items."""
+    normalized = _normalize_parsed_payslip(
+        parsed,
+        fallback_date=receipt.receipt_date or date.today(),
+        fallback_currency=receipt.currency or "NZD",
+    )
+    if normalized is None:
+        return False
+
+    receipt.document_type = "payslip"
+    receipt.receipt_date = normalized.pay_date
+    receipt.merchant = normalized.employer
+    receipt.total_amount = normalized.net_pay
+    receipt.currency = normalized.currency
+    if normalized.pay_period_ref:
+        receipt.order_number = normalized.pay_period_ref
+    receipt.tax_amount = normalized.tax_amount
+    receipt.notes = normalized.notes
+    receipt.is_processed = True
+    if receipt.items:
+        receipt.items.clear()
+        db.flush()
+    return True
+
+
+def _decode_valid_payslip_attachment(att: Any) -> Optional[tuple[bytes, str]]:
+    """Decode and size-check a PDF or image attachment for payslip extraction."""
+    if not att.content_base64:
+        return None
+    try:
+        raw_bytes = base64.b64decode(att.content_base64, validate=False)
+    except Exception:
+        return None
+    mime_type = infer_receipt_mime_type(att.filename, att.content_type)
+    if mime_type == "application/pdf":
+        return (raw_bytes, mime_type) if len(raw_bytes) >= MIN_PAYSLIP_PDF_BYTES else None
+    if mime_type.startswith("image/"):
+        return (raw_bytes, mime_type) if len(raw_bytes) >= MIN_RECEIPT_ATTACHMENT_BYTES else None
+    return None
+
+
+def _extract_payslip_from_attachments(
+    attachments: list[Any],
+    fallback_date: date,
+) -> _PayslipAttachmentOutcome:
+    """Parse payslip fields from valid PDF/image attachments and retain first attachment fallback."""
+    fallback_attachment: Optional[_StoredReceiptMedia] = None
+    raw_text_for_record: Optional[str] = None
+
+    for att in attachments:
+        decoded = _decode_valid_payslip_attachment(att)
+        if decoded is None:
+            continue
+        raw_bytes, mime_type = decoded
+        if fallback_attachment is None:
+            fallback_attachment = _StoredReceiptMedia(raw_bytes, mime_type, att.filename)
+        if mime_type == "application/pdf":
+            pdf_text = extract_pdf_text(raw_bytes)
+            if pdf_text:
+                raw_text_for_record = pdf_text[:32000]
+
+        parsed_att = parse_payslip_with_llm(raw_bytes, att.filename, mime_type)
+        normalized = _normalize_parsed_payslip(parsed_att, fallback_date=fallback_date)
+        if normalized is not None:
+            comp_bytes, comp_mime = compress_receipt_image(raw_bytes, mime_type)
+            return _PayslipAttachmentOutcome(
+                payslip=normalized,
+                stored_media=_StoredReceiptMedia(comp_bytes, comp_mime, att.filename),
+                fallback_attachment=fallback_attachment,
+                raw_text=raw_text_for_record,
+            )
+
+    return _PayslipAttachmentOutcome(
+        payslip=None,
+        stored_media=None,
+        fallback_attachment=fallback_attachment,
+        raw_text=raw_text_for_record,
+    )
+
+
+def _extract_payslip_from_email_body(
+    sanitized_text: str,
+    fallback_date: date,
+) -> tuple[_NormalizedPayslip, str]:
+    """Parse payslip fields from sanitized email body text via text LLM fallback."""
+    if not sanitized_text:
+        raise ValueError(
+            "Payslip email contains no readable payslip content or valid attachment."
+        )
+    parsed_body = parse_payslip_text_with_llm(sanitized_text, raise_on_error=True)
+    normalized = _normalize_parsed_payslip(parsed_body, fallback_date=fallback_date)
+    if normalized is None:
+        raise ValueError(
+            "Payslip extraction failed: missing valid employer and positive net_pay."
+        )
+    return normalized, sanitized_text[:32000]
+
+
+def _persist_payslip_receipt(
+    db: Session,
+    *,
+    normalized: _NormalizedPayslip,
+    message_id: str,
+    raw_text: Optional[str],
+    stored_media: Optional[_StoredReceiptMedia],
+) -> Receipt:
+    """Create a payslip Receipt row (zero items/products) and trigger inflow matching."""
+    receipt = Receipt(
+        document_type="payslip",
+        receipt_date=normalized.pay_date,
+        merchant=normalized.employer,
+        total_amount=normalized.net_pay,
+        currency=normalized.currency,
+        tax_amount=normalized.tax_amount,
+        order_number=normalized.pay_period_ref,
+        source_email_message_id=message_id[:512],
+        status="unlinked",
+        is_processed=True,
+        raw_text=raw_text,
+        notes=normalized.notes,
+        image_data=stored_media.data if stored_media else None,
+        image_mime_type=stored_media.mime_type if stored_media else None,
+        image_filename=(
+            stored_media.filename[:255] if stored_media and stored_media.filename else None
+        ),
+    )
+    db.add(receipt)
+    db.commit()
+    db.refresh(receipt)
+    match_receipt_to_transaction(receipt, db)
+    return receipt
+
+
+def ingest_payslip_email(db: Session, payload: InboundEmailDispatchPayload) -> Receipt:
+    """Ingest a payslip email (attachment-first, zero ReceiptItem/Product rows, inflow matching)."""
+    sanitized_body, fallback_date = sanitize_receipt_email_content(
+        subject=payload.subject or "", from_address=payload.from_address,
+        received_at=payload.received_at, text_body=payload.text_body,
+        html_excerpt=payload.html_excerpt, raw_excerpt=payload.raw_excerpt,
+    )
+    outcome = _extract_payslip_from_attachments(payload.attachments, fallback_date)
+    normalized, stored_media, raw_text = outcome.payslip, outcome.stored_media, outcome.raw_text
+
+    if normalized is None:
+        normalized, raw_text = _extract_payslip_from_email_body(sanitized_body, fallback_date)
+        if stored_media is None and outcome.fallback_attachment is not None:
+            fb = outcome.fallback_attachment
+            comp_bytes, comp_mime = compress_receipt_image(fb.data, fb.mime_type)
+            stored_media = _StoredReceiptMedia(comp_bytes, comp_mime, fb.filename)
+
+    existing_dup = _find_semantic_duplicate_receipt(
+        db, merchant=normalized.employer, receipt_date=normalized.pay_date,
+        total_amount=normalized.net_pay, currency=normalized.currency,
+        order_number=normalized.pay_period_ref, document_type="payslip",
+    )
+    if existing_dup is not None:
+        return existing_dup
+
+    return _persist_payslip_receipt(
+        db, normalized=normalized, message_id=payload.message_id,
+        raw_text=raw_text, stored_media=stored_media,
+    )
 
 
 def compute_product_statistics(
