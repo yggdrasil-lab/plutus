@@ -22,6 +22,7 @@ from app.services.product_catalog import (
     ProductListQuery,
     ProductListResult,
     ProductNotFoundError,
+    ProductRef,
     ProductSnapshot,
     ProductStatisticSnapshot,
     ProductStatisticsSnapshot,
@@ -153,6 +154,35 @@ def test_detached_frozen_snapshots_survive_session_close() -> None:
             detail.name = "Mutated"  # type: ignore[misc]
         with pytest.raises(FrozenInstanceError):
             stats.products[0].total_spent = 999.0  # type: ignore[misc]
+    finally:
+        Base.metadata.drop_all(bind=engine)
+
+
+def test_get_or_create_product_returns_detached_frozen_product_ref() -> None:
+    session_factory, engine = _new_memory_session_factory()
+    try:
+        with session_factory() as db:
+            ref = get_or_create_product(
+                db,
+                "Marine Hydration Gel",
+                brand="Harbour Skin",
+                category="Personal Care",
+                domain="02-skin",
+                tags=["skincare", "moisturizer"],
+                volume_ml="50ml",
+            )
+            db.commit()
+
+        assert is_dataclass(ref) and isinstance(ref, ProductRef)
+        assert isinstance(ref.id, int)
+        assert ref.name == "Marine Hydration Gel"
+        assert ref.brand == "Harbour Skin"
+        assert ref.category == "Personal Care"
+        assert ref.domain == "02-skin"
+        assert ref.tags == ("skincare", "moisturizer")
+        assert ref.volume_ml == "50ml"
+        with pytest.raises(FrozenInstanceError):
+            ref.name = "Mutated"  # type: ignore[misc]
     finally:
         Base.metadata.drop_all(bind=engine)
 

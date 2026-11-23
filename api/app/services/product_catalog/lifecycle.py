@@ -12,12 +12,14 @@ from sqlalchemy.orm import Session
 from app.models import Product, ReceiptItem
 from app.services.product_catalog._types import (
     _MAX_BRAND_LENGTH,
+    _MAX_CATEGORY_LENGTH,
     _MAX_DOMAIN_LENGTH,
     _MAX_VOLUME_LENGTH,
     UNSET,
     ProductConflictError,
     ProductCreateInput,
     ProductNotFoundError,
+    ProductRef,
     ProductSnapshot,
     ProductUpdateInput,
     TagResolver,
@@ -68,7 +70,7 @@ def get_or_create_product(
     tags: Optional[Sequence[str]] = None,
     volume_ml: Optional[str] = None,
     tag_resolver: Optional[TagResolver] = None,
-) -> Product:
+) -> ProductRef:
     """Upsert a catalog product by name, merge metadata, and link unlinked items."""
     canonical = normalize_product_name(item_name)
     product = db.scalars(
@@ -84,7 +86,7 @@ def get_or_create_product(
         product = Product(
             name=canonical,
             brand=_clip_optional(brand, _MAX_BRAND_LENGTH),
-            category=((category or "").strip()[:50] or "General"),
+            category=_clip_optional(category, _MAX_CATEGORY_LENGTH) or "General",
             domain=_clip_optional(domain, _MAX_DOMAIN_LENGTH),
             tags=json.dumps(tags_list),
             volume_ml=_clip_optional(volume_ml, _MAX_VOLUME_LENGTH),
@@ -97,7 +99,7 @@ def get_or_create_product(
     )
     if linked > 0:
         db.flush()
-    return product
+    return _to_product_ref(product)
 
 
 def create_product(
@@ -237,6 +239,18 @@ def _clip_optional(value: Optional[str], max_length: int) -> Optional[str]:
         return None
     cleaned = value.strip()
     return cleaned[:max_length] if cleaned else None
+
+
+def _to_product_ref(product: Product) -> ProductRef:
+    return ProductRef(
+        id=product.id,
+        name=product.name,
+        brand=product.brand,
+        category=product.category,
+        domain=product.domain,
+        tags=parse_product_tags(product.tags),
+        volume_ml=product.volume_ml,
+    )
 
 
 def _merge_existing_product(

@@ -49,6 +49,19 @@ UNSET = _UnsetType()
 
 
 @dataclass(frozen=True)
+class ProductRef:
+    """Detached immutable reference returned when upserting a catalog product."""
+
+    id: int
+    name: str
+    brand: Optional[str] = None
+    category: str = "General"
+    domain: Optional[str] = None
+    tags: tuple[str, ...] = ()
+    volume_ml: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class PricePointSnapshot:
     """Detached immutable historical unit price point from a receipt item."""
 
