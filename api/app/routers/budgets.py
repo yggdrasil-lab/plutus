@@ -114,6 +114,37 @@ def _save_budget_rule_record(
     return new_rule
 
 
+def _sync_budget_or_400(
+    db: Session,
+    *,
+    category_name: str,
+    is_active: bool,
+    explicit_period: Optional[str] = None,
+    existing_period: Optional[str] = None,
+    existing_is_active: bool = True,
+    annual_limit_only: bool = False,
+) -> tuple[str, str]:
+    """Resolve budget cadence and sync taxonomy amortization, mapping domain errors to HTTP 400."""
+    try:
+        resolved_period = resolve_budget_rule_period(
+            db,
+            category_name,
+            explicit_period=explicit_period,
+            existing_period=existing_period,
+            existing_is_active=existing_is_active,
+            annual_limit_only=annual_limit_only,
+        )
+        canonical_cat = sync_budget_rule_amortization(
+            db,
+            category_name=category_name,
+            budget_period=resolved_period,
+            is_active=is_active,
+        )
+    except CategoryTaxonomyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return canonical_cat, resolved_period
+
+
 @router.post("", response_model=BudgetRuleRead, status_code=status.HTTP_200_OK)
 def upsert_budget_rule(
     payload: BudgetRuleCreate,
@@ -129,29 +160,20 @@ def upsert_budget_rule(
     existing = db.scalar(
         select(BudgetRule).where(func.lower(func.trim(BudgetRule.category)) == cleaned.lower())
     )
-    annual_limit_only = (
+    annual_only = (
         payload.annual_limit is not None
         and payload.weekly_limit is None
         and payload.monthly_limit is None
     )
-    try:
-        resolved_period = resolve_budget_rule_period(
-            db,
-            cleaned,
-            explicit_period=payload.budget_period,
-            existing_period=existing.budget_period if existing is not None else None,
-            existing_is_active=bool(existing.is_active) if existing is not None else True,
-            annual_limit_only=annual_limit_only,
-        )
-        canonical_cat = sync_budget_rule_amortization(
-            db,
-            category_name=cleaned,
-            budget_period=resolved_period,
-            is_active=payload.is_active,
-        )
-    except CategoryTaxonomyError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
+    canonical_cat, resolved_period = _sync_budget_or_400(
+        db,
+        category_name=cleaned,
+        is_active=payload.is_active,
+        explicit_period=payload.budget_period,
+        existing_period=existing.budget_period if existing is not None else None,
+        existing_is_active=bool(existing.is_active) if existing is not None else True,
+        annual_limit_only=annual_only,
+    )
     return _save_budget_rule_record(
         db,
         existing=existing,
@@ -189,16 +211,9 @@ def initialize_default_budgets(
         )
         if existing:
             continue
-        try:
-            resolved_period = resolve_budget_rule_period(db, cat)
-            canonical_cat = sync_budget_rule_amortization(
-                db,
-                category_name=cat,
-                budget_period=resolved_period,
-                is_active=True,
-            )
-        except CategoryTaxonomyError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        canonical_cat, resolved_period = _sync_budget_or_400(
+            db, category_name=cat, is_active=True
+        )
         rule = BudgetRule(
             category=canonical_cat,
             weekly_limit=weekly,
@@ -243,16 +258,12 @@ def _upsert_budget_rules_from_burn(db: Session, lookback_weeks: int) -> list[Bud
     for est in burn.categories:
         if est.average_weekly_burn < MIN_SIGNIFICANT_WEEKLY_BURN_NZD:
             continue
-        resolved_period = est.budget_period or "monthly"
-        try:
-            canonical_cat = sync_budget_rule_amortization(
-                db,
-                category_name=est.category,
-                budget_period=resolved_period,
-                is_active=True,
-            )
-        except CategoryTaxonomyError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        canonical_cat, resolved_period = _sync_budget_or_400(
+            db,
+            category_name=est.category,
+            is_active=True,
+            explicit_period=est.budget_period or "monthly",
+        )
         existing = existing_rules.get(canonical_cat.lower())
         if existing:
             existing.category = canonical_cat

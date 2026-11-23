@@ -328,3 +328,150 @@ def test_normalize_existing_legacy_categories_six_tables_and_budget_collision():
         kept_dining = session.get(BudgetRule, active_dining_rule.id)
         assert kept_dining is not None and kept_dining.category == "Dining"
         assert normalize_existing_legacy_categories(session) == 0
+
+
+def test_normalize_preserves_adhoc_budget_rules_and_deactivated_categories():
+    from app.models import Category, Product, Receipt, ReceiptItem, TransactionSplit
+    from app.services.category_taxonomy import (
+        CategoryCreateInput,
+        CategoryUpdateInput,
+        create_category,
+        ensure_default_categories,
+        normalize_existing_legacy_categories,
+        update_category,
+    )
+
+    engine = sa.create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        ensure_default_categories(session)
+        hobbies = create_category(session, CategoryCreateInput(name="Hobbies"))
+        food = session.scalar(sa.select(Category).where(Category.name == "Food"))
+        assert food is not None
+        for child in session.scalars(sa.select(Category).where(Category.parent_id == food.id)).all():
+            update_category(session, child.id, CategoryUpdateInput(is_active=False))
+        update_category(session, food.id, CategoryUpdateInput(is_active=False))
+        update_category(session, hobbies.id, CategoryUpdateInput(is_active=False))
+
+        acc = Account(
+            name="ANZ",
+            institution="ANZ",
+            account_type="checking",
+            tier="cash",
+            currency="NZD",
+        )
+        session.add(acc)
+        session.flush()
+
+        tx_food = Transaction(
+            account_id=acc.id,
+            transaction_date=date(2026, 11, 10),
+            amount=-20.0,
+            currency="NZD",
+            merchant="Corner Eatery",
+            category="Food",
+            raw_hash="deact-food-tx",
+            tags="[]",
+        )
+        tx_hobbies = Transaction(
+            account_id=acc.id,
+            transaction_date=date(2026, 11, 10),
+            amount=-45.0,
+            currency="NZD",
+            merchant="Hobby Co",
+            category="Hobbies",
+            raw_hash="deact-hobbies-tx",
+            tags="[]",
+        )
+        session.add_all([tx_food, tx_hobbies])
+        session.flush()
+
+        split_food = TransactionSplit(
+            transaction_id=tx_food.id, amount=-10.0, category="Food"
+        )
+        split_hobbies = TransactionSplit(
+            transaction_id=tx_hobbies.id, amount=-15.0, category="Hobbies"
+        )
+        cat_rule_food = CategorizationRule(
+            name="Food Rule",
+            description_pattern="Eatery",
+            match_type="contains",
+            target_category="Food",
+        )
+        cat_rule_hobbies = CategorizationRule(
+            name="Hobby Rule",
+            description_pattern="Hobby Co",
+            match_type="contains",
+            target_category="Hobbies",
+        )
+        prod_food = Product(name="Snack Pack", category="Food")
+        prod_hobbies = Product(name="Paint Set", category="Hobbies")
+        receipt = Receipt(
+            receipt_date=date(2026, 11, 10),
+            merchant="Corner Eatery",
+            total_amount=20.0,
+            currency="NZD",
+            status="unlinked",
+        )
+        session.add_all(
+            [
+                split_food,
+                split_hobbies,
+                cat_rule_food,
+                cat_rule_hobbies,
+                prod_food,
+                prod_hobbies,
+                receipt,
+            ]
+        )
+        session.flush()
+
+        item_food = ReceiptItem(
+            receipt_id=receipt.id,
+            product_id=prod_food.id,
+            item_name="Sandwich",
+            unit_price=10.0,
+            total_price=10.0,
+            category="Food",
+        )
+        item_hobbies = ReceiptItem(
+            receipt_id=receipt.id,
+            product_id=prod_hobbies.id,
+            item_name="Brush",
+            unit_price=10.0,
+            total_price=10.0,
+            category="Hobbies",
+        )
+        general_rule = BudgetRule(
+            category="General", weekly_limit=40.0, monthly_limit=173.33, is_active=True
+        )
+        adhoc_rule = BudgetRule(
+            category="Education", weekly_limit=30.0, monthly_limit=130.0, is_active=True
+        )
+        food_rule = BudgetRule(
+            category="Food", weekly_limit=60.0, monthly_limit=260.0, is_active=False
+        )
+        hobbies_rule = BudgetRule(
+            category="Hobbies", weekly_limit=25.0, monthly_limit=108.33, is_active=False
+        )
+        session.add_all(
+            [item_food, item_hobbies, general_rule, adhoc_rule, food_rule, hobbies_rule]
+        )
+        session.commit()
+
+        assert normalize_existing_legacy_categories(session) == 0
+        assert session.get(Transaction, tx_food.id).category == "Food"
+        assert session.get(Transaction, tx_hobbies.id).category == "Hobbies"
+        assert session.get(TransactionSplit, split_food.id).category == "Food"
+        assert session.get(TransactionSplit, split_hobbies.id).category == "Hobbies"
+        assert session.get(CategorizationRule, cat_rule_food.id).target_category == "Food"
+        assert session.get(CategorizationRule, cat_rule_hobbies.id).target_category == "Hobbies"
+        assert session.get(ReceiptItem, item_food.id).category == "Food"
+        assert session.get(ReceiptItem, item_hobbies.id).category == "Hobbies"
+        assert session.get(Product, prod_food.id).category == "Food"
+        assert session.get(Product, prod_hobbies.id).category == "Hobbies"
+        assert session.get(BudgetRule, adhoc_rule.id).category == "Education"
+        assert session.get(BudgetRule, general_rule.id).category == "General"
+        assert session.get(BudgetRule, food_rule.id).category == "Food"
+        assert session.get(BudgetRule, hobbies_rule.id).category == "Hobbies"

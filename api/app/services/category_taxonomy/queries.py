@@ -121,14 +121,14 @@ def get_canonical_category_names(
     db: Optional[Session] = None,
     *,
     include_system_non_expense: bool = True,
+    include_inactive: bool = False,
 ) -> list[str]:
-    """Return active category names from DB (or default specs when unseeded)."""
+    """Return category names from DB (or default specs when unseeded)."""
     if db is not None and db.scalar(select(Category.id).limit(1)) is not None:
-        rows = db.scalars(
-            select(Category)
-            .where(Category.is_active == True)
-            .order_by(Category.sort_order.asc(), Category.name.asc())
-        ).all()
+        stmt = select(Category)
+        if not include_inactive:
+            stmt = stmt.where(Category.is_active == True)
+        rows = db.scalars(stmt.order_by(Category.sort_order.asc(), Category.name.asc())).all()
         names = [row.name for row in rows]
     else:
         names = list(DEFAULT_CATEGORY_NAMES)

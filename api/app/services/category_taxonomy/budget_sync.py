@@ -16,38 +16,13 @@ from app.services.category_taxonomy._types import (
 )
 
 
-def _lookup_category_by_name(db: Session, cleaned_name: str) -> Optional[Category]:
-    return db.scalar(
-        select(Category).where(func.lower(func.trim(Category.name)) == cleaned_name.lower())
-    )
-
-
-def _resolve_validated_target(
-    db: Session,
-    category_name: str,
-    *,
-    budget_period: str,
-) -> tuple[str, Optional[Category], str]:
-    cleaned = normalize_category_name(category_name)
-    normalized_period = normalize_budget_period_setting(budget_period)
-    cat = _lookup_category_by_name(db, cleaned)
-    if normalized_period == "annual" and (
-        (cat is not None and cat.is_system) or is_system_category_name(cleaned)
-    ):
-        raise CategoryValidationError("System categories cannot use an annual budget period.")
-    canonical_name = cat.name if cat is not None else cleaned
-    return canonical_name, cat, normalized_period
-
-
 def resolve_budget_rule_category(
     db: Session,
     category_name: str,
     *,
     budget_period: str,
-    is_active: bool = True,
 ) -> str:
     """Validate budget category & period and return canonical casing without mutating Category."""
-    _ = is_active
     canonical_name, _, _ = _resolve_validated_target(
         db, category_name, budget_period=budget_period
     )
@@ -94,3 +69,26 @@ def sync_budget_rule_amortization(
         cat.amortize_period = "annual" if normalized_period == "annual" else None
         db.flush()
     return canonical_name
+
+
+def _lookup_category_by_name(db: Session, cleaned_name: str) -> Optional[Category]:
+    return db.scalar(
+        select(Category).where(func.lower(func.trim(Category.name)) == cleaned_name.lower())
+    )
+
+
+def _resolve_validated_target(
+    db: Session,
+    category_name: str,
+    *,
+    budget_period: str,
+) -> tuple[str, Optional[Category], str]:
+    cleaned = normalize_category_name(category_name)
+    normalized_period = normalize_budget_period_setting(budget_period)
+    cat = _lookup_category_by_name(db, cleaned)
+    if normalized_period == "annual" and (
+        (cat is not None and cat.is_system) or is_system_category_name(cleaned)
+    ):
+        raise CategoryValidationError("System categories cannot use an annual budget period.")
+    canonical_name = cat.name if cat is not None else cleaned
+    return canonical_name, cat, normalized_period

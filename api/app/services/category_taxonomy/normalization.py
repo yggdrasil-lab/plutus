@@ -110,15 +110,11 @@ AKAHU_TAG_HINTS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
     (("hotel", "accommodation"), ("accommodation",)),
 )
 
-
-def _concise_akahu_tags(lower_category: str, canonical: str) -> tuple[str, ...]:
-    """Derive concise, composable atomic tags from Akahu's verbose category string."""
-    if not lower_category or lower_category in ("unknown", "other", "general", canonical.lower()):
-        return ()
-    for keywords, tags in AKAHU_TAG_HINTS:
-        if any(kw in lower_category for kw in keywords):
-            return tags
-    return ()
+_SIMPLE_NORMALIZATION_TARGETS: tuple[tuple[type[Any], Any, str, str], ...] = (
+    (CategorizationRule, CategorizationRule.target_category, "target_category", "description_pattern"),
+    (ReceiptItem, ReceiptItem.category, "category", "item_name"),
+    (Product, Product.category, "category", "name"),
+)
 
 
 def normalize_akahu_category(
@@ -143,6 +139,35 @@ def normalize_akahu_category(
     return canonical, _concise_akahu_tags(lower, canonical)
 
 
+def normalize_existing_legacy_categories(db: Session) -> int:
+    """Normalize non-canonical categories across all six denormalized ledger tables."""
+    canonical_names = set(
+        get_canonical_category_names(db, include_inactive=True)
+    ) or set(DEFAULT_CATEGORY_NAMES)
+    canonical_by_lower = {name.lower(): name for name in canonical_names}
+
+    updated = _normalize_transactions(db, canonical_names, canonical_by_lower)
+    updated += _normalize_splits(db, canonical_names, canonical_by_lower)
+    for model, column, cat_attr, hint_attr in _SIMPLE_NORMALIZATION_TARGETS:
+        updated += _normalize_simple_table(
+            db, model, column, cat_attr, hint_attr, canonical_names, canonical_by_lower
+        )
+    updated += _normalize_budget_rules(db, canonical_names, canonical_by_lower)
+    if updated > 0:
+        db.commit()
+    return updated
+
+
+def _concise_akahu_tags(lower_category: str, canonical: str) -> tuple[str, ...]:
+    """Derive concise, composable atomic tags from Akahu's verbose category string."""
+    if not lower_category or lower_category in ("unknown", "other", "general", canonical.lower()):
+        return ()
+    for keywords, tags in AKAHU_TAG_HINTS:
+        if any(kw in lower_category for kw in keywords):
+            return tags
+    return ()
+
+
 def _resolve_legacy_target(
     raw_category: Optional[str],
     merchant: str,
@@ -155,6 +180,22 @@ def _resolve_legacy_target(
         return existing_canonical, ()
     canonical, new_tags = normalize_akahu_category(raw_category, merchant, raw_description)
     return canonical_by_lower.get(canonical.lower(), canonical), new_tags
+
+
+def _resolve_budget_rule_target(
+    raw_category: Optional[str],
+    canonical_by_lower: dict[str, str],
+) -> str:
+    cleaned = (raw_category or "").strip()
+    lower = cleaned.lower()
+    if not cleaned or lower in ("unknown", "other", "general"):
+        return canonical_by_lower.get("general", "General")
+    if lower in canonical_by_lower:
+        return canonical_by_lower[lower]
+    for keywords, target in AKAHU_CATEGORY_RULES:
+        if any(kw in lower for kw in keywords):
+            return canonical_by_lower.get(target.lower(), target)
+    return cleaned
 
 
 def _merge_tags_json(raw_tags: Optional[str], new_tags: tuple[str, ...]) -> tuple[str, bool]:
@@ -269,7 +310,7 @@ def _normalize_budget_rules(
     pending_updates: dict[int, tuple[BudgetRule, str]] = {}
 
     for rule in non_canonical:
-        canonical, _ = _resolve_legacy_target(rule.category, "", "", canonical_by_lower)
+        canonical = _resolve_budget_rule_target(rule.category, canonical_by_lower)
         target_lower = canonical.lower()
         if target_lower in seen_by_lower:
             retained = seen_by_lower[target_lower]
@@ -295,44 +336,3 @@ def _normalize_budget_rules(
     if pending_updates:
         db.flush()
     return len(to_delete) + len(pending_updates)
-
-
-def normalize_existing_legacy_categories(db: Session) -> int:
-    """Normalize non-canonical categories across all six denormalized ledger tables."""
-    canonical_names = set(get_canonical_category_names(db)) or set(DEFAULT_CATEGORY_NAMES)
-    canonical_by_lower = {name.lower(): name for name in canonical_names}
-
-    updated = 0
-    updated += _normalize_transactions(db, canonical_names, canonical_by_lower)
-    updated += _normalize_splits(db, canonical_names, canonical_by_lower)
-    updated += _normalize_simple_table(
-        db,
-        CategorizationRule,
-        CategorizationRule.target_category,
-        "target_category",
-        "description_pattern",
-        canonical_names,
-        canonical_by_lower,
-    )
-    updated += _normalize_simple_table(
-        db,
-        ReceiptItem,
-        ReceiptItem.category,
-        "category",
-        "item_name",
-        canonical_names,
-        canonical_by_lower,
-    )
-    updated += _normalize_simple_table(
-        db,
-        Product,
-        Product.category,
-        "category",
-        "name",
-        canonical_names,
-        canonical_by_lower,
-    )
-    updated += _normalize_budget_rules(db, canonical_names, canonical_by_lower)
-    if updated > 0:
-        db.commit()
-    return updated
