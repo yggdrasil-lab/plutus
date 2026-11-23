@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.db import get_db
 from app.models import Receipt, ReceiptItem, Transaction
+from app.services.ai_gateway import AiGateway, get_ai_gateway
 from app.services.rules_engine import normalize_tags
 from app.schemas import (
     ProductStatisticsResponse,
@@ -59,7 +60,13 @@ def list_receipts(
     )
 
 
-def _persist_payload_receipt_items(db: Session, receipt: Receipt, items: list[Any]) -> None:
+def _persist_payload_receipt_items(
+    db: Session,
+    receipt: Receipt,
+    items: list[Any],
+    *,
+    gateway: AiGateway | None = None,
+) -> None:
     """Classify and persist line items submitted via ReceiptCreate."""
     active_rules, existing_tags, extra_categories = load_receipt_rule_context(db)
     for item in items:
@@ -81,6 +88,7 @@ def _persist_payload_receipt_items(db: Session, receipt: Receipt, items: list[An
             active_rules=active_rules,
             existing_tags=existing_tags,
             extra_categories=extra_categories,
+            gateway=gateway,
         )
 
 
@@ -88,6 +96,7 @@ def _persist_payload_receipt_items(db: Session, receipt: Receipt, items: list[An
 def create_receipt(
     payload: ReceiptCreate,
     db: Session = Depends(get_db),
+    ai_gateway: AiGateway = Depends(get_ai_gateway),
 ):
     """Create a structured receipt or payslip and attempt auto-matching."""
     receipt = Receipt(
@@ -104,14 +113,20 @@ def create_receipt(
     db.add(receipt)
     db.flush()
     if payload.document_type != "payslip" and payload.items:
-        _persist_payload_receipt_items(db, receipt, payload.items)
+        _persist_payload_receipt_items(db, receipt, payload.items, gateway=ai_gateway)
     db.commit()
     db.refresh(receipt)
     match_receipt_to_transaction(receipt, db)
     return receipt
 
 
-def _apply_parsed_receipt_fields(receipt: Receipt, parsed: dict[str, Any], db: Session) -> None:
+def _apply_parsed_receipt_fields(
+    receipt: Receipt,
+    parsed: dict[str, Any],
+    db: Session,
+    *,
+    gateway: AiGateway | None = None,
+) -> None:
     """Populate receipt header fields and itemized line items from parsed LLM JSON."""
     try:
         r_date = date.fromisoformat(parsed.get("receipt_date", date.today().isoformat()))
@@ -135,7 +150,7 @@ def _apply_parsed_receipt_fields(receipt: Receipt, parsed: dict[str, Any], db: S
     db.flush()
 
     active_rules, existing_tags, extra_categories = load_receipt_rule_context(db)
-    resolved_items = apply_receipt_discounts_with_jev(parsed.get("items", []))
+    resolved_items = apply_receipt_discounts_with_jev(parsed.get("items", []), gateway=gateway)
     for it in resolved_items:
         create_classified_receipt_item(
             db,
@@ -157,6 +172,7 @@ def _apply_parsed_receipt_fields(receipt: Receipt, parsed: dict[str, Any], db: S
             active_rules=active_rules,
             existing_tags=existing_tags,
             extra_categories=extra_categories,
+            gateway=gateway,
         )
 
 
@@ -164,6 +180,7 @@ def _apply_parsed_receipt_fields(receipt: Receipt, parsed: dict[str, Any], db: S
 async def upload_receipt(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
+    ai_gateway: AiGateway = Depends(get_ai_gateway),
 ):
     """Upload a receipt photo/PDF/text, parse with Hydrogen Vision, and store in DB.
 
@@ -182,7 +199,7 @@ async def upload_receipt(
         except UnicodeDecodeError:
             raw_text = None
 
-    parsed = parse_receipt_with_llm(content, file.filename, mime_type)
+    parsed = parse_receipt_with_llm(content, file.filename, mime_type, gateway=ai_gateway)
 
     if parsed and "merchant" in parsed and "total_amount" in parsed:
         stored_bytes, stored_mime = compress_receipt_image(content, mime_type)
@@ -199,7 +216,7 @@ async def upload_receipt(
         )
         db.add(receipt)
         db.flush()
-        _apply_parsed_receipt_fields(receipt, parsed, db)
+        _apply_parsed_receipt_fields(receipt, parsed, db, gateway=ai_gateway)
         db.commit()
         db.refresh(receipt)
         match_receipt_to_transaction(receipt, db)
@@ -246,6 +263,7 @@ def get_receipt_image(
 def reprocess_receipt(
     receipt_id: int,
     db: Session = Depends(get_db),
+    ai_gateway: AiGateway = Depends(get_ai_gateway),
 ):
     """Re-run LLM parsing on a stored receipt or payslip and compress image attachments on success."""
     receipt = db.get(Receipt, receipt_id)
@@ -256,20 +274,24 @@ def reprocess_receipt(
 
     mime_type = receipt.image_mime_type or infer_receipt_mime_type(receipt.image_filename, None)
     if receipt.document_type == "payslip":
-        parsed = parse_payslip_with_llm(receipt.image_data, receipt.image_filename, mime_type)
+        parsed = parse_payslip_with_llm(
+            receipt.image_data, receipt.image_filename, mime_type, gateway=ai_gateway
+        )
         if not apply_parsed_payslip_fields(receipt, parsed, db):
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail="Payslip parsing failed; original document preserved.",
             )
     else:
-        parsed = parse_receipt_with_llm(receipt.image_data, receipt.image_filename, mime_type)
+        parsed = parse_receipt_with_llm(
+            receipt.image_data, receipt.image_filename, mime_type, gateway=ai_gateway
+        )
         if not parsed or "merchant" not in parsed or "total_amount" not in parsed:
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail="Receipt vision parsing failed; original image preserved.",
             )
-        _apply_parsed_receipt_fields(receipt, parsed, db)
+        _apply_parsed_receipt_fields(receipt, parsed, db, gateway=ai_gateway)
 
     compressed_bytes, compressed_mime = compress_receipt_image(receipt.image_data, mime_type)
     receipt.image_data = compressed_bytes

@@ -22,6 +22,14 @@ from app.db import Base, get_db
 from app.main import app
 from app.models import Account, ExchangeRate, IngestedEmail, Receipt, Transaction
 from app.schemas import EmailAttachmentPayload, InboundEmailDispatchPayload
+from app.services.ai_gateway import (
+    AiConfigError,
+    AiInvalidResponseError,
+    AiUpstreamError,
+    InMemoryAiGateway,
+    get_ai_gateway,
+)
+from app.services.connectors import ConnectorUpstreamError
 from app.services.receipt_service import (
     ingest_purchase_receipt_email,
     match_receipt_to_transaction,
@@ -119,6 +127,7 @@ class TestReceiptsPhase4(unittest.TestCase):
         settings.environment = self._orig_env
         settings.llm_api_key = self._orig_llm_key
         app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides.pop(get_ai_gateway, None)
         self.db.close()
         Base.metadata.drop_all(bind=engine)
 
@@ -232,29 +241,31 @@ class TestReceiptsPhase4(unittest.TestCase):
             ]
         }
 
-        with patch(
-            "app.services.receipt_service._invoke_receipt_llm",
-            return_value=mock_multi_orders,
-        ):
-            resp = self.client.post(
-                "/integrations/email",
-                json={
-                    "email_id": 201,
-                    "message_id": "<amz-multi-1@example.com>",
-                    "route_target": "plutus_purchase_receipt",
-                    "subject": "Your Amazon.com.au orders",
-                    "received_at": "2026-11-01T02:00:00Z",
-                    "html_excerpt": "<div>Order 503-1111111-2222222 AUD 179.74</div><div>Order 503-3333333-4444444 AUD 135.99</div>",
-                    "attachments": [
-                        {
-                            "filename": "logo.png",
-                            "content_type": "image/png",
-                            "size_bytes": len(tiny_logo),
-                            "content_base64": base64.b64encode(tiny_logo).decode("ascii"),
-                        }
-                    ],
-                },
-            )
+        gateway = InMemoryAiGateway(
+            text_responses=[mock_multi_orders, mock_multi_orders],
+            jev_handler=lambda _req: '{"category": "General", "is_anomaly": false, "primary_tag": "none"}',
+        )
+        app.dependency_overrides[get_ai_gateway] = lambda: gateway
+
+        resp = self.client.post(
+            "/integrations/email",
+            json={
+                "email_id": 201,
+                "message_id": "<amz-multi-1@example.com>",
+                "route_target": "plutus_purchase_receipt",
+                "subject": "Your Amazon.com.au orders",
+                "received_at": "2026-11-01T02:00:00Z",
+                "html_excerpt": "<div>Order 503-1111111-2222222 AUD 179.74</div><div>Order 503-3333333-4444444 AUD 135.99</div>",
+                "attachments": [
+                    {
+                        "filename": "logo.png",
+                        "content_type": "image/png",
+                        "size_bytes": len(tiny_logo),
+                        "content_base64": base64.b64encode(tiny_logo).decode("ascii"),
+                    }
+                ],
+            },
+        )
 
         self.assertEqual(resp.status_code, 200)
         data = resp.json()
@@ -276,20 +287,16 @@ class TestReceiptsPhase4(unittest.TestCase):
         self.assertEqual(r2.transaction_id, tx2.id)
 
         # Replay with a DIFFERENT message_id triggers semantic dedup instead of creating duplicates
-        with patch(
-            "app.services.receipt_service._invoke_receipt_llm",
-            return_value=mock_multi_orders,
-        ):
-            dup_semantic = self.client.post(
-                "/integrations/email",
-                json={
-                    "email_id": 202,
-                    "message_id": "<amz-multi-1-re-forward@example.com>",
-                    "route_target": "plutus_purchase_receipt",
-                    "subject": "Fwd: Your Amazon.com.au orders",
-                    "text_body": "Order 503-1111111-2222222 and 503-3333333-4444444",
-                },
-            )
+        dup_semantic = self.client.post(
+            "/integrations/email",
+            json={
+                "email_id": 202,
+                "message_id": "<amz-multi-1-re-forward@example.com>",
+                "route_target": "plutus_purchase_receipt",
+                "subject": "Fwd: Your Amazon.com.au orders",
+                "text_body": "Order 503-1111111-2222222 and 503-3333333-4444444",
+            },
+        )
         self.assertEqual(dup_semantic.status_code, 200)
         self.assertEqual(dup_semantic.json()["receipt_ids"], data["receipt_ids"])
         self.assertEqual(len(self.db.scalars(select(Receipt)).all()), 2)
@@ -313,26 +320,31 @@ class TestReceiptsPhase4(unittest.TestCase):
                 }
             ],
         }
-        with patch("app.services.receipt_service.parse_receipt_with_llm", return_value=mock_vision) as mock_vis:
-            resp = self.client.post(
-                "/integrations/email",
-                json={
-                    "email_id": 203,
-                    "message_id": "<att-large-1@example.com>",
-                    "route_target": "plutus_purchase_receipt",
-                    "subject": "Your Mecca receipt",
-                    "text_body": "Thank you for your purchase.",
-                    "attachments": [
-                        {
-                            "filename": "mecca_receipt.png",
-                            "content_type": "image/png",
-                            "size_bytes": len(large_png),
-                            "content_base64": base64.b64encode(large_png).decode("ascii"),
-                        }
-                    ],
-                },
-            )
-            mock_vis.assert_called_once()
+        gateway = InMemoryAiGateway(
+            vision_responses=[mock_vision, mock_vision],
+            jev_handler=lambda _req: '{"category": "Personal Care", "is_anomaly": false, "primary_tag": "none"}',
+        )
+        app.dependency_overrides[get_ai_gateway] = lambda: gateway
+
+        resp = self.client.post(
+            "/integrations/email",
+            json={
+                "email_id": 203,
+                "message_id": "<att-large-1@example.com>",
+                "route_target": "plutus_purchase_receipt",
+                "subject": "Your Mecca receipt",
+                "text_body": "Thank you for your purchase.",
+                "attachments": [
+                    {
+                        "filename": "mecca_receipt.png",
+                        "content_type": "image/png",
+                        "size_bytes": len(large_png),
+                        "content_base64": base64.b64encode(large_png).decode("ascii"),
+                    }
+                ],
+            },
+        )
+        self.assertEqual(len(gateway.vision_requests), 1)
 
         self.assertEqual(resp.status_code, 200)
         rec = self.db.get(Receipt, resp.json()["receipt_id"])
@@ -342,14 +354,14 @@ class TestReceiptsPhase4(unittest.TestCase):
         self.assertEqual(rec.image_filename, "mecca_receipt.png")
 
         # Direct /receipts/upload must ALSO preserve parsed currency (no NZD clobber bug)
-        with patch("app.routers.receipts.parse_receipt_with_llm", return_value=mock_vision):
-            up = self.client.post(
-                "/receipts/upload",
-                files={"file": ("direct.png", large_png, "image/png")},
-            )
+        up = self.client.post(
+            "/receipts/upload",
+            files={"file": ("direct.png", large_png, "image/png")},
+        )
         self.assertEqual(up.status_code, 201)
         self.assertEqual(up.json()["currency"], "AUD")
         self.assertEqual(up.json()["order_number"], "MEC-7788")
+        self.assertEqual(len(gateway.vision_requests), 2)
 
     def test_strict_currency_guard_and_cross_currency_needs_review_candidates_and_link_conflict(self):
         # 1. SGD 50.00 receipt must NOT falsely auto-match an NZD 50.00 transaction
@@ -580,18 +592,19 @@ class TestReceiptsPhase4(unittest.TestCase):
                 }
             ]
         }
-        with patch("app.services.receipt_service._invoke_receipt_llm", return_value=retry_order):
-            retry_res = self.client.post(
-                "/integrations/email",
-                headers=headers,
-                json={
-                    "email_id": 302,
-                    "message_id": "<retry-after-fail@example.com>",
-                    "route_target": "plutus_purchase_receipt",
-                    "subject": "Apple Receipt",
-                    "text_body": "Order RETRY-100 NZD 49.00",
-                },
-            )
+        gateway = InMemoryAiGateway(text_responses=[retry_order])
+        app.dependency_overrides[get_ai_gateway] = lambda: gateway
+        retry_res = self.client.post(
+            "/integrations/email",
+            headers=headers,
+            json={
+                "email_id": 302,
+                "message_id": "<retry-after-fail@example.com>",
+                "route_target": "plutus_purchase_receipt",
+                "subject": "Apple Receipt",
+                "text_body": "Order RETRY-100 NZD 49.00",
+            },
+        )
         self.assertEqual(retry_res.status_code, 200)
         self.assertEqual(retry_res.json()["status"], "processed")
         self.assertFalse(retry_res.json()["duplicate"])
@@ -600,45 +613,59 @@ class TestReceiptsPhase4(unittest.TestCase):
         self.assertEqual(failed_audit.consumer_ref, f"receipt:{retry_res.json()['receipt_id']}")
 
     def test_text_receipt_llm_routes_to_fast_text_model_with_json_mode_and_60s_timeout(self):
-        settings.llm_api_key = "test-llm-key"
-        recorded: list[tuple[dict, int]] = []
-
-        def fake_urlopen(req, timeout=None):
-            recorded.append((json.loads(req.data.decode("utf-8")), timeout))
-            return _FakeLlmResponse(
-                {"orders": [{"merchant": "Demo Store", "total_amount": 12.5}]}
-            )
-
-        with patch("app.services.receipt_service.urllib.request.urlopen", side_effect=fake_urlopen):
-            orders_res = parse_receipt_orders_text_with_llm("Order SYN-101 Total NZD 12.50")
-            text_res = parse_receipt_text_with_llm("Receipt Demo Store Total NZD 12.50")
+        gateway = InMemoryAiGateway(
+            text_responses=[
+                {"orders": [{"merchant": "Demo Store", "total_amount": 12.5}]},
+                {"merchant": "Demo Store", "total_amount": 12.5},
+            ]
+        )
+        orders_res = parse_receipt_orders_text_with_llm(
+            "Order SYN-101 Total NZD 12.50", gateway=gateway
+        )
+        text_res = parse_receipt_text_with_llm(
+            "Receipt Demo Store Total NZD 12.50", gateway=gateway
+        )
 
         self.assertIsNotNone(orders_res)
         self.assertIsNotNone(text_res)
-        self.assertEqual(len(recorded), 2)
-        for payload, timeout in recorded:
-            self.assertEqual(payload["model"], settings.resolved_llm_model)
-            self.assertEqual(payload["response_format"], {"type": "json_object"})
-            self.assertEqual(timeout, 60)
+        self.assertEqual(len(gateway.text_requests), 2)
+        for req in gateway.text_requests:
+            self.assertEqual(req.model, settings.resolved_llm_model)
+            self.assertTrue(req.response_format_json)
+            self.assertEqual(req.timeout, 60.0)
 
     def test_image_receipt_llm_routes_to_vision_model_with_105s_timeout_without_json_mode(self):
-        settings.llm_api_key = "test-llm-key"
-        recorded: list[tuple[dict, int]] = []
         png_bytes = _make_png_bytes(128, 128, large=False)
-
-        def fake_urlopen(req, timeout=None):
-            recorded.append((json.loads(req.data.decode("utf-8")), timeout))
-            return _FakeLlmResponse({"merchant": "Demo Mart", "total_amount": 25.0, "items": []})
-
-        with patch("app.services.receipt_service.urllib.request.urlopen", side_effect=fake_urlopen):
-            res = parse_receipt_with_llm(png_bytes, "receipt.png", "image/png")
+        gateway = InMemoryAiGateway(
+            vision_responses=[{"merchant": "Demo Mart", "total_amount": 25.0, "items": []}]
+        )
+        res = parse_receipt_with_llm(png_bytes, "receipt.png", "image/png", gateway=gateway)
 
         self.assertIsNotNone(res)
-        self.assertEqual(len(recorded), 1)
-        payload, timeout = recorded[0]
-        self.assertEqual(payload["model"], settings.resolved_receipt_llm_model)
-        self.assertNotIn("response_format", payload)
-        self.assertEqual(timeout, 105)
+        self.assertEqual(len(gateway.vision_requests), 1)
+        req = gateway.vision_requests[0]
+        self.assertEqual(req.model, settings.resolved_receipt_llm_model)
+        self.assertFalse(req.response_format_json)
+        self.assertEqual(req.timeout, 105.0)
+
+    def test_receipt_llm_error_mapping_respects_raise_on_error(self):
+        gateway = InMemoryAiGateway(
+            text_responses=[
+                AiConfigError("Missing API key"),
+                AiInvalidResponseError("Malformed JSON"),
+                AiUpstreamError("Gateway timeout", status_code=503),
+                AiUpstreamError("Gateway timeout", status_code=503),
+            ]
+        )
+        with self.assertRaises(ValueError):
+            parse_receipt_orders_text_with_llm("Order 1", raise_on_error=True, gateway=gateway)
+        with self.assertRaises(ValueError):
+            parse_receipt_orders_text_with_llm("Order 2", raise_on_error=True, gateway=gateway)
+        with self.assertRaises(ConnectorUpstreamError):
+            parse_receipt_orders_text_with_llm("Order 3", raise_on_error=True, gateway=gateway)
+        self.assertIsNone(
+            parse_receipt_orders_text_with_llm("Order 4", raise_on_error=False, gateway=gateway)
+        )
 
     def test_parse_original_fx_from_description_wise_and_nz_bank_formats(self):
         cases = [
@@ -757,16 +784,14 @@ class TestReceiptsPhase4(unittest.TestCase):
             ],
         )
 
-        with (
-            patch("app.services.receipt_service.parse_receipt_with_llm", return_value=None) as mock_vis,
-            patch(
-                "app.services.receipt_service.parse_receipt_orders_text_with_llm",
-                return_value=fallback_orders,
-            ) as mock_text,
-        ):
-            created = ingest_purchase_receipt_email(self.db, img_payload)
-            mock_vis.assert_called_once()
-            mock_text.assert_called_once()
+        gateway = InMemoryAiGateway(
+            vision_responses=[AiUpstreamError("Vision unavailable", status_code=503)],
+            text_responses=[fallback_orders],
+            jev_handler=lambda _req: '{"category": "Travel", "is_anomaly": false, "primary_tag": "none"}',
+        )
+        created = ingest_purchase_receipt_email(self.db, img_payload, gateway=gateway)
+        self.assertEqual(len(gateway.vision_requests), 1)
+        self.assertEqual(len(gateway.text_requests), 1)
 
         self.assertEqual(len(created), 1)
         rec = created[0]
@@ -808,40 +833,17 @@ class TestReceiptsPhase4(unittest.TestCase):
             ],
         )
 
-        with (
-            patch("app.services.receipt_service.extract_pdf_text", return_value=""),
-            patch("app.services.receipt_service.parse_receipt_with_llm", return_value=None),
-            patch(
-                "app.services.receipt_service.parse_receipt_orders_text_with_llm",
-                return_value=pdf_fallback_orders,
-            ),
-        ):
-            pdf_created = ingest_purchase_receipt_email(self.db, pdf_payload)
+        gateway = InMemoryAiGateway(text_responses=[pdf_fallback_orders])
+        with patch("app.services.receipt_service.extract_pdf_text", return_value=""):
+            pdf_created = ingest_purchase_receipt_email(self.db, pdf_payload, gateway=gateway)
 
+        self.assertEqual(len(gateway.text_requests), 1)
         self.assertEqual(len(pdf_created), 1)
         pdf_rec = pdf_created[0]
         self.assertEqual(pdf_rec.image_data, raw_pdf)
         self.assertEqual(pdf_rec.image_mime_type, "application/pdf")
         self.assertEqual(pdf_rec.image_filename, "itinerary.pdf")
         self.assertEqual(pdf_rec.currency, "EUR")
-
-
-class _FakeLlmResponse:
-    """Minimal context-manager mock for urllib.request.urlopen responses."""
-
-    def __init__(self, content_obj: dict):
-        self._body = json.dumps(
-            {"choices": [{"message": {"content": json.dumps(content_obj)}}]}
-        ).encode("utf-8")
-
-    def read(self) -> bytes:
-        return self._body
-
-    def __enter__(self) -> "_FakeLlmResponse":
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> bool:
-        return False
 
 
 if __name__ == "__main__":

@@ -2,11 +2,9 @@
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-import json
 import logging
 import re
 from typing import Any, Callable, Optional
-import urllib.request
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -14,6 +12,13 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.models import Account
 from app.schemas import DbsAlertPayload, DbsAlertResult
+from app.services.ai_gateway import (
+    AiConfigError,
+    AiGateway,
+    AiGatewayError,
+    AiTextRequest,
+    get_default_ai_gateway,
+)
 from app.services.connectors import ConnectorUpstreamError
 from app.services.email_utils import (
     SGT_TZ,
@@ -246,14 +251,10 @@ def _invoke_dbs_llm_fallback(
     subject: str,
     body: str,
     ref_sgt_dt: datetime,
+    *,
+    gateway: AiGateway | None = None,
 ) -> Optional[dict[str, Any]]:
     """Call Muninn LLM gateway as a fail-loud fallback for unfamiliar DBS alert templates."""
-    base_url = settings.resolved_llm_base_url
-    api_key = settings.resolved_llm_api_key
-    if not base_url or not api_key:
-        return None
-
-    url = f"{base_url.rstrip('/')}/chat/completions"
     prompt = (
         "Extract DBS bank alert transaction fields strictly as JSON:\n"
         '{"is_transaction": true/false, "amount": 0.00, "currency": "SGD", '
@@ -263,35 +264,105 @@ def _invoke_dbs_llm_fallback(
         f"Reference SGT date: {ref_sgt_dt.date().isoformat()}.\n"
         "Set is_transaction=false for OTP notices, login alerts, or marketing emails."
     )
-    payload = {
-        "model": settings.resolved_llm_model,
-        "messages": [
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": f"Subject: {subject}\n\n{body[:4000]}"},
-        ],
-        "temperature": 0.0,
-        "response_format": {"type": "json_object"},
-    }
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-            "User-Agent": "Yggdrasil-Plutus/1.0",
-        },
-        method="POST",
+    resolved_gateway = gateway or get_default_ai_gateway()
+    request = AiTextRequest(
+        system_prompt=prompt,
+        user_prompt=f"Subject: {subject}\n\n{body[:4000]}",
+        model=None,
+        temperature=0.0,
+        timeout=20.0,
+        response_format_json=True,
     )
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            body_json = json.loads(resp.read().decode("utf-8"))
-            content = body_json["choices"][0]["message"]["content"].strip()
-            if content.startswith("```"):
-                content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-            parsed = json.loads(content)
-            return parsed if isinstance(parsed, dict) else None
-    except Exception as exc:
+        return resolved_gateway.complete_json(request).data
+    except AiConfigError:
+        return None
+    except AiGatewayError as exc:
         raise ConnectorUpstreamError(f"DBS alert LLM fallback failed: {exc}") from exc
+
+
+def _build_llm_fallback_parsed_alert(
+    *,
+    clean_subject: str,
+    cleaned_body: str,
+    combined: str,
+    ref_sgt_dt: datetime,
+    resolved_own_suffixes: set[str],
+    gateway: AiGateway | None = None,
+) -> ParsedDbsAlert:
+    """Invoke AI gateway fallback when regex parsing finds no amount and map fields."""
+    llm_data = _invoke_dbs_llm_fallback(clean_subject, cleaned_body, ref_sgt_dt, gateway=gateway)
+    if not llm_data or not llm_data.get("is_transaction") or not llm_data.get("amount"):
+        raise ValueError("Could not extract transaction amount from DBS alert email.")
+    raw_amount = abs(float(llm_data["amount"]))
+    currency = str(llm_data.get("currency") or "SGD").strip().upper()[:3]
+    direction = (
+        "credit" if str(llm_data.get("direction") or "").strip().lower() == "credit" else "debit"
+    )
+    signed_amount = raw_amount if direction == "credit" else -raw_amount
+    merchant = str(llm_data.get("merchant") or clean_subject or "DBS Transaction").strip()[:150]
+    raw_date = llm_data.get("transaction_date")
+    try:
+        tx_date = date.fromisoformat(str(raw_date)) if raw_date else ref_sgt_dt.date()
+    except ValueError:
+        tx_date = ref_sgt_dt.date()
+    tx_ref = re.sub(r"[^A-Za-z0-9_-]", "", str(llm_data.get("transaction_ref") or "").strip()) or None
+    account_hint = str(llm_data.get("account_hint") or "").strip()
+    is_self_transfer = bool(llm_data.get("is_transfer")) or any(
+        _text_matches_suffix(merchant, s, strict_marker=False) for s in resolved_own_suffixes
+    )
+    normalized = NormalizedTx(
+        transaction_date=tx_date,
+        amount=signed_amount,
+        currency=currency,
+        merchant=merchant,
+        category="Transfers" if is_self_transfer else "General",
+        raw_description=f"{clean_subject} | {cleaned_body[:240]}".strip(),
+        notes=f"dbs:{tx_ref}" if tx_ref else "dbs_email_alert",
+    )
+    return ParsedDbsAlert(
+        normalized=normalized,
+        account_hint=account_hint,
+        counterparty_hint=merchant,
+        direction=direction,
+        tx_ref=tx_ref,
+        cleaned_combined=combined,
+    )
+
+
+def _resolve_dbs_direction_and_hints(
+    fields: dict[str, str],
+    combined: str,
+    clean_subject: str,
+    cleaned_body: str,
+    resolved_own_suffixes: set[str],
+) -> tuple[str, str, str]:
+    """Resolve (direction, account_hint, counterparty) from structured or legacy fields."""
+    from_val = fields.get("from", "").strip()
+    to_val = fields.get("to", "").strip()
+    acct_val = fields.get("account", "").strip()
+    merchant_val = fields.get("merchant", "").strip()
+    has_credit_kw = bool(CREDIT_RE.search(combined))
+    has_debit_kw = bool(DEBIT_RE.search(combined))
+
+    if from_val and to_val:
+        from_is_own = _looks_like_own_account(from_val, resolved_own_suffixes)
+        to_is_own = _looks_like_own_account(to_val, resolved_own_suffixes)
+        if (has_credit_kw and not has_debit_kw) or (to_is_own and not from_is_own):
+            return "credit", to_val, from_val
+        return "debit", from_val, to_val
+    if from_val:
+        direction = "credit" if (has_credit_kw and not has_debit_kw) else "debit"
+        return direction, from_val, merchant_val or to_val or _extract_legacy_merchant(cleaned_body, clean_subject)
+    if to_val:
+        direction = "credit" if (has_credit_kw and not has_debit_kw) else "debit"
+        account_hint = acct_val or (to_val if direction == "credit" else "")
+        counterparty = merchant_val or (to_val if direction == "debit" else _extract_legacy_merchant(cleaned_body, clean_subject))
+        return direction, account_hint, counterparty
+    if acct_val or merchant_val:
+        direction = "credit" if (has_credit_kw and not has_debit_kw) else "debit"
+        return direction, acct_val or cleaned_body, merchant_val or _extract_legacy_merchant(cleaned_body, clean_subject)
+    return ("credit" if has_credit_kw else "debit"), cleaned_body, _extract_legacy_merchant(cleaned_body, clean_subject)
 
 
 def _collect_db_own_suffixes(db: Optional[Session]) -> set[str]:
@@ -321,6 +392,7 @@ def parse_dbs_alert_details(
     *,
     received_at: Optional[datetime] = None,
     own_suffixes: Optional[set[str]] = None,
+    gateway: AiGateway | None = None,
 ) -> ParsedDbsAlert:
     """Parse structured or legacy DBS alert emails with SGT timezone and self-transfer detection."""
     clean_subject, cleaned_body, ref_sgt_dt = extract_and_strip_forwarded_header(
@@ -336,108 +408,34 @@ def parse_dbs_alert_details(
 
     amt_res = _extract_amount_and_currency(fields.get("amount"), combined)
     if amt_res is None:
-        llm_data = _invoke_dbs_llm_fallback(clean_subject, cleaned_body, ref_sgt_dt)
-        if not llm_data or not llm_data.get("is_transaction") or not llm_data.get("amount"):
-            raise ValueError("Could not extract transaction amount from DBS alert email.")
-        raw_amount = abs(float(llm_data["amount"]))
-        currency = str(llm_data.get("currency") or "SGD").strip().upper()[:3]
-        direction = (
-            "credit"
-            if str(llm_data.get("direction") or "").strip().lower() == "credit"
-            else "debit"
-        )
-        signed_amount = raw_amount if direction == "credit" else -raw_amount
-        merchant = str(llm_data.get("merchant") or clean_subject or "DBS Transaction").strip()[:150]
-        raw_date = llm_data.get("transaction_date")
-        try:
-            tx_date = date.fromisoformat(str(raw_date)) if raw_date else ref_sgt_dt.date()
-        except ValueError:
-            tx_date = ref_sgt_dt.date()
-        tx_ref_raw = llm_data.get("transaction_ref")
-        tx_ref = re.sub(r"[^A-Za-z0-9_-]", "", str(tx_ref_raw or "").strip()) or None
-        account_hint = str(llm_data.get("account_hint") or "").strip()
-        is_self_transfer = bool(llm_data.get("is_transfer")) or any(
-            _text_matches_suffix(merchant, s, strict_marker=False) for s in resolved_own_suffixes
-        )
-        notes = f"dbs:{tx_ref}" if tx_ref else "dbs_email_alert"
-        normalized = NormalizedTx(
-            transaction_date=tx_date,
-            amount=signed_amount,
-            currency=currency,
-            merchant=merchant,
-            category="Transfers" if is_self_transfer else "General",
-            raw_description=f"{clean_subject} | {cleaned_body[:240]}".strip(),
-            notes=notes,
-        )
-        return ParsedDbsAlert(
-            normalized=normalized,
-            account_hint=account_hint,
-            counterparty_hint=merchant,
-            direction=direction,
-            tx_ref=tx_ref,
-            cleaned_combined=combined,
+        return _build_llm_fallback_parsed_alert(
+            clean_subject=clean_subject,
+            cleaned_body=cleaned_body,
+            combined=combined,
+            ref_sgt_dt=ref_sgt_dt,
+            resolved_own_suffixes=resolved_own_suffixes,
+            gateway=gateway,
         )
 
     raw_amount, currency = amt_res
-
-    from_val = fields.get("from", "").strip()
-    to_val = fields.get("to", "").strip()
-    acct_val = fields.get("account", "").strip()
-    merchant_val = fields.get("merchant", "").strip()
-
-    has_credit_kw = bool(CREDIT_RE.search(combined))
-    has_debit_kw = bool(DEBIT_RE.search(combined))
-
-    if from_val and to_val:
-        from_is_own = _looks_like_own_account(from_val, resolved_own_suffixes)
-        to_is_own = _looks_like_own_account(to_val, resolved_own_suffixes)
-        if (has_credit_kw and not has_debit_kw) or (to_is_own and not from_is_own):
-            direction = "credit"
-            account_hint = to_val
-            counterparty = from_val
-        else:
-            direction = "debit"
-            account_hint = from_val
-            counterparty = to_val
-    elif from_val:
-        direction = "credit" if (has_credit_kw and not has_debit_kw) else "debit"
-        account_hint = from_val
-        counterparty = merchant_val or to_val or _extract_legacy_merchant(cleaned_body, clean_subject)
-    elif to_val:
-        direction = "credit" if (has_credit_kw and not has_debit_kw) else "debit"
-        account_hint = acct_val or (to_val if direction == "credit" else "")
-        counterparty = merchant_val or (
-            to_val if direction == "debit" else _extract_legacy_merchant(cleaned_body, clean_subject)
-        )
-    elif acct_val or merchant_val:
-        direction = "credit" if (has_credit_kw and not has_debit_kw) else "debit"
-        account_hint = acct_val or cleaned_body
-        counterparty = merchant_val or _extract_legacy_merchant(cleaned_body, clean_subject)
-    else:
-        direction = "credit" if has_credit_kw else "debit"
-        account_hint = cleaned_body
-        counterparty = _extract_legacy_merchant(cleaned_body, clean_subject)
-
+    direction, account_hint, counterparty = _resolve_dbs_direction_and_hints(
+        fields, combined, clean_subject, cleaned_body, resolved_own_suffixes
+    )
     signed_amount = abs(raw_amount) if direction == "credit" else -abs(raw_amount)
-    date_source = fields.get("date_time") or cleaned_body
-    tx_date = _parse_alert_date(date_source, ref_sgt_dt)
-
+    tx_date = _parse_alert_date(fields.get("date_time") or cleaned_body, ref_sgt_dt)
     raw_ref = fields.get("tx_ref")
     tx_ref = re.sub(r"[^A-Za-z0-9_-]", "", raw_ref.strip()) if raw_ref else None
-    if tx_ref == "":
-        tx_ref = None
+    tx_ref = tx_ref or None
 
+    from_val, to_val = fields.get("from", "").strip(), fields.get("to", "").strip()
     merchant = (counterparty or clean_subject or "DBS Transaction").strip()[:150]
     is_self_transfer = any(
-        _text_matches_suffix(counterparty, s, strict_marker=False)
-        for s in resolved_own_suffixes
+        _text_matches_suffix(counterparty, s, strict_marker=False) for s in resolved_own_suffixes
     ) or (
         bool(from_val and to_val)
         and _looks_like_own_account(from_val, resolved_own_suffixes)
         and _looks_like_own_account(to_val, resolved_own_suffixes)
     )
-
-    notes = f"dbs:{tx_ref}" if tx_ref else "dbs_email_alert"
     normalized = NormalizedTx(
         transaction_date=tx_date,
         amount=signed_amount,
@@ -445,7 +443,7 @@ def parse_dbs_alert_details(
         merchant=merchant,
         category="Transfers" if is_self_transfer else "General",
         raw_description=f"{clean_subject} | {cleaned_body[:240]}".strip(),
-        notes=notes,
+        notes=f"dbs:{tx_ref}" if tx_ref else "dbs_email_alert",
     )
     return ParsedDbsAlert(
         normalized=normalized,
@@ -462,9 +460,12 @@ def parse_dbs_alert_text(
     text: str,
     *,
     received_at: Optional[datetime] = None,
+    gateway: AiGateway | None = None,
 ) -> NormalizedTx:
     """Parse amount, currency, merchant, and date from a DBS alert email."""
-    return parse_dbs_alert_details(subject, text, received_at=received_at).normalized
+    return parse_dbs_alert_details(
+        subject, text, received_at=received_at, gateway=gateway
+    ).normalized
 
 
 _DBS_PRODUCT_MATCHERS: tuple[tuple[tuple[str, ...], Callable[[Account], bool]], ...] = (
@@ -597,6 +598,7 @@ def ingest_dbs_alert(
     payload: DbsAlertPayload,
     *,
     received_at: Optional[datetime] = None,
+    gateway: AiGateway | None = None,
 ) -> DbsAlertResult:
     """Parse and commit a forwarded DBS alert email into Plutus."""
     db_own_suffixes = _collect_db_own_suffixes(db)
@@ -605,6 +607,7 @@ def ingest_dbs_alert(
         payload.text,
         received_at=received_at,
         own_suffixes=db_own_suffixes,
+        gateway=gateway,
     )
     normalized = parsed.normalized
     account = resolve_dbs_account(
@@ -616,7 +619,9 @@ def ingest_dbs_alert(
     )
 
     created_count, skipped_count, created_txs, matched_existing = (
-        ingest_normalized_transactions_detailed(db, account, [normalized])
+        ingest_normalized_transactions_detailed(
+            db, account, [normalized], gateway=gateway
+        )
     )
     if created_count == 0 and skipped_count > 0:
         matched_tx = matched_existing[0] if matched_existing else None

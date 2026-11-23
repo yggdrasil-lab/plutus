@@ -18,6 +18,7 @@ from app.config import settings
 from app.db import Base, get_db
 from app.main import app
 from app.models import Account, IngestedEmail, Product, Receipt, ReceiptItem, Transaction
+from app.services.ai_gateway import AiUpstreamError, InMemoryAiGateway, get_ai_gateway
 from app.services.category_taxonomy import ensure_default_categories
 from app.services.receipt_service import (
     MIN_PAYSLIP_PDF_BYTES,
@@ -31,24 +32,6 @@ from app.services.spending_projection import (
     expand_expense_lines,
     project_window,
 )
-
-
-class _FakeLlmResponse:
-    """Minimal context-manager mock for urllib.request.urlopen LLM calls."""
-
-    def __init__(self, content_obj: dict):
-        self._body = json.dumps(
-            {"choices": [{"message": {"content": json.dumps(content_obj)}}]}
-        ).encode("utf-8")
-
-    def read(self) -> bytes:
-        return self._body
-
-    def __enter__(self) -> "_FakeLlmResponse":
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> bool:
-        return False
 
 
 def _make_synthetic_pdf_bytes(size: int = 1024) -> bytes:
@@ -180,16 +163,10 @@ def test_payslip_email_pdf_ingests_skips_items_matches_inflow_and_hydrates_tx(
         "pay_period_label": "Nov 2026",
     }
 
-    recorded_llm_calls: list[tuple[dict, int]] = []
+    gateway = InMemoryAiGateway(text_responses=[llm_payslip_json])
+    app.dependency_overrides[get_ai_gateway] = lambda: gateway
 
-    def fake_urlopen(req, timeout=None):
-        recorded_llm_calls.append((json.loads(req.data.decode("utf-8")), timeout))
-        return _FakeLlmResponse(llm_payslip_json)
-
-    with (
-        patch("app.services.receipt_service.extract_pdf_text", return_value=extracted_pdf_text) as mock_pdf,
-        patch("app.services.receipt_service.urllib.request.urlopen", side_effect=fake_urlopen),
-    ):
+    with patch("app.services.receipt_service.extract_pdf_text", return_value=extracted_pdf_text) as mock_pdf:
         resp = client.post(
             "/integrations/email",
             json={
@@ -221,12 +198,12 @@ def test_payslip_email_pdf_ingests_skips_items_matches_inflow_and_hydrates_tx(
     assert body["receipt_ids"] == [rid]
     assert body["consumer_ref"] == f"receipt:{rid}"
 
-    assert len(recorded_llm_calls) == 1
-    llm_payload, llm_timeout = recorded_llm_calls[0]
-    assert llm_payload["model"] == settings.resolved_llm_model
-    assert llm_payload["response_format"] == {"type": "json_object"}
-    assert llm_timeout == 60
-    assert "Net Pay" in llm_payload["messages"][0]["content"]
+    assert len(gateway.text_requests) == 1
+    sent_req = gateway.text_requests[0]
+    assert sent_req.model == settings.resolved_llm_model
+    assert sent_req.response_format_json is True
+    assert sent_req.timeout == 60.0
+    assert "Net Pay" in sent_req.user_prompt
 
     rec = memory_db.get(Receipt, rid)
     assert rec is not None
@@ -474,48 +451,6 @@ def test_payslip_semantic_dedup_and_cross_document_type_isolation(
         "pay_period_label": "Nov 2026",
     }
 
-    with patch("app.services.receipt_service.parse_payslip_with_llm", return_value=parsed_slip):
-        first = client.post(
-            "/integrations/email",
-            json={
-                "email_id": 501,
-                "message_id": "<slip-dedup-1@acme.example>",
-                "route_target": "plutus_payslip",
-                "subject": "Payslip Nov",
-                "attachments": [
-                    {
-                        "filename": "payslip.pdf",
-                        "content_type": "application/pdf",
-                        "size_bytes": len(pdf_bytes),
-                        "content_base64": base64.b64encode(pdf_bytes).decode("ascii"),
-                    }
-                ],
-            },
-        )
-        second = client.post(
-            "/integrations/email",
-            json={
-                "email_id": 502,
-                "message_id": "<slip-dedup-2-reforward@acme.example>",
-                "route_target": "plutus_payslip",
-                "subject": "Fwd: Payslip Nov",
-                "attachments": [
-                    {
-                        "filename": "payslip.pdf",
-                        "content_type": "application/pdf",
-                        "size_bytes": len(pdf_bytes),
-                        "content_base64": base64.b64encode(pdf_bytes).decode("ascii"),
-                    }
-                ],
-            },
-        )
-
-    assert first.status_code == 200
-    assert second.status_code == 200
-    assert second.json()["receipt_id"] == first.json()["receipt_id"]
-    assert len(memory_db.scalars(select(Receipt)).all()) == 1
-
-    # Purchase receipt with matching merchant/date/amount/order_number must NOT collide with payslip
     purchase_orders = {
         "orders": [
             {
@@ -528,17 +463,63 @@ def test_payslip_semantic_dedup_and_cross_document_type_isolation(
             }
         ]
     }
-    with patch("app.services.receipt_service._invoke_receipt_llm", return_value=purchase_orders):
-        purchase = client.post(
-            "/integrations/email",
-            json={
-                "email_id": 503,
-                "message_id": "<purchase-same-amt@acme.example>",
-                "route_target": "plutus_purchase_receipt",
-                "subject": "Acme Invoice",
-                "text_body": "Acme Corp Invoice 4250.50 NZD",
-            },
-        )
+    gateway = InMemoryAiGateway(
+        vision_responses=[parsed_slip, parsed_slip],
+        text_responses=[purchase_orders],
+    )
+    app.dependency_overrides[get_ai_gateway] = lambda: gateway
+
+    first = client.post(
+        "/integrations/email",
+        json={
+            "email_id": 501,
+            "message_id": "<slip-dedup-1@acme.example>",
+            "route_target": "plutus_payslip",
+            "subject": "Payslip Nov",
+            "attachments": [
+                {
+                    "filename": "payslip.pdf",
+                    "content_type": "application/pdf",
+                    "size_bytes": len(pdf_bytes),
+                    "content_base64": base64.b64encode(pdf_bytes).decode("ascii"),
+                }
+            ],
+        },
+    )
+    second = client.post(
+        "/integrations/email",
+        json={
+            "email_id": 502,
+            "message_id": "<slip-dedup-2-reforward@acme.example>",
+            "route_target": "plutus_payslip",
+            "subject": "Fwd: Payslip Nov",
+            "attachments": [
+                {
+                    "filename": "payslip.pdf",
+                    "content_type": "application/pdf",
+                    "size_bytes": len(pdf_bytes),
+                    "content_base64": base64.b64encode(pdf_bytes).decode("ascii"),
+                }
+            ],
+        },
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json()["receipt_id"] == first.json()["receipt_id"]
+    assert len(memory_db.scalars(select(Receipt)).all()) == 1
+
+    # Purchase receipt with matching merchant/date/amount/order_number must NOT collide with payslip
+    purchase = client.post(
+        "/integrations/email",
+        json={
+            "email_id": 503,
+            "message_id": "<purchase-same-amt@acme.example>",
+            "route_target": "plutus_purchase_receipt",
+            "subject": "Acme Invoice",
+            "text_body": "Acme Corp Invoice 4250.50 NZD",
+        },
+    )
     assert purchase.status_code == 200
     assert purchase.json()["receipt_id"] != first.json()["receipt_id"]
     assert len(memory_db.scalars(select(Receipt)).all()) == 2
@@ -551,58 +532,53 @@ def test_payslip_vision_fallback_for_scanned_pdf_and_image_and_422_on_unparseabl
     """Scanned/empty-text PDFs and images route to vision LLM; unparseable payloads return 422."""
     raw_pdf = _make_synthetic_pdf_bytes(900)
     large_png = _make_large_png_bytes()
-    recorded: list[tuple[dict, int]] = []
+    vision_slip = {
+        "employer": "Acme Corp",
+        "pay_date": "2026-11-15",
+        "currency": "NZD",
+        "net_pay": 4250.50,
+        "tax_amount": 1180.25,
+        "pay_period_label": "Nov 2026",
+    }
+    gateway = InMemoryAiGateway(
+        vision_responses=[vision_slip, vision_slip],
+        text_responses=[{"employer": "", "net_pay": 0}],
+    )
+    app.dependency_overrides[get_ai_gateway] = lambda: gateway
 
-    def fake_urlopen(req, timeout=None):
-        recorded.append((json.loads(req.data.decode("utf-8")), timeout))
-        return _FakeLlmResponse(
-            {
-                "employer": "Acme Corp",
-                "pay_date": "2026-11-15",
-                "currency": "NZD",
-                "net_pay": 4250.50,
-                "tax_amount": 1180.25,
-                "pay_period_label": "Nov 2026",
-            }
-        )
-
-    # 1. Scanned PDF (extract_pdf_text == "") -> vision LLM with application/pdf data URI
-    with (
-        patch("app.services.receipt_service.extract_pdf_text", return_value=""),
-        patch("app.services.receipt_service.urllib.request.urlopen", side_effect=fake_urlopen),
-    ):
-        scanned = parse_payslip_with_llm(raw_pdf, "scanned.pdf", "application/pdf")
+    # 1. Scanned PDF (extract_pdf_text == "") -> vision LLM with application/pdf mime
+    with patch("app.services.receipt_service.extract_pdf_text", return_value=""):
+        scanned = parse_payslip_with_llm(raw_pdf, "scanned.pdf", "application/pdf", gateway=gateway)
     assert scanned is not None
     assert scanned["employer"] == "Acme Corp"
-    assert len(recorded) == 1
-    payload_pdf, timeout_pdf = recorded[0]
-    assert payload_pdf["model"] == settings.resolved_receipt_llm_model
-    assert timeout_pdf == 105
-    content_parts = payload_pdf["messages"][0]["content"]
-    assert content_parts[0]["text"] == PAYSLIP_PARSING_PROMPT
-    assert content_parts[1]["image_url"]["url"].startswith("data:application/pdf;base64,")
+    assert len(gateway.vision_requests) == 1
+    req_pdf = gateway.vision_requests[0]
+    assert req_pdf.model == settings.resolved_receipt_llm_model
+    assert req_pdf.timeout == 105.0
+    assert req_pdf.user_prompt == PAYSLIP_PARSING_PROMPT
+    assert req_pdf.image_mime_type == "application/pdf"
+    assert req_pdf.image_b64 == base64.b64encode(raw_pdf).decode("ascii")
 
     # 2. Image attachment -> vision LLM + WebP stored in DB
-    recorded.clear()
-    with patch("app.services.receipt_service.urllib.request.urlopen", side_effect=fake_urlopen):
-        img_resp = client.post(
-            "/integrations/email",
-            json={
-                "email_id": 601,
-                "message_id": "<payslip-img-1@acme.example>",
-                "route_target": "plutus_payslip",
-                "subject": "Payslip Image",
-                "attachments": [
-                    {
-                        "filename": "payslip.png",
-                        "content_type": "image/png",
-                        "size_bytes": len(large_png),
-                        "content_base64": base64.b64encode(large_png).decode("ascii"),
-                    }
-                ],
-            },
-        )
+    img_resp = client.post(
+        "/integrations/email",
+        json={
+            "email_id": 601,
+            "message_id": "<payslip-img-1@acme.example>",
+            "route_target": "plutus_payslip",
+            "subject": "Payslip Image",
+            "attachments": [
+                {
+                    "filename": "payslip.png",
+                    "content_type": "image/png",
+                    "size_bytes": len(large_png),
+                    "content_base64": base64.b64encode(large_png).decode("ascii"),
+                }
+            ],
+        },
+    )
     assert img_resp.status_code == 200
+    assert len(gateway.vision_requests) == 2
     img_rec = memory_db.get(Receipt, img_resp.json()["receipt_id"])
     assert img_rec.document_type == "payslip"
     assert img_rec.image_mime_type == "image/webp"
@@ -626,20 +602,16 @@ def test_payslip_vision_fallback_for_scanned_pdf_and_image_and_422_on_unparseabl
     assert audit is not None
     assert audit.status == "failed"
 
-    with patch(
-        "app.services.receipt_service.parse_payslip_text_with_llm",
-        return_value={"employer": "", "net_pay": 0},
-    ):
-        fail_invalid = client.post(
-            "/integrations/email",
-            json={
-                "email_id": 603,
-                "message_id": "<payslip-fail-2@acme.example>",
-                "route_target": "plutus_payslip",
-                "subject": "Invalid values",
-                "text_body": "Payslip notification without valid numbers",
-            },
-        )
+    fail_invalid = client.post(
+        "/integrations/email",
+        json={
+            "email_id": 603,
+            "message_id": "<payslip-fail-2@acme.example>",
+            "route_target": "plutus_payslip",
+            "subject": "Invalid values",
+            "text_body": "Payslip notification without valid numbers",
+        },
+    )
     assert fail_invalid.status_code == 422
 
     # 4. Invalid document_type in ReceiptCreate -> 422
@@ -720,10 +692,15 @@ def test_payslip_reprocess_and_spending_projection_isolation(
         "tax_amount": 1180.25,
         "pay_period_label": "Nov 2026",
     }
-    with patch("app.routers.receipts.parse_payslip_with_llm", return_value=reprocessed_json):
-        re_res = client.post(f"/receipts/{stored_slip.id}/reprocess")
+    gateway = InMemoryAiGateway(
+        vision_responses=[reprocessed_json],
+        text_responses=[reprocessed_json],
+    )
+    app.dependency_overrides[get_ai_gateway] = lambda: gateway
+    re_res = client.post(f"/receipts/{stored_slip.id}/reprocess")
 
     assert re_res.status_code == 200
+    assert len(gateway.vision_requests) == 1
     re_body = re_res.json()
     assert re_body["document_type"] == "payslip"
     assert re_body["merchant"] == "Acme Corp"
@@ -751,24 +728,20 @@ def test_payslip_reprocess_and_spending_projection_isolation(
     assert after_proj.categories == before_proj.categories
 
     # Also verify parse_payslip_text_with_llm contract directly
-    recorded_direct: list[tuple[dict, int]] = []
-
-    def fake_urlopen_direct(req, timeout=None):
-        recorded_direct.append((json.loads(req.data.decode("utf-8")), timeout))
-        return _FakeLlmResponse(reprocessed_json)
-
-    with patch("app.services.receipt_service.urllib.request.urlopen", side_effect=fake_urlopen_direct):
-        direct_out = parse_payslip_text_with_llm("Acme Corp Net Pay 4250.50 NZD", raise_on_error=True)
+    direct_out = parse_payslip_text_with_llm(
+        "Acme Corp Net Pay 4250.50 NZD", raise_on_error=True, gateway=gateway
+    )
     assert direct_out["employer"] == "Acme Corp"
-    assert recorded_direct[0][1] == 60
-    assert recorded_direct[0][0]["response_format"] == {"type": "json_object"}
+    assert len(gateway.text_requests) == 1
+    assert gateway.text_requests[0].timeout == 60.0
+    assert gateway.text_requests[0].response_format_json is True
 
 
 def test_payslip_body_fallback_retains_pdf_and_forwarded_date_when_attachment_parse_fails(
     memory_db: Session,
     client: TestClient,
 ) -> None:
-    """When attachment parsing returns None, email body fallback keeps the PDF attachment and forwarded Date."""
+    """When attachment parsing fails, email body fallback keeps the PDF attachment and forwarded Date."""
     raw_pdf = _make_synthetic_pdf_bytes(900)
     body_parsed = {
         "employer": "Northwind Payroll",
@@ -778,36 +751,39 @@ def test_payslip_body_fallback_retains_pdf_and_forwarded_date_when_attachment_pa
         "tax_amount": 610.00,
         "pay_period_label": "Fortnight 22",
     }
-    with (
-        patch("app.services.receipt_service.parse_payslip_with_llm", return_value=None),
-        patch("app.services.receipt_service.parse_payslip_text_with_llm", return_value=body_parsed),
-    ):
-        resp = client.post(
-            "/integrations/email",
-            json={
-                "email_id": 701,
-                "message_id": "<payslip-body-fallback-1@acme.example>",
-                "route_target": "plutus_payslip",
-                "subject": "Fwd: Payslip Advice",
-                "text_body": (
-                    "---------- Forwarded message ---------\n"
-                    "From: Payroll <payroll@northwind.example>\n"
-                    "Date: Fri, Nov 13, 2026 at 9:00 AM\n"
-                    "Subject: Payslip Advice\n\n"
-                    "Northwind Payroll Net Pay NZD 2850.00"
-                ),
-                "attachments": [
-                    {
-                        "filename": "advice.pdf",
-                        "content_type": "application/pdf",
-                        "size_bytes": len(raw_pdf),
-                        "content_base64": base64.b64encode(raw_pdf).decode("ascii"),
-                    }
-                ],
-            },
-        )
+    gateway = InMemoryAiGateway(
+        vision_responses=[AiUpstreamError("Vision unavailable", status_code=503)],
+        text_responses=[body_parsed],
+    )
+    app.dependency_overrides[get_ai_gateway] = lambda: gateway
+    resp = client.post(
+        "/integrations/email",
+        json={
+            "email_id": 701,
+            "message_id": "<payslip-body-fallback-1@acme.example>",
+            "route_target": "plutus_payslip",
+            "subject": "Fwd: Payslip Advice",
+            "text_body": (
+                "---------- Forwarded message ---------\n"
+                "From: Payroll <payroll@northwind.example>\n"
+                "Date: Fri, Nov 13, 2026 at 9:00 AM\n"
+                "Subject: Payslip Advice\n\n"
+                "Northwind Payroll Net Pay NZD 2850.00"
+            ),
+            "attachments": [
+                {
+                    "filename": "advice.pdf",
+                    "content_type": "application/pdf",
+                    "size_bytes": len(raw_pdf),
+                    "content_base64": base64.b64encode(raw_pdf).decode("ascii"),
+                }
+            ],
+        },
+    )
 
     assert resp.status_code == 200
+    assert len(gateway.vision_requests) == 1
+    assert len(gateway.text_requests) == 1
     rid = resp.json()["receipt_id"]
     rec = memory_db.get(Receipt, rid)
     assert rec is not None
@@ -840,43 +816,42 @@ def test_payslip_semantic_dedup_does_not_collide_across_months_with_generic_peri
         "pay_date": "2026-11-15",
     }
 
-    with patch("app.services.receipt_service.parse_payslip_with_llm", return_value=oct_slip):
-        first = client.post(
-            "/integrations/email",
-            json={
-                "email_id": 801,
-                "message_id": "<slip-oct-generic@acme.example>",
-                "route_target": "plutus_payslip",
-                "subject": "Payslip Oct",
-                "attachments": [
-                    {
-                        "filename": "payslip.pdf",
-                        "content_type": "application/pdf",
-                        "size_bytes": len(pdf_bytes),
-                        "content_base64": base64.b64encode(pdf_bytes).decode("ascii"),
-                    }
-                ],
-            },
-        )
-
-    with patch("app.services.receipt_service.parse_payslip_with_llm", return_value=nov_slip):
-        second = client.post(
-            "/integrations/email",
-            json={
-                "email_id": 802,
-                "message_id": "<slip-nov-generic@acme.example>",
-                "route_target": "plutus_payslip",
-                "subject": "Payslip Nov",
-                "attachments": [
-                    {
-                        "filename": "payslip.pdf",
-                        "content_type": "application/pdf",
-                        "size_bytes": len(pdf_bytes),
-                        "content_base64": base64.b64encode(pdf_bytes).decode("ascii"),
-                    }
-                ],
-            },
-        )
+    gateway = InMemoryAiGateway(vision_responses=[oct_slip, nov_slip])
+    app.dependency_overrides[get_ai_gateway] = lambda: gateway
+    first = client.post(
+        "/integrations/email",
+        json={
+            "email_id": 801,
+            "message_id": "<slip-oct-generic@acme.example>",
+            "route_target": "plutus_payslip",
+            "subject": "Payslip Oct",
+            "attachments": [
+                {
+                    "filename": "payslip.pdf",
+                    "content_type": "application/pdf",
+                    "size_bytes": len(pdf_bytes),
+                    "content_base64": base64.b64encode(pdf_bytes).decode("ascii"),
+                }
+            ],
+        },
+    )
+    second = client.post(
+        "/integrations/email",
+        json={
+            "email_id": 802,
+            "message_id": "<slip-nov-generic@acme.example>",
+            "route_target": "plutus_payslip",
+            "subject": "Payslip Nov",
+            "attachments": [
+                {
+                    "filename": "payslip.pdf",
+                    "content_type": "application/pdf",
+                    "size_bytes": len(pdf_bytes),
+                    "content_base64": base64.b64encode(pdf_bytes).decode("ascii"),
+                }
+            ],
+        },
+    )
 
     assert first.status_code == 200
     assert second.status_code == 200

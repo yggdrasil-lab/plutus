@@ -246,6 +246,7 @@ class TestMuninnHttpAdapter(unittest.TestCase):
         clock = FakeClock(50.0)
         calls = 0
         fail_jev = True
+        fail_text = False
 
         def handler(request: httpx.Request) -> httpx.Response:
             nonlocal calls
@@ -258,6 +259,8 @@ class TestMuninnHttpAdapter(unittest.TestCase):
                     200,
                     json={"choices": [{"message": {"content": '{"category": "Groceries"}'}}]},
                 )
+            if fail_text:
+                return httpx.Response(500, text="text upstream error")
             return httpx.Response(
                 200,
                 json={"choices": [{"message": {"content": '{"ok": true}'}}]},
@@ -265,22 +268,26 @@ class TestMuninnHttpAdapter(unittest.TestCase):
 
         adapter = self._build_adapter(handler, clock=clock)
 
-        # Text failures must NOT trip the Jev breaker
-        with self.assertRaises(AiUpstreamError):
-            self._build_adapter(lambda _r: httpx.Response(500)).complete_json(AiTextRequest(user_prompt="x"))
+        # 3 consecutive text failures on adapter itself must NOT trip the Jev breaker
+        fail_text = True
+        for _ in range(3):
+            with self.assertRaises(AiUpstreamError):
+                adapter.complete_json(AiTextRequest(user_prompt="x"))
         self.assertFalse(adapter.is_jev_circuit_open())
+        self.assertEqual(calls, 3)
+        fail_text = False
 
         # 3 consecutive Jev failures open the circuit
         for _ in range(3):
             with self.assertRaises(AiUpstreamError):
                 adapter.call_jev_gate(JevGateRequest(system_prompt="sys", user_content="user"))
         self.assertTrue(adapter.is_jev_circuit_open())
-        self.assertEqual(calls, 3)
+        self.assertEqual(calls, 6)
 
         # 4th Jev call fails fast with AiCircuitOpenError and zero HTTP traffic
         with self.assertRaises(AiCircuitOpenError):
             adapter.call_jev_gate(JevGateRequest(system_prompt="sys", user_content="user"))
-        self.assertEqual(calls, 3)
+        self.assertEqual(calls, 6)
 
         # Text and vision completions continue working while Jev breaker is open
         text_res = adapter.complete_json(AiTextRequest(user_prompt="runway"))
@@ -289,7 +296,7 @@ class TestMuninnHttpAdapter(unittest.TestCase):
         )
         self.assertEqual(text_res.data, {"ok": True})
         self.assertEqual(vision_res.data, {"ok": True})
-        self.assertEqual(calls, 5)
+        self.assertEqual(calls, 8)
         self.assertTrue(adapter.is_jev_circuit_open())
 
         # Advance clock past 60s cooldown -> probe succeeds and resets circuit

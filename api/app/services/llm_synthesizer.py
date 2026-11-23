@@ -18,6 +18,8 @@ import json
 import logging
 from typing import Any, Optional
 
+from pydantic import ValidationError
+
 from app.schemas import RunwayAiSynthesisRead
 from app.services.ai_gateway import (
     AiGateway,
@@ -127,9 +129,9 @@ def synthesize_runway_scenario_llm(
     try:
         response = resolved_gateway.complete_json(request)
         return _build_llm_synthesis_read(response.data, metrics)
-    except AiGatewayError as exc:
+    except (AiGatewayError, ValidationError) as exc:
         logger.warning(
-            "LLM runway synthesis failed or timed out (%s); falling back to deterministic synthesis",
+            "LLM runway synthesis failed or returned invalid schema (%s); falling back to deterministic synthesis",
             exc,
         )
         return synthesize_runway_deterministic(

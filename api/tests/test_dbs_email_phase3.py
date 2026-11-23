@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
@@ -20,6 +20,7 @@ from app.db import Base, get_db
 from app.main import app
 from app.models import Account, IngestedEmail, Receipt, Transaction
 from app.schemas import DbsAlertPayload
+from app.services.ai_gateway import AiUpstreamError, InMemoryAiGateway, get_ai_gateway
 from app.services.connectors.dbs_email import (
     EXPLICIT_SUFFIX_RE,
     _text_matches_suffix,
@@ -108,6 +109,7 @@ class TestDbsEmailPhase3(unittest.TestCase):
         settings.webhook_secret = self._orig_webhook_secret
         settings.environment = self._orig_env
         app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides.pop(get_ai_gateway, None)
         self.db.close()
         Base.metadata.drop_all(bind=engine)
 
@@ -314,46 +316,36 @@ class TestDbsEmailPhase3(unittest.TestCase):
         self.assertEqual(card_tx.notes, "dbs:CC20261110001")
 
     def test_unfamiliar_dbs_template_uses_llm_fallback_and_handles_failures(self):
-        settings.llm_api_key = "test-muninn-key"
-
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = json.dumps(
-            {
-                "choices": [
-                    {
-                        "message": {
-                            "content": json.dumps(
-                                {
-                                    "is_transaction": True,
-                                    "amount": 88.50,
-                                    "currency": "SGD",
-                                    "direction": "debit",
-                                    "merchant": "FAIRPRICE XTRA",
-                                    "transaction_date": "2026-11-14",
-                                    "account_hint": "DBS Live Fresh Visa ending 4444",
-                                    "transaction_ref": "LLM998877",
-                                    "is_transfer": False,
-                                }
-                            )
-                        }
-                    }
-                ]
-            }
-        ).encode("utf-8")
-        mock_resp.__enter__.return_value = mock_resp
-        mock_resp.__exit__.return_value = False
-
-        with patch("app.services.connectors.dbs_email.urllib.request.urlopen", return_value=mock_resp):
-            ok = self.client.post(
-                "/integrations/email",
-                json={
-                    "email_id": 104,
-                    "message_id": "<unfamiliar-dbs-1@example.com>",
-                    "route_target": "plutus_dbs_alert",
-                    "subject": "DBS Notification",
-                    "text_body": "Unstructured notice for eighty-eight fifty at FairPrice.",
+        gateway = InMemoryAiGateway(
+            text_responses=[
+                {
+                    "is_transaction": True,
+                    "amount": 88.50,
+                    "currency": "SGD",
+                    "direction": "debit",
+                    "merchant": "FAIRPRICE XTRA",
+                    "transaction_date": "2026-11-14",
+                    "account_hint": "DBS Live Fresh Visa ending 4444",
+                    "transaction_ref": "LLM998877",
+                    "is_transfer": False,
                 },
-            )
+                {"is_transaction": False, "amount": None},
+                AiUpstreamError("Muninn unavailable", status_code=503),
+            ],
+            jev_handler=lambda _req: '{"category": "Groceries", "is_anomaly": false, "primary_tag": "none"}',
+        )
+        app.dependency_overrides[get_ai_gateway] = lambda: gateway
+
+        ok = self.client.post(
+            "/integrations/email",
+            json={
+                "email_id": 104,
+                "message_id": "<unfamiliar-dbs-1@example.com>",
+                "route_target": "plutus_dbs_alert",
+                "subject": "DBS Notification",
+                "text_body": "Unstructured notice for eighty-eight fifty at FairPrice.",
+            },
+        )
         self.assertEqual(ok.status_code, 200)
         tx = self.db.get(Transaction, ok.json()["transaction_id"])
         self.assertEqual(tx.account_id, self.acc_card.id)
@@ -362,30 +354,42 @@ class TestDbsEmailPhase3(unittest.TestCase):
         self.assertEqual(tx.notes, "dbs:LLM998877")
 
         # Non-transaction LLM response -> 422 + failed IngestedEmail row
-        otp_resp = MagicMock()
-        otp_resp.read.return_value = json.dumps(
-            {"choices": [{"message": {"content": json.dumps({"is_transaction": False, "amount": None})}}]}
-        ).encode("utf-8")
-        otp_resp.__enter__.return_value = otp_resp
-        otp_resp.__exit__.return_value = False
-
-        with patch("app.services.connectors.dbs_email.urllib.request.urlopen", return_value=otp_resp):
-            bad = self.client.post(
-                "/integrations/email",
-                json={
-                    "email_id": 105,
-                    "message_id": "<unparseable-otp@example.com>",
-                    "route_target": "plutus_dbs_alert",
-                    "subject": "Security Notice",
-                    "text_body": "Your verification code has expired.",
-                },
-            )
+        bad = self.client.post(
+            "/integrations/email",
+            json={
+                "email_id": 105,
+                "message_id": "<unparseable-otp@example.com>",
+                "route_target": "plutus_dbs_alert",
+                "subject": "Security Notice",
+                "text_body": "Your verification code has expired.",
+            },
+        )
         self.assertEqual(bad.status_code, 422)
+        self.assertEqual(len(gateway.text_requests), 2)
+        self.assertEqual(gateway.text_requests[0].timeout, 20.0)
         failed_row = self.db.scalar(
             select(IngestedEmail).where(IngestedEmail.message_id == "<unparseable-otp@example.com>")
         )
         self.assertIsNotNone(failed_row)
         self.assertEqual(failed_row.status, "failed")
+
+        # Gateway upstream outage -> 503 + failed IngestedEmail row
+        outage = self.client.post(
+            "/integrations/email",
+            json={
+                "email_id": 106,
+                "message_id": "<upstream-outage@example.com>",
+                "route_target": "plutus_dbs_alert",
+                "subject": "DBS Notification",
+                "text_body": "Unstructured notice while Muninn is down.",
+            },
+        )
+        self.assertEqual(outage.status_code, 503)
+        outage_row = self.db.scalar(
+            select(IngestedEmail).where(IngestedEmail.message_id == "<upstream-outage@example.com>")
+        )
+        self.assertIsNotNone(outage_row)
+        self.assertEqual(outage_row.status, "failed")
 
     def test_text_matches_suffix_matrix_and_no_filler_word_capture(self):
         positive_cases = [
@@ -467,21 +471,21 @@ class TestDbsEmailPhase3(unittest.TestCase):
             "*To: *DBS CASHLINE (Ref ending 2002)\n"
         )
 
-        with patch(
-            "app.services.ingestion_service.classify_transaction_jev_with_tags",
-            return_value=("General", False, []),
-        ):
-            resp = self.client.post(
-                "/integrations/email",
-                json={
-                    "email_id": 3,
-                    "message_id": "<synthetic-email-3@example.com>",
-                    "route_target": "plutus_dbs_alert",
-                    "subject": "Fwd: DBS digibank Alert",
-                    "received_at": "2026-10-27T11:00:00Z",
-                    "text_body": email3_body,
-                },
-            )
+        gateway = InMemoryAiGateway(
+            jev_handler=lambda _req: '{"category": "General", "is_anomaly": false, "primary_tag": "none"}'
+        )
+        app.dependency_overrides[get_ai_gateway] = lambda: gateway
+        resp = self.client.post(
+            "/integrations/email",
+            json={
+                "email_id": 3,
+                "message_id": "<synthetic-email-3@example.com>",
+                "route_target": "plutus_dbs_alert",
+                "subject": "Fwd: DBS digibank Alert",
+                "received_at": "2026-10-27T11:00:00Z",
+                "text_body": email3_body,
+            },
+        )
 
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
@@ -527,24 +531,24 @@ class TestDbsEmailPhase3(unittest.TestCase):
         )
         self.assertEqual(resolved.id, self.acc_savings.id)
 
-        with patch(
-            "app.services.ingestion_service.classify_transaction_jev_with_tags",
-            return_value=("General", False, []),
-        ):
-            result = ingest_dbs_alert(
-                self.db,
-                DbsAlertPayload(
-                    subject="DBS digibank Alert",
-                    text=(
-                        "Transaction Ref: 8877665544\n"
-                        "Date & Time: 27 Oct 19:02 (SGT)\n"
-                        "Amount: SGD 117.78\n"
-                        "From: DBS Multiplier Account\n"
-                        "To: DBS CASHLINE (Ref ending 2002)\n"
-                    ),
+        gateway = InMemoryAiGateway(
+            jev_handler=lambda _req: '{"category": "General", "is_anomaly": false, "primary_tag": "none"}'
+        )
+        result = ingest_dbs_alert(
+            self.db,
+            DbsAlertPayload(
+                subject="DBS digibank Alert",
+                text=(
+                    "Transaction Ref: 8877665544\n"
+                    "Date & Time: 27 Oct 19:02 (SGT)\n"
+                    "Amount: SGD 117.78\n"
+                    "From: DBS Multiplier Account\n"
+                    "To: DBS CASHLINE (Ref ending 2002)\n"
                 ),
-                received_at=datetime(2026, 10, 27, 11, 5, tzinfo=timezone.utc),
-            )
+            ),
+            received_at=datetime(2026, 10, 27, 11, 5, tzinfo=timezone.utc),
+            gateway=gateway,
+        )
         self.assertEqual(result.status, "created")
         self.assertIsNotNone(result.transaction)
         self.assertEqual(result.transaction.account_id, self.acc_savings.id)
@@ -620,21 +624,21 @@ class TestDbsEmailPhase3(unittest.TestCase):
         self.assertEqual(parsed.account_hint, "Your DBS/ POSB account ending 1001")
         self.assertEqual(parsed.normalized.notes, "dbs:TW00000000000011223344C120630614240")
 
-        with patch(
-            "app.services.ingestion_service.classify_transaction_jev_with_tags",
-            return_value=("Income", False, []),
-        ):
-            resp = self.client.post(
-                "/integrations/email",
-                json={
-                    "email_id": 4,
-                    "message_id": "<synthetic-email-4@example.com>",
-                    "route_target": "plutus_dbs_alert",
-                    "subject": "Fwd: PayNow Transfer Alert",
-                    "received_at": "2026-10-27T11:00:00Z",
-                    "text_body": email4_body,
-                },
-            )
+        gateway = InMemoryAiGateway(
+            jev_handler=lambda _req: '{"category": "Income", "is_anomaly": false, "primary_tag": "none"}'
+        )
+        app.dependency_overrides[get_ai_gateway] = lambda: gateway
+        resp = self.client.post(
+            "/integrations/email",
+            json={
+                "email_id": 4,
+                "message_id": "<synthetic-email-4@example.com>",
+                "route_target": "plutus_dbs_alert",
+                "subject": "Fwd: PayNow Transfer Alert",
+                "received_at": "2026-10-27T11:00:00Z",
+                "text_body": email4_body,
+            },
+        )
 
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["transaction_id"], existing_tx.id)
@@ -685,21 +689,21 @@ class TestDbsEmailPhase3(unittest.TestCase):
             "To: Alex Tan A/C ending 4004\n"
         )
 
-        with patch(
-            "app.services.ingestion_service.classify_transaction_jev_with_tags",
-            return_value=("General", False, []),
-        ):
-            resp = self.client.post(
-                "/integrations/email",
-                json={
-                    "email_id": 2,
-                    "message_id": "<synthetic-email-2@example.com>",
-                    "route_target": "plutus_dbs_alert",
-                    "subject": "Fwd: DBS digibank Alert",
-                    "received_at": "2026-11-06T07:17:00Z",
-                    "text_body": email2_body,
-                },
-            )
+        gateway = InMemoryAiGateway(
+            jev_handler=lambda _req: '{"category": "General", "is_anomaly": false, "primary_tag": "none"}'
+        )
+        app.dependency_overrides[get_ai_gateway] = lambda: gateway
+        resp = self.client.post(
+            "/integrations/email",
+            json={
+                "email_id": 2,
+                "message_id": "<synthetic-email-2@example.com>",
+                "route_target": "plutus_dbs_alert",
+                "subject": "Fwd: DBS digibank Alert",
+                "received_at": "2026-11-06T07:17:00Z",
+                "text_body": email2_body,
+            },
+        )
 
         self.assertEqual(resp.status_code, 200)
         tx = self.db.get(Transaction, resp.json()["transaction_id"])
