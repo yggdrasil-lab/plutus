@@ -24,6 +24,7 @@ from app.models import (
     Receipt,
     ReceiptItem,
     Transaction,
+    TransactionSplit,
 )
 from app.services.connectors.akahu import normalize_existing_legacy_categories
 from app.services.receipt_service import classify_line_item
@@ -526,6 +527,63 @@ class TestCategoriesRouterAndHierarchy(unittest.TestCase):
         self.assertEqual(auto_categorize("Super Liquor"), "Alcohol")
         self.assertEqual(classify_line_item("Copper & Oak Pant")[0], "Clothing")
         self.assertEqual(classify_line_item("Tefal Nonstick Frypan")[0], "Household")
+
+    def test_http_contract_schema_fields_and_error_mapping(self):
+        cats = self.client.get("/categories").json()
+        expected_fields = {
+            "id",
+            "name",
+            "parent_id",
+            "parent_name",
+            "is_system",
+            "is_active",
+            "amortize_period",
+            "sort_order",
+            "transaction_count",
+            "rule_count",
+            "child_count",
+            "has_budget_rule",
+            "budget_period",
+            "weekly_limit",
+            "monthly_limit",
+            "annual_limit",
+        }
+        self.assertEqual(set(cats[0].keys()), expected_fields)
+        self.assertEqual(self.client.patch("/categories/999999", json={"name": "Nope"}).status_code, 404)
+        self.assertEqual(self.client.delete("/categories/999999").status_code, 404)
+        self.assertEqual(self.client.post("/categories", json={"name": "Ghost", "parent_id": 999999}).status_code, 404)
+        self.assertEqual(self.client.post("/categories", json={"name": "FOOD"}).status_code, 409)
+        self.assertEqual(
+            self.client.post("/categories", json={"name": "Transfers", "amortize_period": "annual"}).status_code,
+            400,
+        )
+
+    def test_http_delete_reports_splits_reassigned(self):
+        cats = self.client.get("/categories").json()
+        food_id = next(c["id"] for c in cats if c["name"] == "Food")
+        created = self.client.post("/categories", json={"name": "Snacks", "parent_id": food_id}).json()
+        parent_tx = Transaction(
+            transaction_date=date.today(),
+            account_id=self.acc.id,
+            amount=-20.0,
+            currency="NZD",
+            merchant="Corner Dairy",
+            category="General",
+            raw_hash="http-split-del",
+        )
+        self.db.add(parent_tx)
+        self.db.flush()
+        split = TransactionSplit(transaction_id=parent_tx.id, amount=-12.0, category="Snacks")
+        self.db.add(split)
+        self.db.commit()
+
+        del_res = self.client.delete(f"/categories/{created['id']}")
+        self.assertEqual(del_res.status_code, 200)
+        body = del_res.json()
+        self.assertEqual(body["splits_reassigned"], 1)
+        self.assertEqual(body["reassigned_to"], "Food")
+        self.db.expire_all()
+        self.assertEqual(self.db.get(TransactionSplit, split.id).category, "Food")
 
 
 if __name__ == "__main__":

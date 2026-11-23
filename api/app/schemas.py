@@ -429,6 +429,7 @@ class CategoryDeleteResult(BaseModel):
     deleted_name: str
     reassigned_to: str
     transactions_reassigned: int
+    splits_reassigned: int = 0
     rules_reassigned: int
     receipt_items_reassigned: int
     products_reassigned: int
