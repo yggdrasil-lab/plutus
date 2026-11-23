@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Optional
 
@@ -91,8 +92,23 @@ SYSTEM_CATEGORY_NAMES_LOWER: frozenset[str] = frozenset(
     name.lower() for name in SYSTEM_CATEGORY_NAMES
 )
 _NON_EXPENSE_SYSTEM_LOWER: frozenset[str] = frozenset({"transfers", "transfer", "income"})
+_EXCLUDED_ACTIVE_CATEGORIES_LOWER: frozenset[str] = frozenset(
+    {"transfers", "transfer", "income", "general"}
+)
 _VALID_AMORTIZE_PERIODS: frozenset[str] = frozenset({"annual"})
+VALID_BUDGET_PERIODS: frozenset[str] = frozenset({"weekly", "monthly", "annual"})
 _MAX_CATEGORY_NAME_LENGTH = 50
+
+
+@dataclass(frozen=True)
+class AnnualCategoryTaxonomy:
+    """Detached immutable hierarchy, display names, and annual amortization sets."""
+
+    parent_map: Mapping[str, str]
+    lower_to_parent: Mapping[str, str]
+    canonical_name_map: Mapping[str, str]
+    annual_cats: frozenset[str]
+    annual_base_roots: frozenset[str]
 
 
 @dataclass(frozen=True)
@@ -209,5 +225,17 @@ def normalize_amortize_setting(value: Optional[str]) -> Optional[str]:
     if cleaned not in _VALID_AMORTIZE_PERIODS:
         raise CategoryValidationError(
             f"Unsupported amortize_period '{value}'. Must be 'annual' or null."
+        )
+    return cleaned
+
+
+def normalize_budget_period_setting(value: Optional[str]) -> str:
+    """Validate and normalize a budget rule cadence ('weekly', 'monthly', or 'annual')."""
+    cleaned = (value or "monthly").strip().lower()
+    if not cleaned:
+        return "monthly"
+    if cleaned not in VALID_BUDGET_PERIODS:
+        raise CategoryValidationError(
+            f"Unsupported budget_period '{value}'. Must be 'weekly', 'monthly', or 'annual'."
         )
     return cleaned

@@ -16,10 +16,10 @@ from app.schemas import (
     RunwayTierBreakdown,
 )
 from app.services.burn_service import (
-    get_active_categories,
     get_latest_account_balances,
     resolve_tier_labels,
 )
+from app.services.category_taxonomy import get_active_categories
 from app.services.llm_synthesizer import synthesize_runway_scenario_llm
 from app.services.loan_service import load_loans_with_transactions, summarize_loans
 from app.services.runway import (

@@ -8,7 +8,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.models import BudgetRule, Category
+from app.models import BudgetRule
 from app.schemas import (
     AverageBurnReportResponse,
     BudgetRuleCreate,
@@ -17,6 +17,11 @@ from app.schemas import (
     CategorySpendingReport,
     RecurringCommitmentRead,
     SpendingBreakdownResponse,
+)
+from app.services.category_taxonomy import (
+    CategoryTaxonomyError,
+    resolve_budget_rule_period,
+    sync_budget_rule_amortization,
 )
 from app.services.spending_projection import (
     MIN_SIGNIFICANT_WEEKLY_BURN_NZD,
@@ -75,59 +80,109 @@ def list_budget_rules(
     return db.scalars(stmt.order_by(BudgetRule.category)).all()
 
 
+def _save_budget_rule_record(
+    db: Session,
+    *,
+    existing: Optional[BudgetRule],
+    category: str,
+    weekly_limit: float,
+    monthly_limit: float,
+    budget_period: str,
+    is_active: bool,
+) -> BudgetRule:
+    """Persist a created or updated BudgetRule with canonical category casing."""
+    if existing:
+        existing.category = category
+        existing.weekly_limit = weekly_limit
+        existing.monthly_limit = monthly_limit
+        existing.budget_period = budget_period
+        existing.is_active = is_active
+        db.commit()
+        db.refresh(existing)
+        return existing
+
+    new_rule = BudgetRule(
+        category=category,
+        weekly_limit=weekly_limit,
+        monthly_limit=monthly_limit,
+        budget_period=budget_period,
+        is_active=is_active,
+    )
+    db.add(new_rule)
+    db.commit()
+    db.refresh(new_rule)
+    return new_rule
+
+
+def _sync_budget_or_400(
+    db: Session,
+    *,
+    category_name: str,
+    is_active: bool,
+    explicit_period: Optional[str] = None,
+    existing_period: Optional[str] = None,
+    existing_is_active: bool = True,
+    annual_limit_only: bool = False,
+) -> tuple[str, str]:
+    """Resolve budget cadence and sync taxonomy amortization, mapping domain errors to HTTP 400."""
+    try:
+        resolved_period = resolve_budget_rule_period(
+            db,
+            category_name,
+            explicit_period=explicit_period,
+            existing_period=existing_period,
+            existing_is_active=existing_is_active,
+            annual_limit_only=annual_limit_only,
+        )
+        canonical_cat = sync_budget_rule_amortization(
+            db,
+            category_name=category_name,
+            budget_period=resolved_period,
+            is_active=is_active,
+        )
+    except CategoryTaxonomyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return canonical_cat, resolved_period
+
+
 @router.post("", response_model=BudgetRuleRead, status_code=status.HTTP_200_OK)
 def upsert_budget_rule(
     payload: BudgetRuleCreate,
     db: Session = Depends(get_db),
 ):
     """Create or update a spending target budget (weekly, monthly, or annual) for a category."""
-    cat = payload.category.strip()
-    if not cat:
+    cleaned = payload.category.strip()
+    if not cleaned:
         raise HTTPException(status_code=400, detail="Category name cannot be empty")
-
     weekly, monthly = _resolve_budget_limits(
         payload.weekly_limit, payload.monthly_limit, payload.annual_limit
     )
-    existing = db.scalar(select(BudgetRule).where(func.lower(BudgetRule.category) == cat.lower()))
-    cat_row = db.scalar(select(Category).where(func.lower(Category.name) == cat.lower()))
-    if payload.budget_period is not None:
-        resolved_period = payload.budget_period
-    elif existing is not None:
-        resolved_period = existing.budget_period
-    elif (
+    existing = db.scalar(
+        select(BudgetRule).where(func.lower(func.trim(BudgetRule.category)) == cleaned.lower())
+    )
+    annual_only = (
         payload.annual_limit is not None
         and payload.weekly_limit is None
         and payload.monthly_limit is None
-    ):
-        resolved_period = "annual"
-    elif cat_row is not None and (cat_row.amortize_period or "").strip().lower() == "annual":
-        resolved_period = "annual"
-    else:
-        resolved_period = "monthly"
-
-    if cat_row is not None and not cat_row.is_system:
-        cat_row.amortize_period = "annual" if resolved_period == "annual" else None
-
-    if existing:
-        existing.weekly_limit = weekly
-        existing.monthly_limit = monthly
-        existing.budget_period = resolved_period
-        existing.is_active = payload.is_active
-        db.commit()
-        db.refresh(existing)
-        return existing
-
-    new_rule = BudgetRule(
-        category=cat,
+    )
+    canonical_cat, resolved_period = _sync_budget_or_400(
+        db,
+        category_name=cleaned,
+        is_active=payload.is_active,
+        explicit_period=payload.budget_period,
+        existing_period=existing.budget_period if existing is not None else None,
+        existing_is_active=bool(existing.is_active) if existing is not None else True,
+        annual_limit_only=annual_only,
+    )
+    return _save_budget_rule_record(
+        db,
+        existing=existing,
+        category=canonical_cat,
         weekly_limit=weekly,
         monthly_limit=monthly,
         budget_period=resolved_period,
         is_active=payload.is_active,
     )
-    db.add(new_rule)
-    db.commit()
-    db.refresh(new_rule)
-    return new_rule
 
 
 @router.delete("/{budget_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -151,16 +206,23 @@ def initialize_default_budgets(
     """Initialize default sensible baseline category budgets if none are configured."""
     created = []
     for cat, weekly, monthly in DEFAULT_BASELINE_BUDGETS:
-        existing = db.scalar(select(BudgetRule).where(func.lower(BudgetRule.category) == cat.lower()))
-        if not existing:
-            rule = BudgetRule(
-                category=cat,
-                weekly_limit=weekly,
-                monthly_limit=monthly,
-                is_active=True,
-            )
-            db.add(rule)
-            created.append(rule)
+        existing = db.scalar(
+            select(BudgetRule).where(func.lower(func.trim(BudgetRule.category)) == cat.lower())
+        )
+        if existing:
+            continue
+        canonical_cat, resolved_period = _sync_budget_or_400(
+            db, category_name=cat, is_active=True
+        )
+        rule = BudgetRule(
+            category=canonical_cat,
+            weekly_limit=weekly,
+            monthly_limit=monthly,
+            budget_period=resolved_period,
+            is_active=True,
+        )
+        db.add(rule)
+        created.append(rule)
     if created:
         db.commit()
         for rule in created:
@@ -190,24 +252,32 @@ def _upsert_budget_rules_from_burn(db: Session, lookback_weeks: int) -> list[Bud
     """Upsert active category BudgetRules directly from projected average weekly burn."""
     burn = project_burn(db, lookback_weeks=lookback_weeks, reference_date=date.today())
     existing_rules = {
-        rule.category.lower(): rule
+        rule.category.strip().lower(): rule
         for rule in db.scalars(select(BudgetRule)).all()
     }
     for est in burn.categories:
         if est.average_weekly_burn < MIN_SIGNIFICANT_WEEKLY_BURN_NZD:
             continue
-        existing = existing_rules.get(est.category.lower())
+        canonical_cat, resolved_period = _sync_budget_or_400(
+            db,
+            category_name=est.category,
+            is_active=True,
+            explicit_period=est.budget_period or "monthly",
+        )
+        existing = existing_rules.get(canonical_cat.lower())
         if existing:
+            existing.category = canonical_cat
             existing.weekly_limit = est.average_weekly_burn
             existing.monthly_limit = est.suggested_monthly_limit
+            existing.budget_period = resolved_period
             existing.is_active = True
         else:
             db.add(
                 BudgetRule(
-                    category=est.category,
+                    category=canonical_cat,
                     weekly_limit=est.average_weekly_burn,
                     monthly_limit=est.suggested_monthly_limit,
-                    budget_period=est.budget_period or "monthly",
+                    budget_period=resolved_period,
                     is_active=True,
                 )
             )

@@ -15,7 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.db import Base, get_db
 from app.main import app
 from app.models import Account
-from app.services.connectors.akahu import normalize_akahu_category, normalize_akahu_feeds
+from app.services.category_taxonomy import normalize_akahu_category
+from app.services.connectors.akahu import normalize_akahu_feeds
 
 TEST_DB_URL = "sqlite:///:memory:"
 engine = create_engine(

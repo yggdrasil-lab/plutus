@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.schemas import SyncResult
-from app.services.category_taxonomy import DEFAULT_CATEGORY_NAMES, get_canonical_category_names
+from app.services.category_taxonomy import normalize_akahu_category
 from app.services.connectors import ConnectorConfigError, ConnectorUpstreamError
 from app.services.ingestion_service import (
     BankFeedGateway,
@@ -22,7 +22,6 @@ from app.services.ingestion_service import (
     resolve_utc_sync_window,
     sync_provider_feeds,
 )
-from app.services.statement_parser import auto_categorize
 
 AKAHU_BASE_URL = "https://api.akahu.io/v1"
 
@@ -34,141 +33,6 @@ AKAHU_TYPE_MAP: dict[str, tuple[str, str]] = {
     "CREDITCARD": ("credit_card", "cash"),
     "SAVINGS": ("savings", "cash"),
 }
-
-CANONICAL_CATEGORIES: frozenset[str] = frozenset(DEFAULT_CATEGORY_NAMES)
-
-AKAHU_CATEGORY_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
-    (("hair", "salon", "barber", "beauty", "cosmetic", "skincare", "groom"), "Personal Care"),
-    (("supplement", "nutrition", "protein"), "Supplements"),
-    (("gym", "fitness", "aquatic", "swim", "pilates", "yoga", "badminton", "sport"), "Fitness"),
-    (("health", "medical", "pharmac", "chemist", "dent", "doctor", "physio", "optom", "clinic", "hospital"), "Medical"),
-    (("supermarket", "grocer"), "Groceries"),
-    (("liquor", "wine", "beer", "alcohol", "bottle shop"), "Alcohol"),
-    (("cafe", "restaurant", "dining", "takeaway", "fast food", "bakery", "bar", "pub", "food"), "Dining"),
-    (("mechanic", "automotive", "vehicle", "car service", "tyre", "dealer"), "Vehicle"),
-    (("fuel", "petrol", "service station"), "Fuel"),
-    (("transport", "parking", "taxi", "rideshare", "uber", "transit", "toll"), "Transit"),
-    (("internet", "broadband", "mobile", "phone", "telco", "electric", "power", "gas", "water", "utilit"), "Bills & Telco"),
-    (("software", "cloud", "saas", "ai "), "Software & AI"),
-    (("clothing", "apparel", "fashion", "footwear", "shoes"), "Clothing"),
-    (("electronic", "computer", "tech"), "Tech"),
-    (("hardware", "home", "appliance", "furniture"), "Household"),
-    (("shopping", "retail", "department store"), "Shopping"),
-    (("gaming", "video game"), "Gaming"),
-    (("entertainment", "leisure", "recreation", "streaming", "hobby", "cinema", "movie"), "Leisure"),
-    (("insurance",), "Insurance"),
-    (("travel", "airline", "flight", "hotel", "accommodation"), "Travel"),
-    (("rent",), "Rent"),
-    (("housing", "mortgage", "rates"), "Housing"),
-    (("family", "gift"), "Family"),
-    (("loan", "debt", "installment", "instalment"), "Debt & Loans"),
-    (("fee", "bank charge", "government", "immigration"), "Fees & Admin"),
-    (("transfer", "credit card payment"), "Transfers"),
-    (("income", "salary", "wage", "interest", "dividend", "refund"), "Income"),
-)
-
-
-AKAHU_TAG_HINTS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
-    (("gym", "fitness"), ("gym", "subscription")),
-    (("aquatic", "pool", "swim"), ("swimming",)),
-    (("pharmac", "chemist"), ("pharmacy",)),
-    (("dent",), ("dental",)),
-    (("physio",), ("physio",)),
-    (("optom",), ("optometry",)),
-    (("doctor", "medical", "clinic", "hospital"), ("medical",)),
-    (("supermarket", "grocer"), ("supermarket",)),
-    (("cafe", "coffee"), ("cafe",)),
-    (("fast food", "takeaway"), ("fast-food", "takeaway")),
-    (("bakery",), ("bakery",)),
-    (("restaurant", "dining"), ("dining",)),
-    (("bar", "pub"), ("drinks",)),
-    (("fuel", "petrol"), ("fuel",)),
-    (("parking",), ("parking",)),
-    (("uber", "taxi", "rideshare"), ("rideshare",)),
-    (("transit", "transport"), ("transit",)),
-    (("electric", "power"), ("electricity",)),
-    (("internet", "broadband"), ("internet", "subscription")),
-    (("mobile", "phone", "telco"), ("mobile", "subscription")),
-    (("gaming",), ("gaming",)),
-    (("streaming",), ("streaming", "subscription")),
-    (("cinema", "movie"), ("movies",)),
-    (("sport",), ("sports",)),
-    (("airline", "flight"), ("flights",)),
-    (("hotel", "accommodation"), ("accommodation",)),
-)
-
-
-def _concise_akahu_tags(lower_category: str, canonical: str) -> tuple[str, ...]:
-    """Derive concise, composable atomic tags from Akahu's verbose category string."""
-    if not lower_category or lower_category in ("unknown", "other", "general", canonical.lower()):
-        return ()
-    for keywords, tags in AKAHU_TAG_HINTS:
-        if any(kw in lower_category for kw in keywords):
-            return tags
-    return ()
-
-
-def normalize_akahu_category(
-    raw_category: Optional[str],
-    merchant: str,
-    raw_description: str,
-) -> tuple[str, tuple[str, ...]]:
-    """Map Akahu's raw category name into Plutus canonical categories plus concise tags."""
-    cleaned = (raw_category or "").strip()
-    lower = cleaned.lower()
-
-    canonical = ""
-    if lower and lower not in ("unknown", "other", "general"):
-        for keywords, target in AKAHU_CATEGORY_RULES:
-            if any(kw in lower for kw in keywords):
-                canonical = target
-                break
-
-    if not canonical:
-        canonical = auto_categorize(f"{merchant} {raw_description}".strip())
-
-    return canonical, _concise_akahu_tags(lower, canonical)
-
-
-def normalize_existing_legacy_categories(db: Session) -> int:
-    """Normalize any non-canonical transaction categories in-place with tags."""
-    import json
-    from app.models import Transaction
-
-    canonical_names = set(get_canonical_category_names(db)) or set(CANONICAL_CATEGORIES)
-    canonical_lower = {name.lower() for name in canonical_names}
-
-    candidates = (
-        db.query(Transaction)
-        .filter(Transaction.category.notin_(canonical_names))
-        .all()
-    )
-    rows = [
-        tx
-        for tx in candidates
-        if (tx.category or "").strip().lower() not in canonical_lower
-    ]
-    if not rows:
-        return 0
-
-    for tx in rows:
-        canonical, new_tags = normalize_akahu_category(
-            tx.category, tx.merchant or "", tx.raw_description or ""
-        )
-        try:
-            existing_tags = json.loads(tx.tags) if tx.tags else []
-            if not isinstance(existing_tags, list):
-                existing_tags = []
-        except (ValueError, TypeError):
-            existing_tags = []
-        for tag in new_tags:
-            if tag not in existing_tags:
-                existing_tags.append(tag)
-        tx.category = canonical
-        tx.tags = json.dumps(existing_tags)
-
-    db.commit()
-    return len(rows)
 
 
 # ============================================================================

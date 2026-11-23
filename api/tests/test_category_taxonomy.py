@@ -22,6 +22,7 @@ from app.models import (
     TransactionSplit,
 )
 from app.services.category_taxonomy import (
+    AnnualCategoryTaxonomy,
     CategoryConflictError,
     CategoryCreateInput,
     CategoryDeleteSummary,
@@ -33,6 +34,8 @@ from app.services.category_taxonomy import (
     create_category,
     delete_category,
     ensure_default_categories,
+    get_active_categories,
+    get_annual_category_taxonomy,
     get_canonical_category_names,
     get_category_parent_map,
     get_category_snapshot,
@@ -40,6 +43,9 @@ from app.services.category_taxonomy import (
     get_parent_category,
     get_root_category,
     list_categories,
+    normalize_existing_legacy_categories,
+    resolve_budget_rule_category,
+    sync_budget_rule_amortization,
     update_category,
 )
 
@@ -461,3 +467,187 @@ def test_package_preserves_hierarchy_helpers_and_error_types(
         get_category_snapshot(db_session, 999999)
     with pytest.raises(CategoryConflictError):
         create_category(db_session, CategoryCreateInput(name="food"))
+
+
+def test_budget_sync_canonicalizes_syncs_amortization_and_rejects_system_annual(
+    db_session: Session,
+) -> None:
+    resolved = resolve_budget_rule_category(
+        db_session, "  groceries ", budget_period="monthly"
+    )
+    assert resolved == "Groceries"
+    assert resolve_budget_rule_category(db_session, "Education", budget_period="annual") == "Education"
+
+    travel_cat = db_session.scalar(select(Category).where(Category.name == "Travel"))
+    assert travel_cat is not None and travel_cat.amortize_period is None
+
+    canonical = sync_budget_rule_amortization(
+        db_session, category_name=" travel ", budget_period="annual", is_active=True
+    )
+    assert canonical == "Travel"
+    assert travel_cat.amortize_period == "annual"
+
+    # Inactive rule updates must ignore (neither set nor clear) Category.amortize_period
+    sync_budget_rule_amortization(
+        db_session, category_name="Travel", budget_period="monthly", is_active=False
+    )
+    assert travel_cat.amortize_period == "annual"
+
+    food_cat = db_session.scalar(select(Category).where(Category.name == "Food"))
+    assert food_cat is not None and food_cat.amortize_period is None
+    sync_budget_rule_amortization(
+        db_session, category_name="Food", budget_period="annual", is_active=False
+    )
+    assert food_cat.amortize_period is None
+
+    sync_budget_rule_amortization(
+        db_session, category_name="Travel", budget_period="monthly", is_active=True
+    )
+    assert travel_cat.amortize_period is None
+
+    assert (
+        sync_budget_rule_amortization(
+            db_session, category_name="Debt & Loans", budget_period="monthly", is_active=True
+        )
+        == "Debt & Loans"
+    )
+
+    for sys_name in ("Transfers", "Income", "General", "Debt & Loans"):
+        with pytest.raises(CategoryValidationError):
+            resolve_budget_rule_category(db_session, sys_name, budget_period="annual")
+        with pytest.raises(CategoryValidationError):
+            sync_budget_rule_amortization(
+                db_session, category_name=sys_name, budget_period="annual", is_active=True
+            )
+
+    with pytest.raises(CategoryValidationError):
+        sync_budget_rule_amortization(
+            db_session, category_name="   ", budget_period="monthly", is_active=True
+        )
+
+
+def test_get_active_categories_fallback_chain_and_exclusions() -> None:
+    session_factory, engine = _new_memory_session_factory()
+    try:
+        # 1. Empty DB -> filtered DEFAULT_CATEGORY_NAMES (keeps Debt & Loans, excludes Transfers/Income/General)
+        with session_factory() as db:
+            defaults = get_active_categories(db)
+            assert "Debt & Loans" in defaults
+            assert "Groceries" in defaults
+            assert {"Transfers", "Income", "General"}.isdisjoint(defaults)
+
+            # 2. Transaction fallback when Category and BudgetRule tables are empty
+            acc = Account(
+                name="Everyday",
+                account_type="checking",
+                tier="cash",
+                institution="ANZ",
+                currency="NZD",
+            )
+            db.add(acc)
+            db.flush()
+            db.add_all(
+                [
+                    Transaction(
+                        transaction_date=date.today(),
+                        account_id=acc.id,
+                        amount=-10.0,
+                        currency="NZD",
+                        merchant="Cafe",
+                        category="Dining",
+                        raw_hash="active-cat-tx-1",
+                    ),
+                    Transaction(
+                        transaction_date=date.today(),
+                        account_id=acc.id,
+                        amount=-50.0,
+                        currency="NZD",
+                        merchant="Unknown",
+                        category="General",
+                        raw_hash="active-cat-tx-2",
+                    ),
+                ]
+            )
+            db.commit()
+            assert get_active_categories(db) == ["Dining"]
+
+            # 3. BudgetRule fallback overrides Transaction fallback
+            db.add(
+                BudgetRule(
+                    category="Travel",
+                    weekly_limit=50.0,
+                    monthly_limit=216.67,
+                    is_active=True,
+                )
+            )
+            db.commit()
+            assert get_active_categories(db) == ["Travel"]
+
+            # 4. Seeded Category table overrides BudgetRule fallback and retains Debt & Loans
+            ensure_default_categories(db)
+            cats = get_active_categories(db)
+            assert "Debt & Loans" in cats
+            assert "Groceries" in cats
+            assert {"Transfers", "Income", "General"}.isdisjoint(cats)
+    finally:
+        Base.metadata.drop_all(bind=engine)
+
+
+def test_annual_category_taxonomy_detached_and_immutable() -> None:
+    session_factory, engine = _new_memory_session_factory()
+    try:
+        with session_factory() as db:
+            ensure_default_categories(db)
+            vehicle = db.scalar(select(Category).where(Category.name == "Vehicle"))
+            assert vehicle is not None
+            update_category(db, vehicle.id, CategoryUpdateInput(amortize_period="annual"))
+            db.add(
+                BudgetRule(
+                    category="Education",
+                    weekly_limit=25.0,
+                    monthly_limit=108.33,
+                    budget_period="annual",
+                    is_active=True,
+                )
+            )
+            db.commit()
+            taxonomy = get_annual_category_taxonomy(db)
+
+        assert isinstance(taxonomy, AnnualCategoryTaxonomy)
+        assert taxonomy.parent_map["Vehicle"] == "Transport"
+        assert taxonomy.lower_to_parent["vehicle"] == "transport"
+        assert taxonomy.canonical_name_map["education"] == "Education"
+        assert taxonomy.canonical_name_map["vehicle"] == "Vehicle"
+        assert "vehicle" in taxonomy.annual_cats
+        assert "education" in taxonomy.annual_cats
+        assert "education" in taxonomy.annual_base_roots
+        assert "vehicle" not in taxonomy.annual_base_roots
+        with pytest.raises(TypeError):
+            taxonomy.parent_map["Education"] = "Food"  # type: ignore[index]
+        with pytest.raises(FrozenInstanceError):
+            taxonomy.annual_cats = frozenset()  # type: ignore[misc]
+    finally:
+        Base.metadata.drop_all(bind=engine)
+
+
+def test_normalize_existing_legacy_categories_idempotent_with_inactive_category(
+    db_session: Session, seeded_account: Account
+) -> None:
+    # Deactivating a default category should remain idempotent across repeated runs
+    alc = db_session.scalar(select(Category).where(Category.name == "Alcohol"))
+    assert alc is not None
+    update_category(db_session, alc.id, CategoryUpdateInput(is_active=False))
+    db_session.add(
+        Transaction(
+            transaction_date=date.today(),
+            account_id=seeded_account.id,
+            amount=-20.0,
+            currency="NZD",
+            merchant="Bottle Store",
+            category="Alcohol",
+            raw_hash="inactive-cat-alc",
+            tags="[]",
+        )
+    )
+    db_session.commit()
+    assert normalize_existing_legacy_categories(db_session) == 0

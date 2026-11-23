@@ -1,4 +1,4 @@
-"""Account balance, tier label, active category, and startup FX repair helpers."""
+"""Account balance, tier label, and startup FX repair helpers."""
 
 # ============================================================================
 # 1. IMPORTS & CONSTANTS
@@ -8,25 +8,12 @@ from typing import Optional
 from sqlalchemy import desc, func, or_, select
 from sqlalchemy.orm import Session
 
-from app.models import Account, AssetSnapshot, BudgetRule, Category, Transaction
+from app.models import Account, AssetSnapshot, Transaction
 from app.services.fx_service import FxRateFetcher, get_exchange_rate
-
-_EXCLUDED_ACTIVE_CATEGORIES: tuple[str, ...] = ("transfers", "transfer", "income", "general")
-DEFAULT_CATEGORIES: tuple[str, ...] = (
-    "Groceries",
-    "Dining",
-    "Alcohol",
-    "Fuel",
-    "Transit",
-    "Bills & Telco",
-    "Software & AI",
-    "Housing",
-    "General",
-)
 
 
 # ============================================================================
-# 2. ACCOUNT & CATEGORY REPOSITORY HELPERS
+# 2. ACCOUNT REPOSITORY HELPERS
 # ============================================================================
 def get_latest_account_balances(db: Session) -> dict[str, float]:
     """Retrieve the latest balance in NZD for all active accounts grouped by tier."""
@@ -61,39 +48,6 @@ def resolve_tier_labels(db: Session) -> dict[str, str]:
         "growth": growth_accs[0] if len(growth_accs) == 1 else "Growth",
         "locked": locked_accs[0] if len(locked_accs) == 1 else "Locked Reserve",
     }
-
-
-def get_active_categories(db: Session) -> list[str]:
-    """Return sorted active expense categories from Category table, BudgetRules, ledger, or defaults."""
-    category_rows = list(
-        db.scalars(
-            select(Category.name)
-            .where(Category.is_active == True)
-            .order_by(Category.name)
-        ).all()
-    )
-    if category_rows:
-        filtered = [
-            name
-            for name in category_rows
-            if name and name.strip().lower() not in _EXCLUDED_ACTIVE_CATEGORIES
-        ]
-        if filtered:
-            return filtered
-
-    active_categories = list(
-        db.scalars(
-            select(BudgetRule.category)
-            .where(BudgetRule.is_active == True)
-            .order_by(BudgetRule.category)
-        ).all()
-    )
-    if active_categories:
-        return active_categories
-
-    tx_cats = db.scalars(select(Transaction.category).distinct()).all()
-    discovered = sorted({c for c in tx_cats if c})
-    return discovered or list(DEFAULT_CATEGORIES)
 
 
 # ============================================================================

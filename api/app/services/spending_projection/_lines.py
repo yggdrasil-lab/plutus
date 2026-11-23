@@ -6,11 +6,10 @@ from typing import Optional, Sequence
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, joinedload
 
-from app.models import BudgetRule, Category, Receipt, Transaction, TransactionSplit
+from app.models import BudgetRule, Receipt, Transaction, TransactionSplit
 from app.services.category_taxonomy import (
-    get_category_parent_map,
+    get_annual_category_taxonomy,
     get_descendant_category_names,
-    get_parent_category,
     get_root_category,
 )
 from app.services.fx_service import to_nzd_amount
@@ -373,38 +372,6 @@ def _compute_annual_category_totals(
     return spend_map, count_map
 
 
-def _build_canonical_name_map(
-    raw_budget_rules: dict[str, BudgetRule],
-    parent_map: dict[str, str],
-) -> dict[str, str]:
-    """Build lowercase-to-canonical display category map from rules and taxonomy."""
-    names: dict[str, str] = {
-        str(r.category).strip().lower(): str(r.category).strip()
-        for r in raw_budget_rules.values()
-        if r.category and str(r.category).strip()
-    }
-    for child_name, parent_name in parent_map.items():
-        names.setdefault(child_name.lower(), child_name)
-        names.setdefault(parent_name.lower(), parent_name)
-    return names
-
-
-def _apply_category_annual_flags(
-    db: Session,
-    annual_cats: set[str],
-    canonical_name_map: dict[str, str],
-) -> None:
-    """Populate canonical category names and annual amortization flags from Category rows."""
-    for db_cat in db.scalars(select(Category)).all():
-        cat_name = (db_cat.name or "").strip()
-        if not cat_name:
-            continue
-        cat_lower = cat_name.lower()
-        canonical_name_map.setdefault(cat_lower, cat_name)
-        if db_cat.is_active and (db_cat.amortize_period or "").strip().lower() == "annual":
-            annual_cats.add(cat_lower)
-
-
 def _load_annual_metadata(
     db: Session,
     resolved: ResolvedWindow,
@@ -412,32 +379,20 @@ def _load_annual_metadata(
     rollup_base: bool,
 ) -> _AnnualCategoryMetadata:
     """Load category taxonomy, active budget rules, and Annualized Category sets."""
-    parent_map = get_category_parent_map(db)
-    lower_to_parent = {
-        k.strip().lower(): v.strip().lower()
-        for k, v in parent_map.items()
-        if k and k.strip() and v and v.strip()
-    }
+    taxonomy = get_annual_category_taxonomy(db)
     active_rules = list(db.scalars(select(BudgetRule).where(BudgetRule.is_active == True)).all())
     raw_budget_rules: dict[str, BudgetRule] = {
-        str(r.category).lower(): r for r in active_rules if r.category
-    }
-    annual_cats: set[str] = {
-        cat_lower
-        for cat_lower, rule in raw_budget_rules.items()
-        if (rule.budget_period or "monthly").strip().lower() == "annual"
-    }
-    canonical_name_map = _build_canonical_name_map(raw_budget_rules, parent_map)
-    _apply_category_annual_flags(db, annual_cats, canonical_name_map)
-    annual_base_roots = {
-        c for c in annual_cats
-        if get_parent_category(canonical_name_map.get(c) or c, parent_map) is None
+        str(r.category).strip().lower(): r for r in active_rules if r.category
     }
     return _AnnualCategoryMetadata(
-        resolved=resolved, rollup_base=rollup_base, parent_map=parent_map,
-        lower_to_parent=lower_to_parent, canonical_name_map=canonical_name_map,
-        raw_budget_rules=raw_budget_rules, annual_cats=frozenset(annual_cats),
-        annual_base_roots=frozenset(annual_base_roots),
+        resolved=resolved,
+        rollup_base=rollup_base,
+        parent_map=dict(taxonomy.parent_map),
+        lower_to_parent=dict(taxonomy.lower_to_parent),
+        canonical_name_map=dict(taxonomy.canonical_name_map),
+        raw_budget_rules=raw_budget_rules,
+        annual_cats=taxonomy.annual_cats,
+        annual_base_roots=taxonomy.annual_base_roots,
     )
 
 

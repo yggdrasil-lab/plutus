@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Optional
 
 from sqlalchemy import func, select, union
@@ -21,7 +23,9 @@ from app.services.category_taxonomy._types import (
     CATEGORY_PARENTS,
     DEFAULT_CATEGORY_NAMES,
     DEFAULT_CATEGORY_SPECS,
+    _EXCLUDED_ACTIVE_CATEGORIES_LOWER,
     _NON_EXPENSE_SYSTEM_LOWER,
+    AnnualCategoryTaxonomy,
     CategoryMetrics,
     CategoryNotFoundError,
     CategorySeedSpec,
@@ -117,14 +121,14 @@ def get_canonical_category_names(
     db: Optional[Session] = None,
     *,
     include_system_non_expense: bool = True,
+    include_inactive: bool = False,
 ) -> list[str]:
-    """Return active category names from DB (or default specs when unseeded)."""
+    """Return category names from DB (or default specs when unseeded)."""
     if db is not None and db.scalar(select(Category.id).limit(1)) is not None:
-        rows = db.scalars(
-            select(Category)
-            .where(Category.is_active == True)
-            .order_by(Category.sort_order.asc(), Category.name.asc())
-        ).all()
+        stmt = select(Category)
+        if not include_inactive:
+            stmt = stmt.where(Category.is_active == True)
+        rows = db.scalars(stmt.order_by(Category.sort_order.asc(), Category.name.asc())).all()
         names = [row.name for row in rows]
     else:
         names = list(DEFAULT_CATEGORY_NAMES)
@@ -135,9 +139,9 @@ def get_canonical_category_names(
 
 
 def _build_lookup_tables(
-    parent_map: Optional[dict[str, str]] = None,
+    parent_map: Optional[Mapping[str, str]] = None,
 ) -> tuple[dict[str, str], dict[str, str]]:
-    active = CATEGORY_PARENTS if parent_map is None else parent_map
+    active: Mapping[str, str] = CATEGORY_PARENTS if parent_map is None else parent_map
     lower_to_canonical: dict[str, str] = {name.lower(): name for name in DEFAULT_CATEGORY_NAMES}
     for child, parent in active.items():
         lower_to_canonical[child.lower()] = child
@@ -148,7 +152,7 @@ def _build_lookup_tables(
 
 def get_parent_category(
     category: str,
-    parent_map: Optional[dict[str, str]] = None,
+    parent_map: Optional[Mapping[str, str]] = None,
 ) -> Optional[str]:
     """Return the immediate base class for a category, or None if it is a root class."""
     key = (category or "").strip().lower()
@@ -160,7 +164,7 @@ def get_parent_category(
 
 def get_root_category(
     category: str,
-    parent_map: Optional[dict[str, str]] = None,
+    parent_map: Optional[Mapping[str, str]] = None,
 ) -> str:
     """Resolve the top-level base class by walking inheritance links safely."""
     current = (category or "General").strip() or "General"
@@ -179,13 +183,13 @@ def get_root_category(
 
 def get_descendant_category_names(
     root_category: str,
-    parent_map: Optional[dict[str, str]] = None,
+    parent_map: Optional[Mapping[str, str]] = None,
 ) -> set[str]:
     """Return lowercase names for root_category and all descendants at any depth."""
     target_lower = (root_category or "").strip().lower()
     if not target_lower:
         return set()
-    active = CATEGORY_PARENTS if parent_map is None else parent_map
+    active: Mapping[str, str] = CATEGORY_PARENTS if parent_map is None else parent_map
     _, lower_to_parent = _build_lookup_tables(active)
     descendants: set[str] = {target_lower}
     for child in active:
@@ -332,3 +336,101 @@ def get_category_snapshot(db: Session, category_id: int) -> CategorySnapshot:
         raise CategoryNotFoundError("Category not found.")
     bundle = _load_metrics_bundle(db)
     return _build_snapshot(cat, by_id=by_id, bundle=bundle)
+
+
+def _filter_active_expense_names(names: Sequence[str]) -> list[str]:
+    return [
+        name
+        for name in names
+        if name and name.strip().lower() not in _EXCLUDED_ACTIVE_CATEGORIES_LOWER
+    ]
+
+
+def get_active_categories(db: Session) -> list[str]:
+    """Return sorted active expense categories from Category, BudgetRule, ledger, or defaults."""
+    category_rows = list(
+        db.scalars(
+            select(Category.name).where(Category.is_active == True).order_by(Category.name)
+        ).all()
+    )
+    filtered_cats = _filter_active_expense_names(category_rows)
+    if filtered_cats:
+        return filtered_cats
+
+    active_rules = list(
+        db.scalars(
+            select(BudgetRule.category)
+            .where(BudgetRule.is_active == True)
+            .order_by(BudgetRule.category)
+        ).all()
+    )
+    filtered_rules = _filter_active_expense_names(active_rules)
+    if filtered_rules:
+        return filtered_rules
+
+    tx_cats = [c for c in db.scalars(select(Transaction.category).distinct()).all() if c]
+    discovered = sorted(_filter_active_expense_names(tx_cats))
+    if discovered:
+        return discovered
+
+    return sorted(_filter_active_expense_names(DEFAULT_CATEGORY_NAMES))
+
+
+def _collect_annual_names_and_flags(
+    parent_map: Mapping[str, str],
+    active_rules: Sequence[BudgetRule],
+    all_cats: Sequence[Category],
+) -> tuple[dict[str, str], set[str]]:
+    canonical_name_map: dict[str, str] = {}
+    annual_cats: set[str] = set()
+    for cat in all_cats:
+        cat_name = (cat.name or "").strip()
+        if not cat_name or not cat.is_active:
+            continue
+        cat_lower = cat_name.lower()
+        canonical_name_map[cat_lower] = cat_name
+        if (cat.amortize_period or "").strip().lower() == "annual":
+            annual_cats.add(cat_lower)
+    for child_name, parent_name in parent_map.items():
+        canonical_name_map.setdefault(child_name.lower(), child_name)
+        canonical_name_map.setdefault(parent_name.lower(), parent_name)
+    for rule in active_rules:
+        rule_name = (rule.category or "").strip()
+        if not rule_name:
+            continue
+        rule_lower = rule_name.lower()
+        canonical_name_map.setdefault(rule_lower, rule_name)
+        if (rule.budget_period or "monthly").strip().lower() == "annual":
+            annual_cats.add(rule_lower)
+    for cat in all_cats:
+        cat_name = (cat.name or "").strip()
+        if cat_name and not cat.is_active:
+            canonical_name_map.setdefault(cat_name.lower(), cat_name)
+    return canonical_name_map, annual_cats
+
+
+def get_annual_category_taxonomy(db: Session) -> AnnualCategoryTaxonomy:
+    """Return detached category hierarchy, display names, and annual amortization sets."""
+    parent_map = get_category_parent_map(db)
+    lower_to_parent = {
+        k.strip().lower(): v.strip().lower()
+        for k, v in parent_map.items()
+        if k and k.strip() and v and v.strip()
+    }
+    active_rules = list(db.scalars(select(BudgetRule).where(BudgetRule.is_active == True)).all())
+    all_cats = list(db.scalars(select(Category)).all())
+    canonical_name_map, annual_cats = _collect_annual_names_and_flags(
+        parent_map, active_rules, all_cats
+    )
+    annual_base_roots = frozenset(
+        c
+        for c in annual_cats
+        if get_parent_category(canonical_name_map.get(c) or c, parent_map) is None
+    )
+    return AnnualCategoryTaxonomy(
+        parent_map=MappingProxyType(parent_map),
+        lower_to_parent=MappingProxyType(lower_to_parent),
+        canonical_name_map=MappingProxyType(canonical_name_map),
+        annual_cats=frozenset(annual_cats),
+        annual_base_roots=annual_base_roots,
+    )
