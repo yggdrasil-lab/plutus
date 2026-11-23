@@ -16,6 +16,7 @@ from app.routers import accounts, budgets, categories, health, institutions, int
 from app.services.ai_gateway import MuninnHttpAdapter
 from app.services.burn_service import repair_transaction_fx_rates
 from app.services.category_taxonomy import normalize_existing_legacy_categories
+from app.services.product_catalog import backfill_unlinked_receipt_item_products
 from app.services.sync_scheduler import periodic_sync_loop
 from app.services.transfer_service import repair_crypto_transfers_and_rates
 
@@ -47,6 +48,12 @@ async def lifespan(app_instance: FastAPI):
             updated = normalize_existing_legacy_categories(db)
             if updated:
                 logger.info("Normalized %d legacy category records on startup.", updated)
+            linked_products = backfill_unlinked_receipt_item_products(db)
+            if linked_products:
+                logger.info(
+                    "Linked %d unlinked receipt items to catalog products on startup.",
+                    linked_products,
+                )
             repaired_fx = repair_transaction_fx_rates(db)
             if repaired_fx:
                 logger.info("Repaired %d transaction FX rates on startup.", repaired_fx)
