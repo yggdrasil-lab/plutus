@@ -5,7 +5,6 @@ import json
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -17,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.db import Base, get_db
 from app.main import app
 from app.models import Account, CategorizationRule, Category, Receipt, ReceiptItem, Transaction
-from app.services.jev_client import reset_jev_circuit
+from app.services.ai_gateway import InMemoryAiGateway, JevGateRequest, get_ai_gateway
 from app.services.receipt_service import collect_existing_tags as receipt_collect_existing_tags
 from app.services.rules_engine import collect_existing_tags, evaluate_rules, matches_rule
 
@@ -32,7 +31,6 @@ TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engin
 
 class TestCategorizationRules(unittest.TestCase):
     def setUp(self):
-        reset_jev_circuit()
         Base.metadata.create_all(bind=engine)
         self.db = TestingSessionLocal()
 
@@ -58,7 +56,7 @@ class TestCategorizationRules(unittest.TestCase):
         self.db.refresh(self.acc)
 
     def tearDown(self):
-        reset_jev_circuit()
+        app.dependency_overrides.pop(get_ai_gateway, None)
         app.dependency_overrides.pop(get_db, None)
         self.db.close()
         Base.metadata.drop_all(bind=engine)
@@ -726,83 +724,74 @@ class TestCategorizationRules(unittest.TestCase):
         )
         self.db.commit()
 
-        jev_calls = []
+        def jev_handler(req: JevGateRequest) -> str:
+            content = req.user_content.lower()
+            if "dormant" in content:
+                return json.dumps({"category": "Shopping", "is_anomaly": "false", "tags": ["general", "shopping", "retail"]})
+            if "weird" in content:
+                return json.dumps({"category": "Income", "is_anomaly": "false", "tags": ["refund"]})
+            if "consulting" in content:
+                return json.dumps({"category": "Income", "is_anomaly": "false", "tags": ["salary", "income"]})
+            if "animates" in content:
+                return json.dumps({"category": "Pets", "is_anomaly": "false", "tags": ["pets", "general", "treats"]})
+            if "mojo" in content:
+                return json.dumps({"category": "Dining", "is_anomaly": "false", "tags": ["coffee", "dining"]})
+            if "mecca" in content:
+                return json.dumps({"category": "Shopping", "is_anomaly": "false", "tags": ["personal-care", "general", "skincare"]})
+            return json.dumps({"category": "General", "is_anomaly": "false", "tags": []})
 
-        def fake_jev(merchant, amount, notes=None, existing_tags=None, extra_categories=None):
-            jev_calls.append(
-                {
-                    "merchant": merchant,
-                    "amount": amount,
-                    "notes": notes,
-                    "existing_tags": existing_tags,
-                    "extra_categories": extra_categories,
-                }
-            )
-            m = merchant.strip().lower()
-            if "dormant" in m:
-                return ("Shopping", False, ["general", "shopping", "retail"])
-            if "weird" in m:
-                return ("Income", False, ["refund"])
-            if "consulting" in m:
-                return ("Income", False, ["salary", "income"])
-            if "animates" in m:
-                return ("Pets", False, ["pets", "general", "treats"])
-            if "mojo" in m:
-                return ("Dining", False, ["coffee", "dining"])
-            if "mecca" in m:
-                return ("Shopping", False, ["personal-care", "general", "skincare"])
-            return ("General", False, [])
+        gateway = InMemoryAiGateway(jev_handler=jev_handler)
+        app.dependency_overrides[get_ai_gateway] = lambda: gateway
 
-        with patch("app.services.rules_engine.classify_transaction_jev_with_tags", side_effect=fake_jev):
-            # 1. Default empty POST body -> dry_run=True, include_untagged=False
-            dry_res = self.client.post("/rules/classify-uncategorized")
-            self.assertEqual(dry_res.status_code, 200)
-            dry_body = dry_res.json()
-            self.assertTrue(dry_body["dry_run"])
-            self.assertEqual(dry_body["evaluated"], 6)
-            self.assertEqual(dry_body["updated"], 6)
-            self.assertEqual(dry_body["skipped_circuit_open"], 0)
-            self.assertEqual(dry_body["remaining"], 0)
-            weird_change = next(
-                c for c in dry_body["changes"] if c["transaction_id"] == tx_outflow_income_reject.id
-            )
-            self.assertEqual(weird_change["old_category"], "General")
-            self.assertEqual(weird_change["new_category"], "General")
-            self.assertEqual(weird_change["new_tags"], ["refund"])
-            # Mojo Coffee evaluated twice via 1 Jev call (in-batch cache)
-            mojo_calls = [c for c in jev_calls if "mojo" in c["merchant"].lower()]
-            self.assertEqual(len(mojo_calls), 1)
-            self.assertEqual(mojo_calls[0]["notes"], "akahu:tx_1")
-            self.assertEqual(mojo_calls[0]["extra_categories"], ["Pets"])
-            self.assertIn("dog", mojo_calls[0]["existing_tags"])
-            self.assertNotIn("general", mojo_calls[0]["existing_tags"])
+        # 1. Default empty POST body -> dry_run=True, include_untagged=False
+        dry_res = self.client.post("/rules/classify-uncategorized")
+        self.assertEqual(dry_res.status_code, 200)
+        dry_body = dry_res.json()
+        self.assertTrue(dry_body["dry_run"])
+        self.assertEqual(dry_body["evaluated"], 6)
+        self.assertEqual(dry_body["updated"], 6)
+        self.assertEqual(dry_body["skipped_circuit_open"], 0)
+        self.assertEqual(dry_body["remaining"], 0)
+        weird_change = next(
+            c for c in dry_body["changes"] if c["transaction_id"] == tx_outflow_income_reject.id
+        )
+        self.assertEqual(weird_change["old_category"], "General")
+        self.assertEqual(weird_change["new_category"], "General")
+        self.assertEqual(weird_change["new_tags"], ["refund"])
+        # Mojo Coffee evaluated twice via 1 Jev call (in-batch cache)
+        mojo_calls = [r for r in gateway.jev_requests if "mojo" in r.user_content.lower()]
+        self.assertEqual(len(mojo_calls), 1)
+        self.assertIn("Notes: akahu:tx_1", mojo_calls[0].user_content)
+        self.assertIn("Additional custom categories: Pets", mojo_calls[0].user_content)
+        self.assertIn("dog", mojo_calls[0].user_content)
+        self.assertNotIn(", general,", mojo_calls[0].user_content)
 
-            # Verify DB unchanged after dry_run=True
-            self.db.expire_all()
-            self.assertEqual(self.db.get(Transaction, tx_tagged_general.id).category, "General")
-            self.assertEqual(self.db.get(Transaction, tx_cache_1.id).category, "General")
+        # Verify DB unchanged after dry_run=True
+        self.db.expire_all()
+        self.assertEqual(self.db.get(Transaction, tx_tagged_general.id).category, "General")
+        self.assertEqual(self.db.get(Transaction, tx_cache_1.id).category, "General")
 
-            # 2. only_outflows=True skips tx_inflow_valid
-            jev_calls.clear()
-            outflow_res = self.client.post(
-                "/rules/classify-uncategorized",
-                json={"only_outflows": True, "dry_run": True},
-            )
-            self.assertEqual(outflow_res.status_code, 200)
-            self.assertEqual(outflow_res.json()["evaluated"], 5)
-            self.assertEqual(outflow_res.json()["updated"], 5)
+        # 2. only_outflows=True skips tx_inflow_valid
+        gateway.requests.clear()
+        outflow_res = self.client.post(
+            "/rules/classify-uncategorized",
+            json={"only_outflows": True, "dry_run": True},
+        )
+        self.assertEqual(outflow_res.status_code, 200)
+        self.assertEqual(outflow_res.json()["evaluated"], 5)
+        self.assertEqual(outflow_res.json()["updated"], 5)
 
-            # 3. include_untagged=True & dry_run=False preserves Personal Care while adding skincare
-            jev_calls.clear()
-            apply_res = self.client.post(
-                "/rules/classify-uncategorized",
-                json={"include_untagged": True, "dry_run": False},
-            )
-            self.assertEqual(apply_res.status_code, 200)
-            apply_body = apply_res.json()
-            self.assertFalse(apply_body["dry_run"])
-            self.assertEqual(apply_body["evaluated"], 7)
-            self.assertEqual(apply_body["updated"], 7)
+        # 3. include_untagged=True & dry_run=False preserves Personal Care while adding skincare
+        gateway.requests.clear()
+        apply_res = self.client.post(
+            "/rules/classify-uncategorized",
+            json={"include_untagged": True, "dry_run": False},
+        )
+        self.assertEqual(apply_res.status_code, 200)
+        apply_body = apply_res.json()
+        self.assertFalse(apply_body["dry_run"])
+        self.assertEqual(apply_body["evaluated"], 7)
+        self.assertEqual(apply_body["updated"], 7)
 
         self.db.expire_all()
         self.assertEqual(self.db.get(Transaction, tx_paired_1.id).category, "General")
@@ -851,24 +840,21 @@ class TestCategorizationRules(unittest.TestCase):
         self.db.add_all(txs)
         self.db.commit()
 
-        with (
-            patch(
-                "app.services.rules_engine.is_jev_circuit_open",
-                side_effect=[False, True],
-            ),
-            patch(
-                "app.services.rules_engine.classify_transaction_jev_with_tags",
-                return_value=("Dining", False, ["coffee"]),
-            ) as mock_jev,
-        ):
-            res = self.client.post(
-                "/rules/classify-uncategorized",
-                json={"limit": 3, "dry_run": False},
-            )
+        def open_after_first(_req: JevGateRequest) -> str:
+            gateway.open_jev_circuit()
+            return json.dumps({"category": "Dining", "is_anomaly": "false", "tags": ["coffee"]})
+
+        gateway = InMemoryAiGateway(jev_handler=open_after_first)
+        app.dependency_overrides[get_ai_gateway] = lambda: gateway
+
+        res = self.client.post(
+            "/rules/classify-uncategorized",
+            json={"limit": 3, "dry_run": False},
+        )
 
         self.assertEqual(res.status_code, 200)
         body = res.json()
-        self.assertEqual(mock_jev.call_count, 1)
+        self.assertEqual(len(gateway.jev_requests), 1)
         self.assertEqual(body["evaluated"], 1)
         self.assertEqual(body["updated"], 1)
         self.assertEqual(body["skipped_circuit_open"], 2)

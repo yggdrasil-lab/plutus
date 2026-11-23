@@ -64,6 +64,7 @@ jobs:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_CHANNEL_WEALTH_ID: ${{ vars.DISCORD_CHANNEL_WEALTH_ID }}
           DISCORD_USER_ID: ${{ vars.DISCORD_USER_ID }}
+          PLUTUS_JEV_MODEL: ${{ vars.PLUTUS_JEV_MODEL || 'jev-decision' }}
           PLUTUS_SYNC_INTERVAL_HOURS: ${{ vars.PLUTUS_SYNC_INTERVAL_HOURS || '6' }}
         run: |
           MISSING=""
@@ -78,6 +79,7 @@ jobs:
           [ -z "$DISCORD_BOT_TOKEN" ] && MISSING="$MISSING DISCORD_BOT_TOKEN"
           [ -z "$DISCORD_CHANNEL_WEALTH_ID" ] && MISSING="$MISSING DISCORD_CHANNEL_WEALTH_ID"
           [ -z "$DISCORD_USER_ID" ] && MISSING="$MISSING DISCORD_USER_ID"
+          [ -z "$PLUTUS_JEV_MODEL" ] && MISSING="$MISSING PLUTUS_JEV_MODEL"
           [ -z "$PLUTUS_SYNC_INTERVAL_HOURS" ] && MISSING="$MISSING PLUTUS_SYNC_INTERVAL_HOURS"
           if [ -n "$MISSING" ]; then
             echo "::error::Deployment halted: missing required configuration:$MISSING" >&2
@@ -95,6 +97,7 @@ jobs:
           PLUTUS_LLM_API_KEY: ${{ secrets.MUNINN_MASTER_KEY }}
           PLUTUS_LLM_MODEL: ${{ vars.PLUTUS_LLM_MODEL || 'app-synthesize' }}
           PLUTUS_RECEIPT_LLM_MODEL: ${{ vars.PLUTUS_RECEIPT_LLM_MODEL || 'gemini-4-hydrogen' }}
+          PLUTUS_JEV_MODEL: ${{ vars.PLUTUS_JEV_MODEL || 'jev-decision' }}
           PLUTUS_DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           PLUTUS_DISCORD_WEALTH_CHANNEL_ID: ${{ vars.DISCORD_CHANNEL_WEALTH_ID }}
           PLUTUS_DISCORD_USER_ID: ${{ vars.DISCORD_USER_ID }}
