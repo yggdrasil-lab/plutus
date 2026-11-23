@@ -167,3 +167,95 @@ class TestProductsRouter(unittest.TestCase):
         search_res = self.client.get("/products?search=almond")
         self.assertEqual(search_res.status_code, 200)
         self.assertEqual(search_res.json()["total_count"], 1)
+
+    def test_get_products_is_read_only_and_crud_errors_and_delete_unlinks_items(self):
+        # 1. Seed a product and an unlinked receipt item directly in DB
+        prod = Product(name="Pure Electrolytes 250g", category="Supplements", domain="01-health")
+        self.db.add(prod)
+        self.db.flush()
+        receipt = Receipt(
+            receipt_date=date(2026, 9, 1),
+            merchant="Harbour Pharmacy",
+            total_amount=25.00,
+            currency="NZD",
+            status="unlinked",
+        )
+        self.db.add(receipt)
+        self.db.flush()
+        unlinked_item = ReceiptItem(
+            receipt_id=receipt.id,
+            product_id=None,
+            item_name="Pure Electrolytes 250g",
+            quantity=1.0,
+            unit_price=25.00,
+            total_price=25.00,
+            category="Supplements",
+        )
+        self.db.add(unlinked_item)
+        self.db.commit()
+
+        # 2. GET /products and GET /products/{id} must NOT mutate unlinked ReceiptItem.product_id
+        list_res = self.client.get("/products")
+        self.assertEqual(list_res.status_code, 200)
+        self.assertEqual(list_res.json()["products"][0]["purchase_count"], 0)
+        detail_res = self.client.get(f"/products/{prod.id}")
+        self.assertEqual(detail_res.status_code, 200)
+        self.assertEqual(detail_res.json()["purchase_count"], 0)
+        self.db.expire_all()
+        self.assertIsNone(self.db.get(ReceiptItem, unlinked_item.id).product_id)
+
+        # 3. Duplicate create -> 400; missing get/patch/delete -> 404
+        dup_res = self.client.post("/products", json={"name": "pure electrolytes 250g"})
+        self.assertEqual(dup_res.status_code, 400)
+        self.assertEqual(self.client.get("/products/99999").status_code, 404)
+        self.assertEqual(self.client.patch("/products/99999", json={"notes": "x"}).status_code, 404)
+        self.assertEqual(self.client.delete("/products/99999").status_code, 404)
+
+        # 4. PATCH preserves omitted nullable fields and clears explicit null fields
+        patch_set = self.client.patch(
+            f"/products/{prod.id}",
+            json={"brand": "Harbour Labs", "notes": "Clean citrus", "rating": 5},
+        )
+        self.assertEqual(patch_set.status_code, 200)
+        self.assertEqual(patch_set.json()["brand"], "Harbour Labs")
+        self.assertEqual(patch_set.json()["rating"], 5)
+
+        patch_clear = self.client.patch(
+            f"/products/{prod.id}",
+            json={"notes": None, "rating": None},
+        )
+        self.assertEqual(patch_clear.status_code, 200)
+        self.assertEqual(patch_clear.json()["brand"], "Harbour Labs")
+        self.assertIsNone(patch_clear.json()["notes"])
+        self.assertIsNone(patch_clear.json()["rating"])
+
+        # 5. Linked receipt item stays intact and becomes unlinked after DELETE /products/{id}
+        linked_receipt = self.client.post(
+            "/receipts",
+            json={
+                "receipt_date": "2026-09-15",
+                "merchant": "Harbour Pharmacy",
+                "total_amount": 27.00,
+                "items": [
+                    {
+                        "item_name": "Pure Electrolytes 250g",
+                        "quantity": 1.0,
+                        "unit_price": 27.00,
+                        "total_price": 27.00,
+                    }
+                ],
+            },
+        )
+        self.assertEqual(linked_receipt.status_code, 201)
+        linked_item_id = linked_receipt.json()["items"][0]["id"]
+        self.assertEqual(linked_receipt.json()["items"][0]["product_id"], prod.id)
+
+        del_res = self.client.delete(f"/products/{prod.id}")
+        self.assertEqual(del_res.status_code, 200)
+        self.assertEqual(del_res.json(), {"status": "deleted", "id": prod.id})
+        self.assertEqual(self.client.get(f"/products/{prod.id}").status_code, 404)
+
+        self.db.expire_all()
+        surviving_item = self.db.get(ReceiptItem, linked_item_id)
+        self.assertIsNotNone(surviving_item)
+        self.assertIsNone(surviving_item.product_id)

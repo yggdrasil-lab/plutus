@@ -10,8 +10,13 @@ from sqlalchemy.orm import Session, joinedload, selectinload
 from app.db import get_db
 from app.models import Receipt, ReceiptItem, Transaction
 from app.services.ai_gateway import AiGateway, get_ai_gateway
+from app.services.product_catalog import (
+    ProductStatisticsSnapshot,
+    compute_product_statistics,
+)
 from app.services.rules_engine import normalize_tags
 from app.schemas import (
+    ProductStatisticItem,
     ProductStatisticsResponse,
     ReceiptCreate,
     ReceiptItemCreate,
@@ -24,7 +29,6 @@ from app.services.receipt_service import (
     apply_parsed_payslip_fields,
     apply_receipt_discounts_with_jev,
     compress_receipt_image,
-    compute_product_statistics,
     create_classified_receipt_item,
     find_receipt_transaction_candidates,
     infer_receipt_mime_type,
@@ -315,6 +319,34 @@ def list_receipt_candidates(
     return find_receipt_transaction_candidates(db, receipt, limit=5)
 
 
+def _to_product_statistics_response(
+    snapshot: ProductStatisticsSnapshot,
+) -> ProductStatisticsResponse:
+    return ProductStatisticsResponse(
+        domain=snapshot.domain,
+        total_products=snapshot.total_products,
+        total_spend=snapshot.total_spend,
+        products=[
+            ProductStatisticItem(
+                item_name=item.item_name,
+                brand=item.brand,
+                category=item.category,
+                domain=item.domain,
+                product_type=item.product_type,
+                volume_ml=item.volume_ml,
+                purchase_count=item.purchase_count,
+                total_spent=item.total_spent,
+                unit_price_latest=item.unit_price_latest,
+                first_purchased=item.first_purchased,
+                last_purchased=item.last_purchased,
+                avg_days_between_purchases=item.avg_days_between_purchases,
+                estimated_depletion_date=item.estimated_depletion_date,
+            )
+            for item in snapshot.products
+        ],
+    )
+
+
 @router.get("/statistics/products", response_model=ProductStatisticsResponse)
 def get_product_statistics(
     domain: Optional[str] = Query(default=None, description="e.g. '02-skin', '01-health', '20-home'"),
@@ -322,7 +354,8 @@ def get_product_statistics(
     db: Session = Depends(get_db),
 ):
     """Retrieve granular product purchase statistics, spend volume, and usage longevity."""
-    return compute_product_statistics(db, domain=domain, product_type=product_type)
+    snapshot = compute_product_statistics(db, domain=domain, product_type=product_type)
+    return _to_product_statistics_response(snapshot)
 
 
 @router.get("/{receipt_id}", response_model=ReceiptRead)

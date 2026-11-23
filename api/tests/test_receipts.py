@@ -24,7 +24,6 @@ from app.services.ai_gateway import (
 )
 from app.services.receipt_service import (
     classify_line_item,
-    compute_product_statistics,
     extract_tags_for_line_item,
     match_receipt_to_transaction,
     reconcile_unlinked_receipts,

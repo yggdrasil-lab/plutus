@@ -17,13 +17,9 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, joinedload
 
 from app.config import settings
-from app.models import CategorizationRule, Product, Receipt, ReceiptItem, Transaction
+from app.models import CategorizationRule, Receipt, ReceiptItem, Transaction
 from app.schemas import (
     InboundEmailDispatchPayload,
-    PricePoint,
-    ProductRead,
-    ProductStatisticItem,
-    ProductStatisticsResponse,
     TransactionCandidateRead,
 )
 from app.services.ai_gateway import (
@@ -44,6 +40,7 @@ from app.services.email_utils import (
 )
 from app.services.fx_service import get_exchange_rate
 from app.services.jev_client import call_jev, classify_transaction_jev_with_tags, get_extra_jev_categories
+from app.services.product_catalog import get_or_create_product
 from app.services.rules_engine import (
     collect_existing_tags,
     match_receipt_item_rule,
@@ -447,151 +444,10 @@ def classify_and_tag_receipt_item(
     return resolved_cat, resolved_dom, resolved_ptype, resolved_vol, final_tags
 
 
-def get_or_create_product(
-    db: Session,
-    item_name: str,
-    brand: Optional[str] = None,
-    category: Optional[str] = None,
-    domain: Optional[str] = None,
-    tags: Optional[list[str]] = None,
-    volume_ml: Optional[str] = None,
-) -> Product:
-    """Finds an existing catalog product by name or creates a new one, merging tags and metadata."""
-    canonical = item_name.strip()
-    stmt = select(Product).where(func.lower(Product.name) == canonical.lower())
-    product = db.scalars(stmt).first()
-
-    tags_list = tags or []
-    if not tags_list:
-        _, auto_dom, auto_ptype, _ = classify_line_item(canonical)
-        tags_list = extract_tags_for_line_item(canonical, auto_dom or domain, auto_ptype)
-
-    if product:
-        existing_tags = []
-        if product.tags:
-            try:
-                existing_tags = json.loads(product.tags)
-            except Exception:
-                existing_tags = [t.strip() for t in product.tags.split(",") if t.strip()]
-        combined_tags = sorted(list(set(existing_tags + tags_list)))
-        product.tags = json.dumps(combined_tags)
-        if not product.brand and brand:
-            product.brand = brand.strip()
-        if not product.volume_ml and volume_ml:
-            product.volume_ml = volume_ml.strip()
-        db.flush()
-        return product
-
-    new_prod = Product(
-        name=canonical,
-        brand=brand.strip() if brand else None,
-        category=category or "General",
-        domain=domain,
-        tags=json.dumps(tags_list),
-        volume_ml=volume_ml.strip() if volume_ml else None,
-    )
-    db.add(new_prod)
-    db.flush()
-    return new_prod
-
-
-def build_product_read(db: Session, product: Product) -> ProductRead:
-    """Computes price telemetry, price change history, and usage duration for a Product."""
-    stmt = (
-        select(ReceiptItem)
-        .join(Receipt)
-        .where(ReceiptItem.product_id == product.id)
-        .order_by(Receipt.receipt_date.asc(), ReceiptItem.id.asc())
-    )
-    items = db.scalars(stmt).all()
-
-    # Fallback name matching if items were uploaded before explicit linking
-    if not items:
-        stmt_fallback = (
-            select(ReceiptItem)
-            .join(Receipt)
-            .where(func.lower(ReceiptItem.item_name) == product.name.lower())
-            .order_by(Receipt.receipt_date.asc(), ReceiptItem.id.asc())
-        )
-        items = db.scalars(stmt_fallback).all()
-        for it in items:
-            it.product_id = product.id
-        if items:
-            db.flush()
-
-    price_history: list[PricePoint] = []
-    unit_prices: list[float] = []
-    total_spent = 0.0
-
-    for it in items:
-        u_price = float(it.unit_price)
-        t_price = float(it.total_price)
-        unit_prices.append(u_price)
-        total_spent += t_price
-        price_history.append(
-            PricePoint(
-                date=it.receipt.receipt_date,
-                merchant=it.receipt.merchant,
-                unit_price=u_price,
-                discount_amount=float(it.discount_amount) if it.discount_amount is not None else None,
-                total_price=t_price,
-                quantity=float(it.quantity),
-                receipt_id=it.receipt_id,
-                receipt_item_id=it.id,
-            )
-        )
-
-    purchase_count = len(items)
-    latest_price = unit_prices[-1] if unit_prices else None
-    lowest_price = min(unit_prices) if unit_prices else None
-    highest_price = max(unit_prices) if unit_prices else None
-    average_price = round(sum(unit_prices) / len(unit_prices), 2) if unit_prices else None
-    price_change_latest = round(unit_prices[-1] - unit_prices[-2], 2) if len(unit_prices) >= 2 else None
-
-    first_purchased = items[0].receipt.receipt_date if items else None
-    last_purchased = items[-1].receipt.receipt_date if items else None
-
-    avg_days: Optional[float] = None
-    depletion_date: Optional[date] = None
-    if purchase_count > 1 and first_purchased and last_purchased:
-        total_days = (last_purchased - first_purchased).days
-        avg_days = round(total_days / (purchase_count - 1), 1)
-        if avg_days > 0:
-            depletion_date = last_purchased + timedelta(days=int(avg_days))
-
-    tags_list: list[str] = []
-    if product.tags:
-        try:
-            tags_list = json.loads(product.tags)
-        except Exception:
-            tags_list = [t.strip() for t in product.tags.split(",") if t.strip()]
-
-    return ProductRead(
-        id=product.id,
-        name=product.name,
-        brand=product.brand,
-        category=product.category,
-        domain=product.domain,
-        tags=tags_list,
-        volume_ml=product.volume_ml,
-        notes=product.notes,
-        rating=product.rating,
-        is_favorite=product.is_favorite,
-        purchase_count=purchase_count,
-        total_spent=round(total_spent, 2),
-        latest_price=latest_price,
-        lowest_price=lowest_price,
-        highest_price=highest_price,
-        average_price=average_price,
-        price_change_latest=price_change_latest,
-        first_purchased=first_purchased,
-        last_purchased=last_purchased,
-        avg_days_between_purchases=avg_days,
-        estimated_depletion_date=depletion_date,
-        price_history=price_history,
-        created_at=product.created_at,
-        updated_at=product.updated_at,
-    )
+def _resolve_product_tags(item_name: str, domain: Optional[str]) -> list[str]:
+    """Derive default catalog tags when a receipt item produced none."""
+    _, auto_dom, auto_ptype, _ = classify_line_item(item_name)
+    return extract_tags_for_line_item(item_name, auto_dom or domain, auto_ptype)
 
 
 def infer_receipt_mime_type(filename: Optional[str], content_type: Optional[str]) -> str:
@@ -1119,6 +975,7 @@ def create_classified_receipt_item(
             domain=dom,
             tags=tags_list,
             volume_ml=vol,
+            tag_resolver=_resolve_product_tags,
         )
         prod_id = prod.id
 
@@ -2270,76 +2127,3 @@ def ingest_payslip_email(
         raw_text=raw_text, stored_media=stored_media,
     )
 
-
-def compute_product_statistics(
-    db: Session,
-    domain: Optional[str] = None,
-    product_type: Optional[str] = None,
-) -> ProductStatisticsResponse:
-    """Aggregates product purchase history and usage duration across receipt line items."""
-    stmt = select(ReceiptItem).join(Receipt)
-    if domain:
-        stmt = stmt.where(ReceiptItem.domain == domain)
-    if product_type:
-        stmt = stmt.where(ReceiptItem.product_type == product_type)
-
-    items = db.scalars(stmt.order_by(Receipt.receipt_date.asc())).all()
-
-    # Group by canonical product identifier: (item_name.lower().strip())
-    products_map: dict[str, list[tuple[ReceiptItem, date]]] = {}
-    total_spend = 0.0
-
-    for item in items:
-        key = item.item_name.strip()
-        r_date = item.receipt.receipt_date
-        products_map.setdefault(key, []).append((item, r_date))
-        total_spend += float(item.total_price)
-
-    stats_list: list[ProductStatisticItem] = []
-    today = date.today()
-
-    for item_name, occurrences in products_map.items():
-        occurrences.sort(key=lambda x: x[1])
-        first_item, first_date = occurrences[0]
-        latest_item, last_date = occurrences[-1]
-
-        purchase_count = len(occurrences)
-        prod_spend = sum(float(it.total_price) for it, _ in occurrences)
-        latest_unit_price = float(latest_item.unit_price)
-
-        avg_days: Optional[float] = None
-        depletion_date: Optional[date] = None
-
-        if purchase_count > 1:
-            total_days = (last_date - first_date).days
-            avg_days = round(total_days / (purchase_count - 1), 1)
-            if avg_days > 0:
-                depletion_date = last_date + timedelta(days=int(avg_days))
-
-        stats_list.append(
-            ProductStatisticItem(
-                item_name=item_name,
-                brand=latest_item.brand,
-                category=latest_item.category,
-                domain=latest_item.domain,
-                product_type=latest_item.product_type,
-                volume_ml=latest_item.volume_ml,
-                purchase_count=purchase_count,
-                total_spent=prod_spend,
-                unit_price_latest=latest_unit_price,
-                first_purchased=first_date,
-                last_purchased=last_date,
-                avg_days_between_purchases=avg_days,
-                estimated_depletion_date=depletion_date,
-            )
-        )
-
-    # Sort by total spent descending
-    stats_list.sort(key=lambda x: x.total_spent, reverse=True)
-
-    return ProductStatisticsResponse(
-        domain=domain,
-        total_products=len(stats_list),
-        total_spend=total_spend,
-        products=stats_list,
-    )
