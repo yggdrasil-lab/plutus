@@ -14,7 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.db import Base, get_db
 from app.main import app
-from app.models import Account, BudgetRule, Transaction
+from app.models import Account, BudgetRule, Category, Transaction
+from app.services.category_taxonomy import ensure_default_categories
 
 # In-memory SQLite for testing with StaticPool so all connections share the memory DB
 TEST_DB_URL = "sqlite:///:memory:"
@@ -576,6 +577,110 @@ class TestBudgetsRouter(unittest.TestCase):
         self.assertAlmostEqual(custom_transport["total_spend"], 20.00, places=2)
         self.assertEqual(custom_transport["transaction_count"], 1)
         self.assertEqual(custom_transport["amortized_count"], 0)
+
+    def test_budget_writes_sync_canonical_casing_amortization_and_system_guards(self):
+        ensure_default_categories(self.db)
+
+        # 1. Create canonicalizes category casing and sets Category.amortize_period='annual'
+        res = self.client.post(
+            "/budgets",
+            json={"category": " travel ", "annual_limit": 2600.0, "budget_period": "annual"},
+        )
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()["category"], "Travel")
+        travel_id = res.json()["id"]
+        travel_cat = self.db.query(Category).filter(Category.name == "Travel").one()
+        self.assertEqual(travel_cat.amortize_period, "annual")
+
+        # 2. Inactive update ignores Category.amortize_period (neither clears nor sets it)
+        inactive_res = self.client.post(
+            "/budgets",
+            json={
+                "category": "TRAVEL",
+                "monthly_limit": 200.0,
+                "budget_period": "monthly",
+                "is_active": False,
+            },
+        )
+        self.assertEqual(inactive_res.status_code, 200)
+        self.assertEqual(inactive_res.json()["category"], "Travel")
+        self.db.refresh(travel_cat)
+        self.assertEqual(travel_cat.amortize_period, "annual")
+
+        # 3. Inactive annual rule on Food must not set Food.amortize_period='annual'
+        food_cat = self.db.query(Category).filter(Category.name == "Food").one()
+        res_food_inactive = self.client.post(
+            "/budgets",
+            json={
+                "category": "food",
+                "annual_limit": 1040.0,
+                "budget_period": "annual",
+                "is_active": False,
+            },
+        )
+        self.assertEqual(res_food_inactive.status_code, 200)
+        self.db.refresh(food_cat)
+        self.assertIsNone(food_cat.amortize_period)
+
+        # 4. Deleting a BudgetRule preserves Category.amortize_period='annual'
+        del_res = self.client.delete(f"/budgets/{travel_id}")
+        self.assertEqual(del_res.status_code, 204)
+        self.db.refresh(travel_cat)
+        self.assertEqual(travel_cat.amortize_period, "annual")
+
+        # 5. Reject annual budget_period on system categories -> HTTP 400
+        for sys_name in ("Transfers", "Income", "General", "Debt & Loans"):
+            err = self.client.post(
+                "/budgets",
+                json={"category": sys_name, "annual_limit": 520.0, "budget_period": "annual"},
+            )
+            self.assertEqual(err.status_code, 400, f"Expected 400 for {sys_name}")
+
+        # 6. POST /budgets/init-defaults preserves existing Category.amortize_period='annual'
+        ins_cat = self.db.query(Category).filter(Category.name == "Insurance").one()
+        ins_cat.amortize_period = "annual"
+        self.db.commit()
+        init_res = self.client.post("/budgets/init-defaults")
+        self.assertEqual(init_res.status_code, 200)
+        by_cat = {r["category"]: r for r in init_res.json()}
+        self.assertEqual(by_cat["Insurance"]["budget_period"], "annual")
+        self.db.refresh(ins_cat)
+        self.assertEqual(ins_cat.amortize_period, "annual")
+
+    def test_sync_from_burn_syncs_annual_and_canonicalizes_casing(self):
+        ensure_default_categories(self.db)
+        travel_cat = self.db.query(Category).filter(Category.name == "Travel").one()
+        travel_cat.amortize_period = "annual"
+        self.db.add(
+            BudgetRule(
+                category="travel",
+                weekly_limit=10.0,
+                monthly_limit=43.33,
+                budget_period="monthly",
+                is_active=False,
+            )
+        )
+        self.db.add(
+            Transaction(
+                transaction_date=date.today(),
+                account_id=self.acc.id,
+                amount=-520.0,
+                currency="NZD",
+                merchant="Air NZ",
+                category="Travel",
+                raw_hash="sync-burn-travel",
+            )
+        )
+        self.db.commit()
+
+        sync_res = self.client.post("/budgets/sync-from-burn?lookback_weeks=4")
+        self.assertEqual(sync_res.status_code, 200)
+        travel_rule = next(r for r in sync_res.json() if r["category"] == "Travel")
+        self.assertEqual(travel_rule["budget_period"], "annual")
+        self.assertTrue(travel_rule["is_active"])
+        self.assertAlmostEqual(travel_rule["weekly_limit"], 10.0, places=2)
+        self.db.refresh(travel_cat)
+        self.assertEqual(travel_cat.amortize_period, "annual")
 
 
 if __name__ == "__main__":

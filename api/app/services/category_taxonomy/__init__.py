@@ -7,6 +7,7 @@ from app.services.category_taxonomy._types import (
     SYSTEM_CATEGORY_NAMES,
     SYSTEM_CATEGORY_NAMES_LOWER,
     UNSET,
+    AnnualCategoryTaxonomy,
     CategoryConflictError,
     CategoryCreateInput,
     CategoryDeleteSummary,
@@ -18,13 +19,27 @@ from app.services.category_taxonomy._types import (
     CategoryUpdateInput,
     CategoryValidationError,
 )
+from app.services.category_taxonomy.budget_sync import (
+    resolve_budget_rule_category,
+    resolve_budget_rule_period,
+    sync_budget_rule_amortization,
+)
 from app.services.category_taxonomy.lifecycle import (
     create_category,
     delete_category,
     update_category,
 )
+from app.services.category_taxonomy.normalization import (
+    AKAHU_CATEGORY_RULES,
+    AKAHU_TAG_HINTS,
+    _concise_akahu_tags,
+    normalize_akahu_category,
+    normalize_existing_legacy_categories,
+)
 from app.services.category_taxonomy.queries import (
     ensure_default_categories,
+    get_active_categories,
+    get_annual_category_taxonomy,
     get_canonical_category_names,
     get_category_parent_map,
     get_category_snapshot,
@@ -35,6 +50,9 @@ from app.services.category_taxonomy.queries import (
 )
 
 __all__ = [
+    "AKAHU_CATEGORY_RULES",
+    "AKAHU_TAG_HINTS",
+    "AnnualCategoryTaxonomy",
     "CATEGORY_PARENTS",
     "CategoryConflictError",
     "CategoryCreateInput",
@@ -51,9 +69,12 @@ __all__ = [
     "SYSTEM_CATEGORY_NAMES",
     "SYSTEM_CATEGORY_NAMES_LOWER",
     "UNSET",
+    "_concise_akahu_tags",
     "create_category",
     "delete_category",
     "ensure_default_categories",
+    "get_active_categories",
+    "get_annual_category_taxonomy",
     "get_canonical_category_names",
     "get_category_parent_map",
     "get_category_snapshot",
@@ -61,5 +82,10 @@ __all__ = [
     "get_parent_category",
     "get_root_category",
     "list_categories",
+    "normalize_akahu_category",
+    "normalize_existing_legacy_categories",
+    "resolve_budget_rule_category",
+    "resolve_budget_rule_period",
+    "sync_budget_rule_amortization",
     "update_category",
 ]

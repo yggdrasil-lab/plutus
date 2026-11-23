@@ -26,7 +26,7 @@ from app.models import (
     Transaction,
     TransactionSplit,
 )
-from app.services.connectors.akahu import normalize_existing_legacy_categories
+from app.services.category_taxonomy import normalize_existing_legacy_categories
 from app.services.receipt_service import classify_line_item
 from app.services.statement_parser import auto_categorize
 
