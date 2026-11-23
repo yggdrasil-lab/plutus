@@ -5,7 +5,6 @@ import io
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -17,6 +16,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.db import Base, get_db
 from app.main import app
 from app.models import Account, Receipt, ReceiptItem, Transaction
+from app.services.ai_gateway import (
+    AiUpstreamError,
+    InMemoryAiGateway,
+    JevGateRequest,
+    get_ai_gateway,
+)
 from app.services.receipt_service import (
     classify_line_item,
     compute_product_statistics,
@@ -62,6 +67,7 @@ class TestReceiptsRouter(unittest.TestCase):
 
     def tearDown(self):
         app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides.pop(get_ai_gateway, None)
         self.db.close()
         Base.metadata.drop_all(bind=engine)
 
@@ -264,12 +270,16 @@ class TestReceiptsRouter(unittest.TestCase):
             ],
         }
 
-        with patch("app.routers.receipts.parse_receipt_with_llm", return_value=mock_parsed) as mock_llm:
-            res = self.client.post(
-                "/receipts/upload",
-                files={"file": ("receipt.png", raw_png, "image/png")},
-            )
-            mock_llm.assert_called_once()
+        gateway = InMemoryAiGateway(
+            vision_responses=[mock_parsed],
+            jev_responses=['{"category": "Personal Care", "is_anomaly": false, "primary_tag": "none"}'],
+        )
+        app.dependency_overrides[get_ai_gateway] = lambda: gateway
+        res = self.client.post(
+            "/receipts/upload",
+            files={"file": ("receipt.png", raw_png, "image/png")},
+        )
+        self.assertEqual(len(gateway.vision_requests), 1)
 
         self.assertEqual(res.status_code, 201)
         data = res.json()
@@ -287,25 +297,6 @@ class TestReceiptsRouter(unittest.TestCase):
 
     def test_upload_unprocessed_preserves_original_until_reprocessed_then_delete(self):
         raw_png = self._make_test_png_bytes(1800, 1800)
-
-        with patch("app.routers.receipts.parse_receipt_with_llm", return_value=None):
-            res = self.client.post(
-                "/receipts/upload",
-                files={"file": ("IMG_1234.png", raw_png, "image/png")},
-            )
-
-        self.assertEqual(res.status_code, 201)
-        data = res.json()
-        self.assertFalse(data["is_processed"])
-        self.assertTrue(data["has_image"])
-        self.assertEqual(data["image_mime_type"], "image/png")
-
-        # Original bytes preserved verbatim while unprocessed
-        img_res = self.client.get(f"/receipts/{data['id']}/image")
-        self.assertEqual(img_res.status_code, 200)
-        self.assertEqual(img_res.content, raw_png)
-
-        # Reprocess succeeds and compresses the stored image
         mock_parsed = {
             "merchant": "Woolworths",
             "receipt_date": "2026-11-19",
@@ -319,8 +310,34 @@ class TestReceiptsRouter(unittest.TestCase):
                 }
             ],
         }
-        with patch("app.routers.receipts.parse_receipt_with_llm", return_value=mock_parsed):
-            re_res = self.client.post(f"/receipts/{data['id']}/reprocess")
+        gateway = InMemoryAiGateway(
+            vision_responses=[
+                AiUpstreamError("Vision temporarily unavailable", status_code=503),
+                mock_parsed,
+            ],
+            jev_responses=['{"category": "Groceries", "is_anomaly": false, "primary_tag": "none"}'],
+        )
+        app.dependency_overrides[get_ai_gateway] = lambda: gateway
+
+        res = self.client.post(
+            "/receipts/upload",
+            files={"file": ("IMG_1234.png", raw_png, "image/png")},
+        )
+
+        self.assertEqual(res.status_code, 201)
+        data = res.json()
+        self.assertFalse(data["is_processed"])
+        self.assertTrue(data["has_image"])
+        self.assertEqual(data["image_mime_type"], "image/png")
+
+        # Original bytes preserved verbatim while unprocessed
+        img_res = self.client.get(f"/receipts/{data['id']}/image")
+        self.assertEqual(img_res.status_code, 200)
+        self.assertEqual(img_res.content, raw_png)
+
+        # Reprocess succeeds and compresses the stored image
+        re_res = self.client.post(f"/receipts/{data['id']}/reprocess")
+        self.assertEqual(len(gateway.vision_requests), 2)
 
         self.assertEqual(re_res.status_code, 200)
         re_data = re_res.json()
@@ -391,14 +408,20 @@ class TestReceiptsRouter(unittest.TestCase):
             ],
         }
 
-        with (
-            patch("app.routers.receipts.parse_receipt_with_llm", return_value=mock_parsed),
-            patch("app.services.receipt_service.call_jev", return_value=('{"target_index": "1"}', 0.05)),
-        ):
-            res = self.client.post(
-                "/receipts/upload",
-                files={"file": ("costco.png", raw_png, "image/png")},
-            )
+        def jev_handler(req: JevGateRequest) -> str:
+            if "target_index" in req.system_prompt:
+                return '{"target_index": "1"}'
+            return '{"category": "Groceries", "is_anomaly": false, "primary_tag": "none"}'
+
+        gateway = InMemoryAiGateway(
+            vision_responses=[mock_parsed],
+            jev_handler=jev_handler,
+        )
+        app.dependency_overrides[get_ai_gateway] = lambda: gateway
+        res = self.client.post(
+            "/receipts/upload",
+            files={"file": ("costco.png", raw_png, "image/png")},
+        )
 
         self.assertEqual(res.status_code, 201)
         data = res.json()
@@ -417,8 +440,10 @@ class TestReceiptsRouter(unittest.TestCase):
             {"item_name": "Coca Cola Zero 36P", "quantity": 1.0, "unit_price": 34.99, "total_price": 34.99},
             {"item_name": "TPD Coca Cola No S", "quantity": 1.0, "unit_price": -7.00, "total_price": -7.00},
         ]
-        with patch("app.services.receipt_service.call_jev", return_value=(None, 0.0)):
-            resolved = apply_receipt_discounts_with_jev(items)
+        gateway = InMemoryAiGateway(
+            jev_responses=[AiUpstreamError("Jev offline", status_code=503)]
+        )
+        resolved = apply_receipt_discounts_with_jev(items, gateway=gateway)
 
         self.assertEqual(len(resolved), 2)
         self.assertEqual(resolved[1]["unit_price"], 34.99)
@@ -651,41 +676,32 @@ class TestReceiptsRouter(unittest.TestCase):
         self.db.add(Category(name="Sports Gear", is_active=True, is_system=False, sort_order=150))
         self.db.commit()
 
-        seen_jev_calls = []
-
-        def fake_jev(merchant, amount, notes=None, existing_tags=None, extra_categories=None):
-            seen_jev_calls.append(
-                {
-                    "merchant": merchant,
-                    "existing_tags": existing_tags,
-                    "extra_categories": extra_categories,
-                }
-            )
-            return ("Leisure", False, ["badminton"])
-
-        with patch("app.services.receipt_service.classify_transaction_jev_with_tags", side_effect=fake_jev):
-            create_res = self.client.post(
-                "/receipts",
-                json={
-                    "receipt_date": date.today().isoformat(),
-                    "merchant": "Chemist & Sport",
-                    "total_amount": 64.90,
-                    "items": [
-                        {
-                            "item_name": "CeraVe Hydrating Wash 236ml",
-                            "quantity": 1.0,
-                            "unit_price": 24.90,
-                            "total_price": 24.90,
-                        },
-                        {
-                            "item_name": "Yonex Aerosensa Feather Pack",
-                            "quantity": 1.0,
-                            "unit_price": 40.00,
-                            "total_price": 40.00,
-                        },
-                    ],
-                },
-            )
+        gateway = InMemoryAiGateway(
+            jev_handler=lambda _req: '{"category": "Leisure", "is_anomaly": false, "primary_tag": "badminton"}'
+        )
+        app.dependency_overrides[get_ai_gateway] = lambda: gateway
+        create_res = self.client.post(
+            "/receipts",
+            json={
+                "receipt_date": date.today().isoformat(),
+                "merchant": "Chemist & Sport",
+                "total_amount": 64.90,
+                "items": [
+                    {
+                        "item_name": "CeraVe Hydrating Wash 236ml",
+                        "quantity": 1.0,
+                        "unit_price": 24.90,
+                        "total_price": 24.90,
+                    },
+                    {
+                        "item_name": "Yonex Aerosensa Feather Pack",
+                        "quantity": 1.0,
+                        "unit_price": 40.00,
+                        "total_price": 40.00,
+                    },
+                ],
+            },
+        )
 
         self.assertEqual(create_res.status_code, 201)
         items_by_name = {it["item_name"]: it for it in create_res.json()["items"]}
@@ -699,11 +715,13 @@ class TestReceiptsRouter(unittest.TestCase):
         yonex = items_by_name["Yonex Aerosensa Feather Pack"]
         self.assertEqual(yonex["category"], "Leisure")
         self.assertIn("badminton", yonex["tags"])
-        self.assertEqual(len(seen_jev_calls), 1)
-        self.assertEqual(seen_jev_calls[0]["merchant"], "Yonex Aerosensa Feather Pack")
-        self.assertIn("badminton", seen_jev_calls[0]["existing_tags"])
-        self.assertIn("coffee-beans", seen_jev_calls[0]["existing_tags"])
-        self.assertEqual(seen_jev_calls[0]["extra_categories"], ["Sports Gear"])
+        self.assertEqual(len(gateway.jev_requests), 1)
+        sent_jev = gateway.jev_requests[0]
+        self.assertIn("Merchant: Yonex Aerosensa Feather Pack", sent_jev.user_content)
+        self.assertIn("badminton", sent_jev.user_content)
+        self.assertIn("coffee-beans", sent_jev.user_content)
+        self.assertIn("Additional custom categories: Sports Gear", sent_jev.user_content)
+        self.assertIn("Sports Gear", sent_jev.system_prompt)
 
         # 3. Creating a new rule later with apply_retroactively=True updates existing receipt items
         yonex_rule = self.client.post(
@@ -740,26 +758,26 @@ class TestReceiptsRouter(unittest.TestCase):
             ["clothing"],
         )
 
-        with patch(
-            "app.services.receipt_service.classify_transaction_jev_with_tags",
-            return_value=("General", False, []),
-        ):
-            res = self.client.post(
-                "/receipts",
-                json={
-                    "receipt_date": date.today().isoformat(),
-                    "merchant": "Corner Shop",
-                    "total_amount": 12.00,
-                    "items": [
-                        {
-                            "item_name": "Zebra Gizmo",
-                            "quantity": 1.0,
-                            "unit_price": 12.00,
-                            "total_price": 12.00,
-                        }
-                    ],
-                },
-            )
+        gateway = InMemoryAiGateway(
+            jev_responses=['{"category": "General", "is_anomaly": false, "primary_tag": "none"}']
+        )
+        app.dependency_overrides[get_ai_gateway] = lambda: gateway
+        res = self.client.post(
+            "/receipts",
+            json={
+                "receipt_date": date.today().isoformat(),
+                "merchant": "Corner Shop",
+                "total_amount": 12.00,
+                "items": [
+                    {
+                        "item_name": "Zebra Gizmo",
+                        "quantity": 1.0,
+                        "unit_price": 12.00,
+                        "total_price": 12.00,
+                    }
+                ],
+            },
+        )
         self.assertEqual(res.status_code, 201)
         item = res.json()["items"][0]
         self.assertEqual(item["tags"], [])

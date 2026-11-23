@@ -33,6 +33,7 @@ from app.schemas import (
     TransactionRead,
 )
 from app.routers.transactions import _transaction_load_options, hydrate_transaction
+from app.services.ai_gateway import AiGateway, get_ai_gateway
 from app.services.connectors import ConnectorConfigError, ConnectorUpstreamError
 from app.services.connectors.akahu import sync_akahu
 from app.services.connectors.bitcoin import sync_bitcoin
@@ -99,85 +100,78 @@ def verify_integration_token(
     )
 
 
+def _resolve_quick_log_account(db: Session, account_name: Optional[str]) -> Account:
+    target_account = None
+    if account_name:
+        target_account = db.scalar(
+            select(Account).where(Account.name.ilike(f"%{account_name}%"), Account.is_active == True)
+        )
+    if not target_account:
+        target_account = db.scalar(
+            select(Account).where(Account.account_type == "checking", Account.is_active == True)
+        )
+    if target_account:
+        return target_account
+    target_account = Account(
+        name="Primary Checking",
+        account_type="checking",
+        tier="cash",
+        institution="Bank",
+        currency="NZD",
+        expected_annual_return=0.0,
+        is_active=True,
+    )
+    db.add(target_account)
+    db.commit()
+    db.refresh(target_account)
+    return target_account
+
+
+def _resolve_quick_log_category_and_notes(
+    db: Session,
+    payload: QuickLogRequest,
+    gateway: AiGateway,
+) -> tuple[str, list[str], Optional[str]]:
+    category = payload.category
+    notes = payload.notes
+    if category and category != "General":
+        return category, [], notes
+    jev_cat, is_anomaly, jev_tags = classify_transaction_jev_with_tags(
+        payload.merchant,
+        payload.amount,
+        payload.notes,
+        existing_tags=collect_existing_tags(db),
+        extra_categories=get_extra_jev_categories(db),
+        gateway=gateway,
+    )
+    resolved_cat = jev_cat if jev_cat and jev_cat != "General" else auto_categorize(payload.merchant)
+    cleaned_tags = strip_redundant_tags(jev_tags, resolved_cat)
+    if is_anomaly:
+        notes = f"{notes} [Anomaly Detected]".strip() if notes else "[Anomaly Detected]"
+    return resolved_cat, cleaned_tags, notes
+
+
 @router.post("/quick-log", response_model=TransactionRead, status_code=status.HTTP_201_CREATED)
 def quick_log_expense(
     payload: QuickLogRequest,
     db: Session = Depends(get_db),
+    ai_gateway: AiGateway = Depends(get_ai_gateway),
     _authorized: bool = Depends(verify_integration_token),
 ):
     """Frictionless quick expense entry from iOS Shortcuts, Siri, or Apple Pay notifications."""
-    # Find target account by name, or fallback to first checking account, or create default
-    target_account = None
-    if payload.account_name:
-        target_account = db.scalar(
-            select(Account).where(
-                Account.name.ilike(f"%{payload.account_name}%"),
-                Account.is_active == True,
-            )
-        )
-
-    if not target_account:
-        target_account = db.scalar(
-            select(Account).where(
-                Account.account_type == "checking",
-                Account.is_active == True,
-            )
-        )
-
-    if not target_account:
-        # Create default checking account if none exists
-        target_account = Account(
-            name="Primary Checking",
-            account_type="checking",
-            tier="cash",
-            institution="Bank",
-            currency="NZD",
-            expected_annual_return=0.0,
-            is_active=True,
-        )
-        db.add(target_account)
-        db.commit()
-        db.refresh(target_account)
-
+    target_account = _resolve_quick_log_account(db, payload.account_name)
     tx_date = payload.transaction_date or date.today()
-    spend_amount = -abs(payload.amount)  # Stored as negative for spending
-
+    spend_amount = -abs(payload.amount)
     raw_hash = generate_transaction_hash(
-        tx_date=tx_date,
-        amount=spend_amount,
-        merchant=payload.merchant,
-        account_id=target_account.id,
+        tx_date=tx_date, amount=spend_amount, merchant=payload.merchant, account_id=target_account.id
     )
-
     existing = db.scalar(
-        select(Transaction)
-        .options(*_transaction_load_options())
-        .where(Transaction.raw_hash == raw_hash)
+        select(Transaction).options(*_transaction_load_options()).where(Transaction.raw_hash == raw_hash)
     )
     if existing:
         return hydrate_transaction(existing)
 
-    # Category resolution via Jev System One or rule-based fallback
-    category = payload.category
-    notes = payload.notes
-    jev_tags: list[str] = []
-    if not category or category == "General":
-        jev_cat, is_anomaly, jev_tags = classify_transaction_jev_with_tags(
-            payload.merchant,
-            payload.amount,
-            payload.notes,
-            existing_tags=collect_existing_tags(db),
-            extra_categories=get_extra_jev_categories(db),
-        )
-        if jev_cat and jev_cat != "General":
-            category = jev_cat
-        else:
-            category = auto_categorize(payload.merchant)
-        jev_tags = strip_redundant_tags(jev_tags, category)
-        if is_anomaly:
-            anomaly_tag = "[Anomaly Detected]"
-            notes = f"{notes} {anomaly_tag}".strip() if notes else anomaly_tag
-
+    category, jev_tags, notes = _resolve_quick_log_category_and_notes(db, payload, ai_gateway)
     tx = Transaction(
         transaction_date=tx_date,
         account_id=target_account.id,
@@ -193,15 +187,10 @@ def quick_log_expense(
     db.add(tx)
     db.commit()
     db.refresh(tx)
-
-    # Reconcile any unlinked receipts or pending transfers against this new transaction
     reconcile_unlinked_receipts(db)
     reconcile_transfers(db)
-
     hydrated = db.scalar(
-        select(Transaction)
-        .options(*_transaction_load_options())
-        .where(Transaction.id == tx.id)
+        select(Transaction).options(*_transaction_load_options()).where(Transaction.id == tx.id)
     )
     return hydrate_transaction(hydrated or tx)
 
@@ -413,11 +402,12 @@ def sync_external_provider(
 def receive_dbs_alert(
     payload: DbsAlertPayload,
     db: Session = Depends(get_db),
+    ai_gateway: AiGateway = Depends(get_ai_gateway),
     _authorized: bool = Depends(verify_integration_token),
 ):
     """Ingest a forwarded DBS transaction alert email from Cloudflare Email Worker."""
     try:
-        result = ingest_dbs_alert(db, payload)
+        result = ingest_dbs_alert(db, payload, gateway=ai_gateway)
         if result.transaction is not None:
             hydrated = db.scalar(
                 select(Transaction)
@@ -480,6 +470,7 @@ class _EmailDispatchOutcome:
 def _dispatch_dbs_alert_email(
     db: Session,
     payload: InboundEmailDispatchPayload,
+    gateway: AiGateway | None = None,
 ) -> _EmailDispatchOutcome:
     effective_text = (
         (payload.text_body or "").strip()
@@ -496,6 +487,7 @@ def _dispatch_dbs_alert_email(
             from_address=(payload.from_address or "")[:200] or None,
         ),
         received_at=payload.received_at,
+        gateway=gateway,
     )
     tx_id = dbs_res.transaction.id if dbs_res.transaction else None
     consumer_ref = f"tx:{tx_id}" if tx_id is not None else "tx:duplicate"
@@ -510,8 +502,9 @@ def _dispatch_dbs_alert_email(
 def _dispatch_purchase_receipt_email(
     db: Session,
     payload: InboundEmailDispatchPayload,
+    gateway: AiGateway | None = None,
 ) -> _EmailDispatchOutcome:
-    receipts = ingest_purchase_receipt_email(db, payload)
+    receipts = ingest_purchase_receipt_email(db, payload, gateway=gateway)
     ids = tuple(r.id for r in receipts)
     consumer_ref = (
         f"receipt:{ids[0]}"
@@ -528,8 +521,9 @@ def _dispatch_purchase_receipt_email(
 def _dispatch_payslip_email(
     db: Session,
     payload: InboundEmailDispatchPayload,
+    gateway: AiGateway | None = None,
 ) -> _EmailDispatchOutcome:
-    receipt = ingest_payslip_email(db, payload)
+    receipt = ingest_payslip_email(db, payload, gateway=gateway)
     return _EmailDispatchOutcome(
         status="processed",
         consumer_ref=f"receipt:{receipt.id}",
@@ -540,6 +534,7 @@ def _dispatch_payslip_email(
 def _dispatch_bank_statement_email(
     _db: Session,
     _payload: InboundEmailDispatchPayload,
+    _gateway: AiGateway | None = None,
 ) -> _EmailDispatchOutcome:
     return _EmailDispatchOutcome(
         status="needs_review",
@@ -548,7 +543,8 @@ def _dispatch_bank_statement_email(
 
 
 _EMAIL_ROUTE_DISPATCHERS: dict[
-    str, Callable[[Session, InboundEmailDispatchPayload], _EmailDispatchOutcome]
+    str,
+    Callable[[Session, InboundEmailDispatchPayload, AiGateway | None], _EmailDispatchOutcome],
 ] = {
     "plutus_dbs_alert": _dispatch_dbs_alert_email,
     "plutus_purchase_receipt": _dispatch_purchase_receipt_email,
@@ -619,6 +615,7 @@ def _upsert_processed_ingested_email(
 def receive_routed_email(
     payload: InboundEmailDispatchPayload,
     db: Session = Depends(get_db),
+    ai_gateway: AiGateway = Depends(get_ai_gateway),
     _authorized: bool = Depends(verify_integration_token),
 ):
     """Unified idempotent email ingestion endpoint routed from Iris Notification Gateway."""
@@ -633,7 +630,7 @@ def receive_routed_email(
             detail=f"Unsupported route_target '{payload.route_target}'.",
         )
     try:
-        outcome = dispatcher(db, payload)
+        outcome = dispatcher(db, payload, ai_gateway)
         receipt_ids = _upsert_processed_ingested_email(db, payload, outcome)
         db.commit()
         return InboundEmailDispatchResult(

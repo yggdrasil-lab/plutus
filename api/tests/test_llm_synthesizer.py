@@ -88,6 +88,27 @@ class TestPlutusLlmSynthesizer(unittest.TestCase):
             self.assertGreaterEqual(len(res.recommendations), 1)
             self.assertIn("Kitces", res.research_citation)
 
+    def test_synthesize_runway_scenario_fallback_on_validation_error(self) -> None:
+        gateway = InMemoryAiGateway(
+            text_responses=[
+                {
+                    "headline": 123,
+                    "recommendations": "not-a-list",
+                    "rationale": None,
+                }
+            ]
+        )
+        res = synthesize_runway_scenario_llm(
+            runway_data=self.sample_telemetry,
+            burn_adjustment=-100.0,
+            gateway=gateway,
+        )
+        self.assertFalse(res.is_llm_generated)
+        self.assertIsNotNone(res.headline)
+        self.assertGreaterEqual(len(res.recommendations), 1)
+        self.assertIn("Kitces", res.research_citation)
+        self.assertEqual(len(gateway.text_requests), 1)
+
 
 class TestRunwaySynthesizeEndpoint(unittest.TestCase):
     def setUp(self) -> None:

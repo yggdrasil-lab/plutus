@@ -11,7 +11,6 @@ import math
 import mimetypes
 import re
 from typing import Any, Callable, Optional
-import urllib.request
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
@@ -26,6 +25,16 @@ from app.schemas import (
     ProductStatisticItem,
     ProductStatisticsResponse,
     TransactionCandidateRead,
+)
+from app.services.ai_gateway import (
+    AiConfigError,
+    AiGateway,
+    AiGatewayError,
+    AiInvalidResponseError,
+    AiJsonResponse,
+    AiTextRequest,
+    AiVisionRequest,
+    get_default_ai_gateway,
 )
 from app.services.category_taxonomy import get_canonical_category_names
 from app.services.connectors import ConnectorUpstreamError
@@ -350,6 +359,29 @@ def _match_existing_tags_heuristic(
     return matched
 
 
+def _finalize_receipt_item_tags(
+    *,
+    item_name: str,
+    resolved_cat: str,
+    resolved_dom: Optional[str],
+    resolved_ptype: Optional[str],
+    base_explicit_tags: list[str],
+    jev_tags: list[str],
+    matched_existing: list[str],
+) -> list[str]:
+    combined_tags = [
+        t
+        for t in normalize_tags([*base_explicit_tags, *jev_tags, *matched_existing])
+        if t != "general"
+    ]
+    non_cat_tags = strip_redundant_tags(combined_tags, resolved_cat)
+    if non_cat_tags:
+        return non_cat_tags
+    if combined_tags:
+        return combined_tags
+    return extract_tags_for_line_item(item_name, resolved_dom, resolved_ptype)
+
+
 def classify_and_tag_receipt_item(
     *,
     item_name: str,
@@ -364,6 +396,7 @@ def classify_and_tag_receipt_item(
     active_rules: list[CategorizationRule],
     existing_tags: list[str],
     extra_categories: Optional[list[str]] = None,
+    gateway: AiGateway | None = None,
 ) -> tuple[str, Optional[str], Optional[str], Optional[str], list[str]]:
     """Resolve (category, domain, product_type, volume_ml, tags) for a new receipt item.
 
@@ -380,43 +413,37 @@ def classify_and_tag_receipt_item(
     if matched_rule:
         matched_rule.match_count = int(matched_rule.match_count or 0) + 1
         rule_tags = parse_rule_tags(matched_rule.target_tags)
-        combined = normalize_tags([*base_explicit_tags, *rule_tags])
-        if not combined:
-            combined = extract_tags_for_line_item(item_name, resolved_dom, resolved_ptype)
+        combined = normalize_tags([*base_explicit_tags, *rule_tags]) or extract_tags_for_line_item(
+            item_name, resolved_dom, resolved_ptype
+        )
         return matched_rule.target_category, resolved_dom, resolved_ptype, resolved_vol, combined
 
     raw_cat = (explicit_category or "").strip()
     resolved_cat = raw_cat if (raw_cat and raw_cat.lower() != "general") else h_cat
-
     matched_existing = _match_existing_tags_heuristic(item_name, brand, existing_tags)
     jev_tags: list[str] = []
     if float(total_price) >= 0 and (resolved_cat == "General" or not base_explicit_tags):
-        jev_label = (
-            f"{brand.strip()} {item_name}".strip() if (brand and brand.strip()) else item_name
-        )
-        jev_cat, _, jev_raw_tags = classify_transaction_jev_with_tags(
+        jev_label = f"{brand.strip()} {item_name}".strip() if (brand and brand.strip()) else item_name
+        jev_cat, _, jev_tags = classify_transaction_jev_with_tags(
             jev_label,
             -abs(float(total_price)),
             notes=f"Receipt merchant: {merchant}",
             existing_tags=existing_tags,
             extra_categories=extra_categories,
+            gateway=gateway,
         )
         if resolved_cat == "General" and jev_cat and jev_cat != "General":
             resolved_cat = jev_cat
-        jev_tags = jev_raw_tags
 
-    combined_tags = [
-        t for t in normalize_tags([*base_explicit_tags, *jev_tags, *matched_existing])
-        if t != "general"
-    ]
-    non_cat_tags = strip_redundant_tags(combined_tags, resolved_cat)
-    if non_cat_tags:
-        final_tags = non_cat_tags
-    elif combined_tags:
-        final_tags = combined_tags
-    else:
-        final_tags = extract_tags_for_line_item(item_name, resolved_dom, resolved_ptype)
-
+    final_tags = _finalize_receipt_item_tags(
+        item_name=item_name,
+        resolved_cat=resolved_cat,
+        resolved_dom=resolved_dom,
+        resolved_ptype=resolved_ptype,
+        base_explicit_tags=base_explicit_tags,
+        jev_tags=jev_tags,
+        matched_existing=matched_existing,
+    )
     return resolved_cat, resolved_dom, resolved_ptype, resolved_vol, final_tags
 
 
@@ -669,80 +696,24 @@ def extract_pdf_text(content: bytes) -> str:
         return ""
 
 
-def _build_receipt_llm_request(
-    messages: list[dict[str, Any]],
+def _execute_receipt_gateway_call(
+    call_fn: Callable[[], AiJsonResponse],
     *,
-    resolved_model: str,
-    response_format_json: bool,
+    label: str,
     raise_on_error: bool,
-) -> Optional[urllib.request.Request]:
-    """Validate LLM gateway settings and build a chat/completions POST request."""
-    base_url = settings.resolved_llm_base_url
-    api_key = settings.resolved_llm_api_key
-    if not api_key and not base_url:
-        if raise_on_error:
-            raise ValueError("Receipt LLM endpoint is not configured.")
-        return None
-    if raise_on_error and not api_key:
-        raise ValueError("Receipt LLM API key is not configured.")
-
-    payload: dict[str, Any] = {
-        "model": resolved_model,
-        "messages": messages,
-        "temperature": 0.1,
-    }
-    if response_format_json:
-        payload["response_format"] = {"type": "json_object"}
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key or 'no-key'}",
-        "User-Agent": "Yggdrasil-Plutus/1.0",
-    }
-    return urllib.request.Request(
-        f"{base_url.rstrip('/')}/chat/completions",
-        data=json.dumps(payload).encode("utf-8"),
-        headers=headers,
-        method="POST",
-    )
-
-
-def _invoke_receipt_llm(
-    messages: list[dict[str, Any]],
-    *,
-    model: Optional[str] = None,
-    timeout: int = 60,
-    response_format_json: bool = False,
-    raise_on_error: bool = False,
 ) -> Optional[dict[str, Any]]:
-    """Call Muninn LLM gateway with the resolved receipt model and parse JSON."""
-    resolved_model = (model or settings.resolved_receipt_llm_model).strip()
-    req = _build_receipt_llm_request(
-        messages,
-        resolved_model=resolved_model,
-        response_format_json=response_format_json,
-        raise_on_error=raise_on_error,
-    )
-    if req is None:
-        return None
-
+    """Execute one AI Gateway call and map typed gateway errors to ValueError or 503."""
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            res_data = json.loads(response.read().decode("utf-8"))
-            content = res_data["choices"][0]["message"]["content"].strip()
-            if content.startswith("```"):
-                content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-            return json.loads(content)
-    except json.JSONDecodeError as e:
-        logger.warning("LLM receipt JSON decode failed (%s): %s", resolved_model, e)
+        return call_fn().data
+    except (AiConfigError, AiInvalidResponseError) as exc:
+        logger.warning("LLM %s failed: %s", label, exc)
         if raise_on_error:
-            raise ValueError(f"Receipt LLM returned invalid JSON: {e}") from e
+            raise ValueError(f"Receipt LLM {label} failed: {exc}") from exc
         return None
-    except Exception as e:
-        logger.warning("LLM receipt parsing failed (%s): %s", resolved_model, e)
+    except AiGatewayError as exc:
+        logger.warning("LLM %s upstream failed: %s", label, exc)
         if raise_on_error:
-            raise ConnectorUpstreamError(
-                f"Receipt LLM request failed ({resolved_model}): {e}"
-            ) from e
+            raise ConnectorUpstreamError(f"Receipt LLM {label} request failed: {exc}") from exc
         return None
 
 
@@ -752,28 +723,47 @@ def _invoke_text_prompt(
     raw_text: str,
     *,
     raise_on_error: bool = False,
+    gateway: AiGateway | None = None,
 ) -> Optional[dict[str, Any]]:
     """Invoke configured text LLM in JSON mode for receipt or payslip text."""
-    messages = [{"role": "user", "content": f"{prompt}\n\n{content_label}:\n{raw_text}"}]
+    resolved_gateway = gateway or get_default_ai_gateway()
     text_model = settings.resolved_llm_model or settings.resolved_receipt_llm_model
-    return _invoke_receipt_llm(
-        messages,
+    request = AiTextRequest(
+        system_prompt=None,
+        user_prompt=f"{prompt}\n\n{content_label}:\n{raw_text}",
         model=text_model,
-        timeout=60,
+        temperature=0.1,
+        timeout=60.0,
         response_format_json=True,
+    )
+    return _execute_receipt_gateway_call(
+        lambda: resolved_gateway.complete_json(request),
+        label="text parsing",
         raise_on_error=raise_on_error,
     )
 
 
-def parse_receipt_text_with_llm(raw_text: str) -> Optional[dict[str, Any]]:
+def parse_receipt_text_with_llm(
+    raw_text: str,
+    *,
+    raise_on_error: bool = False,
+    gateway: AiGateway | None = None,
+) -> Optional[dict[str, Any]]:
     """Invoke text LLM to extract structured line items from raw receipt text."""
-    return _invoke_text_prompt(RECEIPT_PARSING_PROMPT, "Receipt text", raw_text)
+    return _invoke_text_prompt(
+        RECEIPT_PARSING_PROMPT,
+        "Receipt text",
+        raw_text,
+        raise_on_error=raise_on_error,
+        gateway=gateway,
+    )
 
 
 def parse_receipt_orders_text_with_llm(
     raw_text: str,
     *,
     raise_on_error: bool = True,
+    gateway: AiGateway | None = None,
 ) -> Optional[dict[str, Any]]:
     """Invoke text LLM to extract one or multiple structured orders from email/document text."""
     return _invoke_text_prompt(
@@ -781,6 +771,7 @@ def parse_receipt_orders_text_with_llm(
         "Email / Receipt content",
         raw_text,
         raise_on_error=raise_on_error,
+        gateway=gateway,
     )
 
 
@@ -788,24 +779,28 @@ def _invoke_vision_prompt(
     content: bytes,
     mime_type: str,
     prompt: str,
+    *,
+    raise_on_error: bool = False,
+    gateway: AiGateway | None = None,
 ) -> Optional[dict[str, Any]]:
-    """Prepare image/PDF bytes as a multimodal data URI and invoke the vision LLM."""
+    """Prepare image/PDF bytes as base64 and invoke the vision LLM via AI Gateway."""
     llm_bytes, llm_mime = prepare_image_for_llm(content, mime_type)
     b64_data = base64.b64encode(llm_bytes).decode("ascii")
-    data_uri = f"data:{llm_mime};base64,{b64_data}"
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": data_uri}},
-            ],
-        }
-    ]
-    return _invoke_receipt_llm(
-        messages,
+    resolved_gateway = gateway or get_default_ai_gateway()
+    request = AiVisionRequest(
+        system_prompt=None,
+        user_prompt=prompt,
+        image_b64=b64_data,
+        image_mime_type=llm_mime,
         model=settings.resolved_receipt_llm_model,
-        timeout=105,
+        temperature=0.1,
+        timeout=105.0,
+        response_format_json=False,
+    )
+    return _execute_receipt_gateway_call(
+        lambda: resolved_gateway.complete_vision_json(request),
+        label="vision parsing",
+        raise_on_error=raise_on_error,
     )
 
 
@@ -813,16 +808,18 @@ def parse_receipt_with_llm(
     content: bytes,
     filename: Optional[str],
     mime_type: str,
+    *,
+    gateway: AiGateway | None = None,
 ) -> Optional[dict[str, Any]]:
     """Extract structured receipt fields from an image, PDF, or text document."""
     if mime_type.startswith("image/"):
-        return _invoke_vision_prompt(content, mime_type, RECEIPT_PARSING_PROMPT)
+        return _invoke_vision_prompt(content, mime_type, RECEIPT_PARSING_PROMPT, gateway=gateway)
 
     if mime_type == "application/pdf" or (filename and filename.lower().endswith(".pdf")):
         pdf_text = extract_pdf_text(content)
         if not pdf_text:
             return None
-        return parse_receipt_text_with_llm(pdf_text)
+        return parse_receipt_text_with_llm(pdf_text, gateway=gateway)
 
     try:
         raw_text = content.decode("utf-8")
@@ -830,13 +827,14 @@ def parse_receipt_with_llm(
         return None
     if not raw_text.strip():
         return None
-    return parse_receipt_text_with_llm(raw_text)
+    return parse_receipt_text_with_llm(raw_text, gateway=gateway)
 
 
 def parse_payslip_text_with_llm(
     raw_text: str,
     *,
     raise_on_error: bool = True,
+    gateway: AiGateway | None = None,
 ) -> Optional[dict[str, Any]]:
     """Invoke text LLM to extract structured payslip header fields from raw text."""
     return _invoke_text_prompt(
@@ -844,6 +842,7 @@ def parse_payslip_text_with_llm(
         "Payslip content",
         raw_text,
         raise_on_error=raise_on_error,
+        gateway=gateway,
     )
 
 
@@ -851,10 +850,12 @@ def parse_payslip_with_llm(
     content: bytes,
     filename: Optional[str],
     mime_type: str,
+    *,
+    gateway: AiGateway | None = None,
 ) -> Optional[dict[str, Any]]:
     """Extract structured payslip fields from an image, PDF, or text document."""
     if mime_type.startswith("image/"):
-        return _invoke_vision_prompt(content, mime_type, PAYSLIP_PARSING_PROMPT)
+        return _invoke_vision_prompt(content, mime_type, PAYSLIP_PARSING_PROMPT, gateway=gateway)
 
     is_pdf = mime_type == "application/pdf" or (
         filename is not None and filename.lower().endswith(".pdf")
@@ -862,10 +863,12 @@ def parse_payslip_with_llm(
     if is_pdf:
         pdf_text = extract_pdf_text(content)
         if pdf_text:
-            parsed = parse_payslip_text_with_llm(pdf_text, raise_on_error=False)
+            parsed = parse_payslip_text_with_llm(pdf_text, raise_on_error=False, gateway=gateway)
             if parsed:
                 return parsed
-        return _invoke_vision_prompt(content, "application/pdf", PAYSLIP_PARSING_PROMPT)
+        return _invoke_vision_prompt(
+            content, "application/pdf", PAYSLIP_PARSING_PROMPT, gateway=gateway
+        )
 
     try:
         raw_text = content.decode("utf-8")
@@ -873,7 +876,7 @@ def parse_payslip_with_llm(
         return None
     if not raw_text.strip():
         return None
-    return parse_payslip_text_with_llm(raw_text, raise_on_error=False)
+    return parse_payslip_text_with_llm(raw_text, raise_on_error=False, gateway=gateway)
 
 
 class _ReceiptHTMLSanitizer(HTMLParser):
@@ -1086,6 +1089,7 @@ def create_classified_receipt_item(
     active_rules: list[CategorizationRule],
     existing_tags: list[str],
     extra_categories: Optional[list[str]] = None,
+    gateway: AiGateway | None = None,
 ) -> None:
     """Resolve rules/Jev classification and persist one ReceiptItem and Product."""
     clean_name = (item_name.strip() or "Item")[:200]
@@ -1103,6 +1107,7 @@ def create_classified_receipt_item(
         active_rules=active_rules,
         existing_tags=existing_tags,
         extra_categories=extra_categories,
+        gateway=gateway,
     )
     prod_id: Optional[int] = None
     if total_price >= 0:
@@ -1167,9 +1172,34 @@ def _match_discount_target_heuristic(
     return best_idx if best_score > 0 else None
 
 
+def _parse_jev_discount_target(
+    content: Optional[str],
+    item_count: int,
+) -> tuple[bool, Optional[int]]:
+    """Parse Jev discount target JSON, returning (handled_by_jev, target_index)."""
+    if not content:
+        return False, None
+    try:
+        parsed = json.loads(content)
+    except (ValueError, TypeError):
+        return False, None
+    if not isinstance(parsed, dict):
+        return False, None
+    raw_idx = str(parsed.get("target_index", "none")).strip()
+    if raw_idx == "none":
+        return True, None
+    if raw_idx.isdigit():
+        idx = int(raw_idx)
+        if 0 <= idx < item_count:
+            return True, idx
+    return False, None
+
+
 def _match_discount_target_jev(
     discount: dict[str, Any],
     positive_items: list[dict[str, Any]],
+    *,
+    gateway: AiGateway | None = None,
 ) -> Optional[int]:
     """Use Jev System One to attribute a negative receipt discount line to its target item."""
     choices = {str(i): str(it.get("item_name", "")) for i, it in enumerate(positive_items)}
@@ -1182,7 +1212,9 @@ def _match_discount_target_jev(
             }
         }
     }
-    system_prompt = f"Match the receipt discount line to the purchased item it discounts:\n```json\n{json.dumps(schema)}\n```"
+    system_prompt = (
+        f"Match the receipt discount line to the purchased item it discounts:\n```json\n{json.dumps(schema)}\n```"
+    )
     candidates_desc = ", ".join(
         f"[{i}] {it.get('item_name')} (${float(it.get('total_price', 0.0)):.2f})"
         for i, it in enumerate(positive_items)
@@ -1192,24 +1224,23 @@ def _match_discount_target_jev(
         f"Items: {candidates_desc}"
     )
 
-    try:
-        content, _ = call_jev(system_prompt, user_content, response_format={"type": "json_object"})
-        if content:
-            parsed = json.loads(content)
-            raw_idx = str(parsed.get("target_index", "none")).strip()
-            if raw_idx != "none" and raw_idx.isdigit():
-                idx = int(raw_idx)
-                if 0 <= idx < len(positive_items):
-                    return idx
-            if raw_idx == "none":
-                return None
-    except Exception as exc:
-        logger.warning("Jev discount attribution failed (%s); using heuristic", exc)
-
+    content, _ = call_jev(
+        system_prompt,
+        user_content,
+        response_format={"type": "json_object"},
+        gateway=gateway,
+    )
+    handled, target_idx = _parse_jev_discount_target(content, len(positive_items))
+    if handled:
+        return target_idx
     return _match_discount_target_heuristic(str(discount.get("item_name", "")), positive_items)
 
 
-def apply_receipt_discounts_with_jev(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def apply_receipt_discounts_with_jev(
+    items: list[dict[str, Any]],
+    *,
+    gateway: AiGateway | None = None,
+) -> list[dict[str, Any]]:
     """Fold negative discount/savings lines into their matching purchased line items via Jev."""
     positive_items: list[dict[str, Any]] = []
     discount_items: list[dict[str, Any]] = []
@@ -1227,7 +1258,7 @@ def apply_receipt_discounts_with_jev(items: list[dict[str, Any]]) -> list[dict[s
     unmatched_discounts: list[dict[str, Any]] = []
     for disc in discount_items:
         disc_total = float(disc.get("total_price", 0.0) or 0.0)
-        target_idx = _match_discount_target_jev(disc, positive_items)
+        target_idx = _match_discount_target_jev(disc, positive_items, gateway=gateway)
         if target_idx is not None:
             target = positive_items[target_idx]
             new_total = round(float(target.get("total_price", 0.0) or 0.0) + disc_total, 2)
@@ -1761,21 +1792,31 @@ def _parse_single_attachment(
     raw_bytes: bytes,
     filename: Optional[str],
     mime_type: str,
+    *,
+    gateway: AiGateway | None = None,
 ) -> tuple[Optional[dict[str, Any]], Optional[str]]:
     """Parse one PDF or image receipt attachment via text-first then vision LLM."""
     return _parse_single_attachment_doc(
-        raw_bytes, filename, mime_type,
-        text_parser=lambda txt: parse_receipt_orders_text_with_llm(txt, raise_on_error=False),
-        fallback_parser=lambda b, f, m: parse_receipt_with_llm(b, f, m),
+        raw_bytes,
+        filename,
+        mime_type,
+        text_parser=lambda txt: parse_receipt_orders_text_with_llm(
+            txt, raise_on_error=False, gateway=gateway
+        ),
+        fallback_parser=lambda b, f, m: parse_receipt_with_llm(b, f, m, gateway=gateway),
     )
 
 
-def _extract_receipt_orders_from_attachments(attachments: list[Any]) -> _AttachmentParseOutcome:
+def _extract_receipt_orders_from_attachments(
+    attachments: list[Any],
+    *,
+    gateway: AiGateway | None = None,
+) -> _AttachmentParseOutcome:
     """Parse orders from valid image/PDF attachments and retain first valid attachment for fallback."""
     extracted, stored_media, fallback_att, raw_text = _extract_from_valid_attachments(
         attachments,
         min_pdf_bytes=MIN_RECEIPT_ATTACHMENT_BYTES,
-        attachment_parser=_parse_single_attachment,
+        attachment_parser=lambda b, f, m: _parse_single_attachment(b, f, m, gateway=gateway),
         normalizer=_normalize_parsed_orders,
     )
     return _AttachmentParseOutcome(
@@ -1794,9 +1835,10 @@ def _create_receipt_items_for_order(
     active_rules: list[CategorizationRule],
     existing_tags: list[str],
     extra_categories: list[str],
+    gateway: AiGateway | None = None,
 ) -> None:
     """Apply discount folding and persist classified line items for one ingested order."""
-    for it in apply_receipt_discounts_with_jev(raw_items):
+    for it in apply_receipt_discounts_with_jev(raw_items, gateway=gateway):
         create_classified_receipt_item(
             db,
             receipt=receipt,
@@ -1817,6 +1859,7 @@ def _create_receipt_items_for_order(
             active_rules=active_rules,
             existing_tags=existing_tags,
             extra_categories=extra_categories,
+            gateway=gateway,
         )
 
 
@@ -1839,6 +1882,7 @@ def _persist_ingested_order(
     active_rules: list[CategorizationRule],
     existing_tags: list[str],
     extra_categories: list[str],
+    gateway: AiGateway | None = None,
 ) -> Receipt:
     """Persist one parsed email receipt order (with semantic dedup) and match to transaction."""
     merchant = str(order.get("merchant") or "Unknown Merchant").strip()[:150]
@@ -1849,16 +1893,26 @@ def _persist_ingested_order(
     r_date = _resolve_order_date(order.get("receipt_date"), fallback_date)
 
     existing_dup = _find_semantic_duplicate_receipt(
-        db, merchant=merchant, receipt_date=r_date,
-        total_amount=total_amount, currency=currency, order_number=order_number,
+        db,
+        merchant=merchant,
+        receipt_date=r_date,
+        total_amount=total_amount,
+        currency=currency,
+        order_number=order_number,
     )
     if existing_dup is not None:
         return existing_dup
 
     receipt = Receipt(
-        receipt_date=r_date, merchant=merchant, total_amount=total_amount,
-        currency=currency, tax_amount=tax_amount, order_number=order_number,
-        source_email_message_id=message_id[:512], status="unlinked", is_processed=True,
+        receipt_date=r_date,
+        merchant=merchant,
+        total_amount=total_amount,
+        currency=currency,
+        tax_amount=tax_amount,
+        order_number=order_number,
+        source_email_message_id=message_id[:512],
+        status="unlinked",
+        is_processed=True,
         raw_text=raw_text,
         image_data=stored_media.data if stored_media else None,
         image_mime_type=stored_media.mime_type if stored_media else None,
@@ -1867,8 +1921,13 @@ def _persist_ingested_order(
     db.add(receipt)
     db.flush()
     _create_receipt_items_for_order(
-        db, receipt=receipt, raw_items=order.get("items") or [],
-        active_rules=active_rules, existing_tags=existing_tags, extra_categories=extra_categories,
+        db,
+        receipt=receipt,
+        raw_items=order.get("items") or [],
+        active_rules=active_rules,
+        existing_tags=existing_tags,
+        extra_categories=extra_categories,
+        gateway=gateway,
     )
     db.commit()
     db.refresh(receipt)
@@ -1876,35 +1935,50 @@ def _persist_ingested_order(
     return receipt
 
 
-def _extract_orders_from_email_body(payload: InboundEmailDispatchPayload) -> tuple[list[dict[str, Any]], date, str]:
+def _extract_orders_from_email_body(
+    payload: InboundEmailDispatchPayload,
+    *,
+    gateway: AiGateway | None = None,
+) -> tuple[list[dict[str, Any]], date, str]:
     """Sanitize email HTML/text body and extract purchase orders via text LLM fallback."""
     sanitized_text, sanitized_date = sanitize_receipt_email_content(
-        subject=payload.subject or "", from_address=payload.from_address,
-        received_at=payload.received_at, text_body=payload.text_body,
-        html_excerpt=payload.html_excerpt, raw_excerpt=payload.raw_excerpt,
+        subject=payload.subject or "",
+        from_address=payload.from_address,
+        received_at=payload.received_at,
+        text_body=payload.text_body,
+        html_excerpt=payload.html_excerpt,
+        raw_excerpt=payload.raw_excerpt,
     )
     if not sanitized_text:
         raise ValueError(
             "Purchase receipt email contains no readable receipt content or valid attachment."
         )
-    parsed_body = parse_receipt_orders_text_with_llm(sanitized_text, raise_on_error=True)
+    parsed_body = parse_receipt_orders_text_with_llm(
+        sanitized_text, raise_on_error=True, gateway=gateway
+    )
     return _normalize_parsed_orders(parsed_body), sanitized_date, sanitized_text[:32000]
 
 
 def ingest_purchase_receipt_email(
     db: Session,
     payload: InboundEmailDispatchPayload,
+    *,
+    gateway: AiGateway | None = None,
 ) -> list[Receipt]:
     """Ingest a purchase receipt email (attachment-first or HTML/text, 1 or N orders)."""
     local_tz = ZoneInfo(settings.timezone)
     fallback_date = _resolve_email_fallback_date(payload.received_at, local_tz)
-    outcome = _extract_receipt_orders_from_attachments(payload.attachments)
+    outcome = _extract_receipt_orders_from_attachments(payload.attachments, gateway=gateway)
     orders, stored_media, raw_text_for_record = (
-        outcome.orders, outcome.stored_media, outcome.raw_text,
+        outcome.orders,
+        outcome.stored_media,
+        outcome.raw_text,
     )
 
     if not orders:
-        orders, fallback_date, raw_text_for_record = _extract_orders_from_email_body(payload)
+        orders, fallback_date, raw_text_for_record = _extract_orders_from_email_body(
+            payload, gateway=gateway
+        )
         if orders and stored_media is None and outcome.fallback_attachment is not None:
             stored_media = _compress_stored_media(outcome.fallback_attachment)
 
@@ -1914,9 +1988,16 @@ def ingest_purchase_receipt_email(
     active_rules, existing_tags, extra_categories = load_receipt_rule_context(db)
     return [
         _persist_ingested_order(
-            db, order=order, fallback_date=fallback_date, message_id=payload.message_id,
-            raw_text=raw_text_for_record, stored_media=stored_media,
-            active_rules=active_rules, existing_tags=existing_tags, extra_categories=extra_categories,
+            db,
+            order=order,
+            fallback_date=fallback_date,
+            message_id=payload.message_id,
+            raw_text=raw_text_for_record,
+            stored_media=stored_media,
+            active_rules=active_rules,
+            existing_tags=existing_tags,
+            extra_categories=extra_categories,
+            gateway=gateway,
         )
         for order in orders
     ]
@@ -2051,25 +2132,37 @@ def _parse_single_payslip_attachment(
     raw_bytes: bytes,
     filename: Optional[str],
     mime_type: str,
+    *,
+    gateway: AiGateway | None = None,
 ) -> tuple[Optional[dict[str, Any]], Optional[str]]:
     """Parse one PDF or image payslip attachment once via text-first then vision LLM."""
     return _parse_single_attachment_doc(
-        raw_bytes, filename, mime_type,
-        text_parser=lambda txt: parse_payslip_text_with_llm(txt, raise_on_error=False),
-        fallback_parser=lambda b, f, m: parse_payslip_with_llm(b, f, m),
-        pdf_vision_fallback=lambda b: _invoke_vision_prompt(b, "application/pdf", PAYSLIP_PARSING_PROMPT),
+        raw_bytes,
+        filename,
+        mime_type,
+        text_parser=lambda txt: parse_payslip_text_with_llm(
+            txt, raise_on_error=False, gateway=gateway
+        ),
+        fallback_parser=lambda b, f, m: parse_payslip_with_llm(b, f, m, gateway=gateway),
+        pdf_vision_fallback=lambda b: _invoke_vision_prompt(
+            b, "application/pdf", PAYSLIP_PARSING_PROMPT, gateway=gateway
+        ),
     )
 
 
 def _extract_payslip_from_attachments(
     attachments: list[Any],
     fallback_date: date,
+    *,
+    gateway: AiGateway | None = None,
 ) -> _PayslipAttachmentOutcome:
     """Parse payslip fields from valid PDF/image attachments and retain first attachment fallback."""
     normalized, stored_media, fallback_att, raw_text = _extract_from_valid_attachments(
         attachments,
         min_pdf_bytes=MIN_PAYSLIP_PDF_BYTES,
-        attachment_parser=_parse_single_payslip_attachment,
+        attachment_parser=lambda b, f, m: _parse_single_payslip_attachment(
+            b, f, m, gateway=gateway
+        ),
         normalizer=lambda parsed: _normalize_parsed_payslip(parsed, fallback_date=fallback_date),
     )
     return _PayslipAttachmentOutcome(
@@ -2083,13 +2176,17 @@ def _extract_payslip_from_attachments(
 def _extract_payslip_from_email_body(
     sanitized_text: str,
     fallback_date: date,
+    *,
+    gateway: AiGateway | None = None,
 ) -> tuple[_NormalizedPayslip, str]:
     """Parse payslip fields from sanitized email body text via text LLM fallback."""
     if not sanitized_text:
         raise ValueError(
             "Payslip email contains no readable payslip content or valid attachment."
         )
-    parsed_body = parse_payslip_text_with_llm(sanitized_text, raise_on_error=True)
+    parsed_body = parse_payslip_text_with_llm(
+        sanitized_text, raise_on_error=True, gateway=gateway
+    )
     normalized = _normalize_parsed_payslip(parsed_body, fallback_date=fallback_date)
     if normalized is None:
         raise ValueError(
@@ -2133,18 +2230,30 @@ def _persist_payslip_receipt(
     return receipt
 
 
-def ingest_payslip_email(db: Session, payload: InboundEmailDispatchPayload) -> Receipt:
+def ingest_payslip_email(
+    db: Session,
+    payload: InboundEmailDispatchPayload,
+    *,
+    gateway: AiGateway | None = None,
+) -> Receipt:
     """Ingest a payslip email (attachment-first, zero ReceiptItem/Product rows, inflow matching)."""
     sanitized_body, fallback_date = sanitize_receipt_email_content(
-        subject=payload.subject or "", from_address=payload.from_address,
-        received_at=payload.received_at, text_body=payload.text_body,
-        html_excerpt=payload.html_excerpt, raw_excerpt=payload.raw_excerpt,
+        subject=payload.subject or "",
+        from_address=payload.from_address,
+        received_at=payload.received_at,
+        text_body=payload.text_body,
+        html_excerpt=payload.html_excerpt,
+        raw_excerpt=payload.raw_excerpt,
     )
-    outcome = _extract_payslip_from_attachments(payload.attachments, fallback_date)
+    outcome = _extract_payslip_from_attachments(
+        payload.attachments, fallback_date, gateway=gateway
+    )
     normalized, stored_media, raw_text = outcome.payslip, outcome.stored_media, outcome.raw_text
 
     if normalized is None:
-        normalized, raw_text = _extract_payslip_from_email_body(sanitized_body, fallback_date)
+        normalized, raw_text = _extract_payslip_from_email_body(
+            sanitized_body, fallback_date, gateway=gateway
+        )
         if stored_media is None and outcome.fallback_attachment is not None:
             stored_media = _compress_stored_media(outcome.fallback_attachment)
 
