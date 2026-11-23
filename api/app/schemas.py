@@ -37,7 +37,7 @@ def normalize_amortize_period(value: Any) -> Optional[str]:
 
 
 # --- Account Schemas ---
-VALID_ACCOUNT_TYPES = {"checking", "savings", "brokerage", "kiwisaver", "crypto", "credit_card"}
+VALID_ACCOUNT_TYPES = {"checking", "savings", "brokerage", "kiwisaver", "crypto", "credit_card", "private_note"}
 VALID_ACCOUNT_TIERS = {"cash", "growth", "locked"}
 
 
@@ -65,7 +65,7 @@ def normalize_account_tier(value: Any) -> Optional[str]:
 
 class AccountBase(BaseModel):
     name: str = Field(..., max_length=100)
-    account_type: str = Field(..., description="checking, savings, brokerage, kiwisaver, crypto, credit_card")
+    account_type: str = Field(..., description="checking, savings, brokerage, kiwisaver, crypto, credit_card, private_note")
     tier: str = Field(default="cash", description="cash, growth, locked")
     institution: str = Field(..., max_length=100)
     currency: str = Field(default="NZD", max_length=3)
@@ -96,7 +96,7 @@ class AccountCreate(AccountBase):
 
 class AccountUpdate(BaseModel):
     name: Optional[str] = Field(default=None, max_length=100)
-    account_type: Optional[str] = Field(default=None, description="checking, savings, brokerage, kiwisaver, crypto, credit_card")
+    account_type: Optional[str] = Field(default=None, description="checking, savings, brokerage, kiwisaver, crypto, credit_card, private_note")
     tier: Optional[str] = Field(default=None, description="cash, growth, locked")
     institution: Optional[str] = Field(default=None, max_length=100)
     expected_annual_return: Optional[float] = Field(default=None, ge=0.0, le=1.0)
@@ -129,6 +129,11 @@ class AccountRead(AccountBase):
     external_provider: Optional[str] = None
     external_account_id: Optional[str] = None
     last_synced_at: Optional[datetime] = None
+    payout_total_native: float = 0.0
+    payout_total_nzd: float = 0.0
+    payout_count: int = 0
+    first_payout_date: Optional[date] = None
+    last_payout_date: Optional[date] = None
     created_at: datetime
     updated_at: datetime
 
@@ -140,7 +145,7 @@ class AccountRead(AccountBase):
 class InstitutionInfo(BaseModel):
     name: str = Field(..., max_length=100)
     default_tier: str = Field(default="cash", description="cash, growth, locked")
-    default_type: str = Field(default="checking", description="checking, savings, brokerage, kiwisaver, crypto, credit_card")
+    default_type: str = Field(default="checking", description="checking, savings, brokerage, kiwisaver, crypto, credit_card, private_note")
     currency: str = Field(default="NZD", max_length=3)
 
 
@@ -281,6 +286,7 @@ class TransactionRead(TransactionBase):
     linked_currency: Optional[str] = None
     counterpart_account_id: Optional[int] = None
     counterpart_account_name: Optional[str] = None
+    counterpart_account_type: Optional[str] = None
     loan_id: Optional[int] = None
     loan_name: Optional[str] = None
     loan_type: Optional[str] = None
@@ -308,6 +314,7 @@ class TransactionUpdate(BaseModel):
     notes: Optional[str] = None
     tags: Optional[list[str]] = None
     recurrence: Optional[str] = Field(default=None, max_length=20)
+    counterpart_account_id: Optional[int] = None
     loan_id: Optional[int] = None
     loan_payment_amount: Optional[float] = Field(default=None, gt=0.0)
 

@@ -586,6 +586,7 @@ def _snapshot_transaction(
         linked_amount=linked_amt, linked_currency=linked_ccy,
         counterpart_account_id=tx.counterpart_account_id,
         counterpart_account_name=tx.counterpart_account.name if tx.counterpart_account else None,
+        counterpart_account_type=tx.counterpart_account.account_type if tx.counterpart_account else None,
         loan_id=tx.loan_id, loan_name=tx.loan.name if tx.loan else None,
         loan_type=tx.loan.loan_type if tx.loan else None,
         loan_payment_amount=float(tx.loan_payment_amount) if tx.loan_payment_amount is not None else None,

@@ -217,6 +217,7 @@ class ProjectedTransaction:
     linked_currency: str | None = None
     counterpart_account_id: int | None = None
     counterpart_account_name: str | None = None
+    counterpart_account_type: str | None = None
     loan_id: int | None = None
     loan_name: str | None = None
     loan_type: str | None = None
