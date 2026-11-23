@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.db import SessionLocal
 from app.routers import accounts, budgets, categories, health, institutions, integrations, loans, mcp, products, receipts, rules, runway, transactions
+from app.services.ai_gateway import MuninnHttpAdapter
 from app.services.burn_service import repair_transaction_fx_rates
 from app.services.category_taxonomy import normalize_existing_legacy_categories
 from app.services.sync_scheduler import periodic_sync_loop
@@ -34,8 +35,10 @@ def _ensure_migrations_current() -> None:
 
 
 @asynccontextmanager
-async def lifespan(_app: FastAPI):
-    """Manage startup migrations and background periodic sync task in production."""
+async def lifespan(app_instance: FastAPI):
+    """Manage startup migrations, AI gateway lifecycle, and background periodic sync task."""
+    ai_gateway = MuninnHttpAdapter.from_settings()
+    app_instance.state.ai_gateway = ai_gateway
     stop_event = asyncio.Event()
     task = None
     if settings.environment == "production":
@@ -58,6 +61,8 @@ async def lifespan(_app: FastAPI):
         stop_event.set()
         if task:
             await task
+        ai_gateway.close()
+        app_instance.state.ai_gateway = None
 
 
 app = FastAPI(

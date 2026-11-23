@@ -15,6 +15,7 @@ from app.schemas import (
     ClassifyUncategorizedRequest,
     ClassifyUncategorizedResponse,
 )
+from app.services.ai_gateway import AiGateway, get_ai_gateway
 from app.services.rules_engine import (
     apply_rules_to_existing_transactions,
     classify_uncategorized_transactions,
@@ -243,6 +244,7 @@ def apply_all_rules(
 def classify_uncategorized(
     payload: Optional[ClassifyUncategorizedRequest] = None,
     db: Session = Depends(get_db),
+    ai_gateway: AiGateway = Depends(get_ai_gateway),
 ):
     """Retroactively classify uncategorized or untagged transactions via Jev System One."""
     req = payload or ClassifyUncategorizedRequest()
@@ -252,4 +254,5 @@ def classify_uncategorized(
         include_untagged=req.include_untagged,
         dry_run=req.dry_run,
         only_outflows=req.only_outflows,
+        gateway=ai_gateway,
     )

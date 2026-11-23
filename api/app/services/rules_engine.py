@@ -9,6 +9,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session, joinedload
 
 from app.models import Account, CategorizationRule, ReceiptItem, Transaction
+from app.services.ai_gateway import AiGateway, get_default_ai_gateway
 from app.services.fx_service import get_exchange_rate
 from app.services.jev_client import (
     classify_transaction_jev_with_tags,
@@ -393,15 +394,14 @@ def apply_rules_to_existing_transactions(
     }
 
 
-def classify_uncategorized_transactions(
+def _load_uncategorized_candidates(
     db: Session,
     *,
-    limit: int = 50,
-    include_untagged: bool = False,
-    dry_run: bool = True,
-    only_outflows: bool = False,
-) -> dict[str, Any]:
-    """Retroactively classify uncategorized or untagged transactions via Jev System One."""
+    include_untagged: bool,
+    only_outflows: bool,
+    limit: int,
+) -> tuple[list[Transaction], int]:
+    """Load eligible rule-unmatched transactions capped by batch limit."""
     stmt = select(Transaction).where(
         Transaction.linked_transaction_id.is_(None),
         Transaction.category.notin_(("Transfers", "Income")),
@@ -422,7 +422,6 @@ def classify_uncategorized_transactions(
     candidates = db.scalars(
         stmt.order_by(Transaction.transaction_date.desc(), Transaction.id.desc())
     ).all()
-
     rules = list(
         db.scalars(
             select(CategorizationRule)
@@ -430,17 +429,93 @@ def classify_uncategorized_transactions(
             .order_by(CategorizationRule.priority.asc(), CategorizationRule.id.asc())
         ).all()
     )
-
-    eligible: list[Transaction] = []
-    for tx in candidates:
-        desc = tx.raw_description or tx.merchant
-        rule_cat, _, _ = evaluate_rules(desc, float(tx.amount), rules)
-        if rule_cat is not None:
-            continue
-        eligible.append(tx)
-
+    eligible = [
+        tx
+        for tx in candidates
+        if evaluate_rules(tx.raw_description or tx.merchant, float(tx.amount), rules)[0] is None
+    ]
     batch = eligible[:limit]
-    remaining = max(0, len(eligible) - len(batch))
+    return batch, max(0, len(eligible) - len(batch))
+
+
+def _resolve_jev_verdict(
+    tx: Transaction,
+    verdict_cache: dict[tuple[str, float], tuple[str, list[str]]],
+    existing_tags: list[str],
+    extra_categories: list[str],
+    gateway: AiGateway,
+) -> Optional[tuple[str, list[str]]]:
+    """Resolve category and tags via in-batch cache or Jev System One."""
+    amt = float(tx.amount)
+    cache_key = ((tx.merchant or "").strip().lower(), round(amt, 2))
+    if cache_key in verdict_cache:
+        return verdict_cache[cache_key]
+    if is_jev_circuit_open(gateway=gateway):
+        return None
+    jev_cat, _, jev_tags = classify_transaction_jev_with_tags(
+        tx.merchant,
+        amt,
+        tx.notes,
+        existing_tags=existing_tags,
+        extra_categories=extra_categories,
+        gateway=gateway,
+    )
+    verdict_cache[cache_key] = (jev_cat, jev_tags)
+    return jev_cat, jev_tags
+
+
+def _apply_jev_verdict(
+    tx: Transaction,
+    jev_cat: str,
+    jev_tags: list[str],
+    *,
+    dry_run: bool,
+) -> Optional[dict[str, Any]]:
+    """Compute category/tag diff for one transaction and apply if dry_run is False."""
+    amt = float(tx.amount)
+    old_category = tx.category
+    old_tags = parse_rule_tags(tx.tags)
+    if old_category == "General":
+        candidate_cat = (jev_cat or "General").strip() or "General"
+        new_category = "General" if (candidate_cat.lower() == "income" and amt <= 0) else candidate_cat
+    else:
+        new_category = old_category
+
+    new_tags = strip_redundant_tags([*old_tags, *(jev_tags or ())], new_category)
+    if new_category == old_category and new_tags == old_tags:
+        return None
+    if not dry_run:
+        tx.category = new_category[:50]
+        tx.tags = json.dumps(new_tags)
+    return {
+        "transaction_id": tx.id,
+        "transaction_date": tx.transaction_date,
+        "merchant": tx.merchant,
+        "amount": amt,
+        "currency": tx.currency or "NZD",
+        "old_category": old_category,
+        "new_category": new_category,
+        "old_tags": old_tags,
+        "new_tags": new_tags,
+    }
+
+
+def classify_uncategorized_transactions(
+    db: Session,
+    *,
+    limit: int = 50,
+    include_untagged: bool = False,
+    dry_run: bool = True,
+    only_outflows: bool = False,
+    gateway: AiGateway | None = None,
+) -> dict[str, Any]:
+    """Retroactively classify uncategorized or untagged transactions via Jev System One."""
+    batch, remaining = _load_uncategorized_candidates(
+        db,
+        include_untagged=include_untagged,
+        only_outflows=only_outflows,
+        limit=limit,
+    )
     if not batch:
         return {
             "dry_run": dry_run,
@@ -451,74 +526,31 @@ def classify_uncategorized_transactions(
             "changes": [],
         }
 
+    resolved_gateway = gateway or get_default_ai_gateway()
     existing_tags = collect_existing_tags(db)
     extra_categories = get_extra_jev_categories(db)
     verdict_cache: dict[tuple[str, float], tuple[str, list[str]]] = {}
-
     evaluated = 0
-    updated = 0
     skipped_circuit_open = 0
     changes: list[dict[str, Any]] = []
 
     for idx, tx in enumerate(batch):
-        amt = float(tx.amount)
-        cache_key = ((tx.merchant or "").strip().lower(), round(amt, 2))
-        if cache_key in verdict_cache:
-            jev_cat, jev_tags = verdict_cache[cache_key]
-        else:
-            if is_jev_circuit_open():
-                skipped_circuit_open = len(batch) - idx
-                break
-            jev_cat, _, jev_tags = classify_transaction_jev_with_tags(
-                tx.merchant,
-                amt,
-                tx.notes,
-                existing_tags=existing_tags,
-                extra_categories=extra_categories,
-            )
-            verdict_cache[cache_key] = (jev_cat, jev_tags)
-
+        verdict = _resolve_jev_verdict(tx, verdict_cache, existing_tags, extra_categories, resolved_gateway)
+        if verdict is None:
+            skipped_circuit_open = len(batch) - idx
+            break
         evaluated += 1
-        old_category = tx.category
-        old_tags = parse_rule_tags(tx.tags)
+        change = _apply_jev_verdict(tx, verdict[0], verdict[1], dry_run=dry_run)
+        if change is not None:
+            changes.append(change)
 
-        if old_category == "General":
-            candidate_cat = (jev_cat or "General").strip() or "General"
-            if candidate_cat.lower() == "income" and amt <= 0:
-                new_category = "General"
-            else:
-                new_category = candidate_cat
-        else:
-            new_category = old_category
-
-        new_tags = strip_redundant_tags([*old_tags, *(jev_tags or ())], new_category)
-
-        if new_category != old_category or new_tags != old_tags:
-            updated += 1
-            changes.append(
-                {
-                    "transaction_id": tx.id,
-                    "transaction_date": tx.transaction_date,
-                    "merchant": tx.merchant,
-                    "amount": amt,
-                    "currency": tx.currency or "NZD",
-                    "old_category": old_category,
-                    "new_category": new_category,
-                    "old_tags": old_tags,
-                    "new_tags": new_tags,
-                }
-            )
-            if not dry_run:
-                tx.category = new_category[:50]
-                tx.tags = json.dumps(new_tags)
-
-    if not dry_run and updated > 0:
+    if not dry_run and changes:
         db.commit()
 
     return {
         "dry_run": dry_run,
         "evaluated": evaluated,
-        "updated": updated,
+        "updated": len(changes),
         "skipped_circuit_open": skipped_circuit_open,
         "remaining": remaining,
         "changes": changes,

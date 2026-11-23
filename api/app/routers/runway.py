@@ -15,6 +15,7 @@ from app.schemas import (
     RunwaySynthesizeRequest,
     RunwayTierBreakdown,
 )
+from app.services.ai_gateway import AiGateway, get_ai_gateway
 from app.services.burn_service import (
     get_latest_account_balances,
     resolve_tier_labels,
@@ -167,24 +168,19 @@ def simulate_runway_scenario(
 def trigger_runway_synthesis(
     payload: RunwaySynthesizeRequest,
     db: Session = Depends(get_db),
+    ai_gateway: AiGateway = Depends(get_ai_gateway),
 ):
     """Force on-demand research-grounded AI synthesis of financial freedom scenario and recommendations."""
-    today = date.today()
     balances = get_latest_account_balances(db)
-    weekly_burn = project_burn(db, reference_date=today).effective_weekly_burn
-
-    cash_bal = balances["cash"]
-    growth_bal = balances["growth"]
-    locked_bal = balances["locked"]
+    weekly_burn = project_burn(db, reference_date=date.today()).effective_weekly_burn
+    cash_bal, growth_bal, locked_bal = balances["cash"], balances["growth"], balances["locked"]
     total_liquid = cash_bal + growth_bal
-
     emergency_weeks = calculate_emergency_runway(cash_bal, weekly_burn)
     growth_weeks, is_perpetual = calculate_compounding_runway(
         accessible_assets=total_liquid,
         weekly_burn=weekly_burn,
         annual_real_return=BASELINE_ANNUAL_RETURN,
     )
-
     runway_telemetry = {
         "cash_balance": cash_bal,
         "growth_balance": growth_bal,
@@ -195,11 +191,11 @@ def trigger_runway_synthesis(
         "growth_weeks": growth_weeks,
         "is_perpetual": is_perpetual,
     }
-
     return synthesize_runway_scenario_llm(
         runway_data=runway_telemetry,
         burn_adjustment=payload.weekly_burn_adjustment,
         annual_return=payload.custom_annual_return,
         lump_sum=payload.lump_sum_adjustment,
         custom_context=payload.custom_context,
+        gateway=ai_gateway,
     )

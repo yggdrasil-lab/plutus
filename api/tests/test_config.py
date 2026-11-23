@@ -122,6 +122,16 @@ class TestDatabaseConfig(unittest.TestCase):
             with self.assertRaises(ValueError):
                 bad_bool.resolved_dbs_account_map()
 
+    def test_resolved_jev_model_defaults_and_trims_override(self) -> None:
+        with patch.dict(os.environ, _clean_env(), clear=True):
+            default_cfg = Settings()
+            self.assertEqual(default_cfg.resolved_jev_model, "jev-decision")
+
+        env = _clean_env({"PLUTUS_JEV_MODEL": "  jev-custom  "})
+        with patch.dict(os.environ, env, clear=True):
+            custom_cfg = Settings()
+            self.assertEqual(custom_cfg.resolved_jev_model, "jev-custom")
+
 
 if __name__ == "__main__":
     unittest.main()

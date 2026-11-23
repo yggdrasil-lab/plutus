@@ -146,6 +146,11 @@ class Settings(BaseSettings):
         """Return configured receipt vision/parsing LLM model name."""
         return (self.receipt_llm_model or "").strip()
 
+    @property
+    def resolved_jev_model(self) -> str:
+        """Return configured TypeSafe Jev model name."""
+        return (self.jev_model or "").strip()
+
     def resolved_dbs_account_map(self) -> dict[str, int]:
         """Parse PLUTUS_DBS_ACCOUNT_MAP JSON mapping account suffixes to Plutus account IDs."""
         raw = (self.dbs_account_map or "").strip()
