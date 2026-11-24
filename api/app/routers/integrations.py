@@ -1,7 +1,7 @@
 """Machine-to-machine integrations router for Shortcuts, Siri, and document ingestion."""
 
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date
 import json
 import logging
 from typing import Callable, Optional
@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.db import get_db
-from app.models import Account, AssetSnapshot, CategorizationRule, IngestedEmail, Transaction
+from app.models import Account, IngestedEmail
 from app.schemas import (
     DbsAlertPayload,
     DbsAlertResult,
@@ -43,12 +43,11 @@ from app.services.ingestion_service import (
     ingest_normalized_transactions,
     upsert_account_snapshot,
 )
-from app.services.jev_client import classify_transaction_jev_with_tags, get_extra_jev_categories
 from app.services.ledger_entry import (
-    collect_existing_tags,
+    QUICK_LOG_WRITE_POLICY,
+    TransactionWriteInput,
     load_hydrated_transaction,
-    normalize_tags,
-    strip_redundant_tags,
+    record_transaction,
 )
 from app.services.receipt_ingestion import (
     PdfTextExtractor,
@@ -58,13 +57,8 @@ from app.services.receipt_ingestion import (
     get_pdf_text_extractor,
     ingest_payslip_email,
     ingest_purchase_receipt_email,
-    reconcile_unlinked_receipts,
 )
-from app.services.transfer_service import reconcile_transfers
-from app.services.rules_engine import evaluate_rules
 from app.services.statement_parser import (
-    auto_categorize,
-    generate_transaction_hash,
     parse_csv_statement,
     parse_pdf_statement,
 )
@@ -110,57 +104,6 @@ def verify_integration_token(
     )
 
 
-def _resolve_quick_log_account(db: Session, account_name: Optional[str]) -> Account:
-    target_account = None
-    if account_name:
-        target_account = db.scalar(
-            select(Account).where(Account.name.ilike(f"%{account_name}%"), Account.is_active == True)
-        )
-    if not target_account:
-        target_account = db.scalar(
-            select(Account).where(Account.account_type == "checking", Account.is_active == True)
-        )
-    if target_account:
-        return target_account
-    target_account = Account(
-        name="Primary Checking",
-        account_type="checking",
-        tier="cash",
-        institution="Bank",
-        currency="NZD",
-        expected_annual_return=0.0,
-        is_active=True,
-    )
-    db.add(target_account)
-    db.commit()
-    db.refresh(target_account)
-    return target_account
-
-
-def _resolve_quick_log_category_and_notes(
-    db: Session,
-    payload: QuickLogRequest,
-    gateway: AiGateway,
-) -> tuple[str, list[str], Optional[str]]:
-    category = payload.category
-    notes = payload.notes
-    if category and category != "General":
-        return category, [], notes
-    jev_cat, is_anomaly, jev_tags = classify_transaction_jev_with_tags(
-        payload.merchant,
-        payload.amount,
-        payload.notes,
-        existing_tags=collect_existing_tags(db),
-        extra_categories=get_extra_jev_categories(db),
-        gateway=gateway,
-    )
-    resolved_cat = jev_cat if jev_cat and jev_cat != "General" else auto_categorize(payload.merchant)
-    cleaned_tags = strip_redundant_tags(jev_tags, resolved_cat)
-    if is_anomaly:
-        notes = f"{notes} [Anomaly Detected]".strip() if notes else "[Anomaly Detected]"
-    return resolved_cat, cleaned_tags, notes
-
-
 @router.post("/quick-log", response_model=TransactionRead, status_code=status.HTTP_201_CREATED)
 def quick_log_expense(
     payload: QuickLogRequest,
@@ -169,35 +112,22 @@ def quick_log_expense(
     _authorized: bool = Depends(verify_integration_token),
 ):
     """Frictionless quick expense entry from iOS Shortcuts, Siri, or Apple Pay notifications."""
-    target_account = _resolve_quick_log_account(db, payload.account_name)
-    tx_date = payload.transaction_date or date.today()
-    spend_amount = -abs(payload.amount)
-    raw_hash = generate_transaction_hash(
-        tx_date=tx_date, amount=spend_amount, merchant=payload.merchant, account_id=target_account.id
+    result = record_transaction(
+        db,
+        TransactionWriteInput(
+            transaction_date=payload.transaction_date or date.today(),
+            account_name=payload.account_name,
+            amount=-abs(payload.amount),
+            currency=None,
+            merchant=payload.merchant,
+            category=payload.category or "General",
+            raw_description=f"QuickLog: {payload.merchant}",
+            notes=payload.notes,
+        ),
+        policy=QUICK_LOG_WRITE_POLICY,
+        ai_gateway=ai_gateway,
     )
-    existing_id = db.scalar(select(Transaction.id).where(Transaction.raw_hash == raw_hash))
-    if existing_id is not None:
-        return load_hydrated_transaction(db, existing_id)
-
-    category, jev_tags, notes = _resolve_quick_log_category_and_notes(db, payload, ai_gateway)
-    tx = Transaction(
-        transaction_date=tx_date,
-        account_id=target_account.id,
-        amount=spend_amount,
-        currency="NZD",
-        merchant=payload.merchant,
-        category=category,
-        raw_description=f"QuickLog: {payload.merchant}",
-        raw_hash=raw_hash,
-        tags=json.dumps(normalize_tags(jev_tags)),
-        notes=notes,
-    )
-    db.add(tx)
-    db.commit()
-    db.refresh(tx)
-    reconcile_unlinked_receipts(db)
-    reconcile_transfers(db)
-    return load_hydrated_transaction(db, tx.id, populate_existing=True)
+    return result.transaction
 
 
 @router.post("/statement", response_model=StatementParseResult)

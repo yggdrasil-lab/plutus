@@ -1,15 +1,12 @@
 """Transactions and spending router."""
 
 from datetime import date
-import json
 from typing import Literal, NoReturn, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.models import Account, Transaction
 from app.schemas import (
     TagCategoryBreakdownItem,
     TagSpendingSummaryItem,
@@ -21,18 +18,18 @@ from app.schemas import (
     TransactionUpdate,
 )
 from app.services.ledger_entry import (
+    MANUAL_WRITE_POLICY,
     UNSET,
     LedgerEntryError,
     LedgerEntryNotFoundError,
     LedgerEntryValidationError,
     ManualSplitLineInput,
     TransactionPatch,
-    load_hydrated_transaction,
-    normalize_tags,
+    TransactionWriteInput,
+    record_transaction,
     replace_manual_splits,
     update_transaction as update_ledger_transaction,
 )
-from app.services.receipt_ingestion import reconcile_unlinked_receipts
 from app.services.spending_projection import (
     InvalidWindowError,
     ProjectedSplit,
@@ -42,7 +39,6 @@ from app.services.spending_projection import (
     project_transactions,
     project_window,
 )
-from app.services.statement_parser import generate_transaction_hash
 from app.services.transfer_service import reconcile_transfers
 
 router = APIRouter(prefix="/transactions", tags=["Transactions"])
@@ -198,46 +194,26 @@ def create_transaction(
     db: Session = Depends(get_db),
 ):
     """Record an individual transaction with deterministic hash deduplication."""
-    account = db.get(Account, payload.account_id)
-    if not account:
-        raise HTTPException(status_code=404, detail="Account not found")
-
-    raw_hash = generate_transaction_hash(
-        tx_date=payload.transaction_date,
-        amount=payload.amount,
-        merchant=payload.merchant,
-        account_id=payload.account_id,
-    )
-
-    existing_id = db.scalar(select(Transaction.id).where(Transaction.raw_hash == raw_hash))
-    if existing_id is not None:
-        return load_hydrated_transaction(db, existing_id)
-
-    tx = Transaction(
+    entry = TransactionWriteInput(
         transaction_date=payload.transaction_date,
         account_id=payload.account_id,
         amount=payload.amount,
         currency=payload.currency,
         merchant=payload.merchant,
         category=payload.category,
-        raw_description=payload.raw_description or payload.merchant,
-        raw_hash=raw_hash,
+        raw_description=payload.raw_description,
+        notes=payload.notes,
         linked_transaction_id=payload.linked_transaction_id,
         exchange_rate=payload.exchange_rate,
         fee_amount=payload.fee_amount,
-        tags=json.dumps(normalize_tags(payload.tags or [])),
+        tags=tuple(payload.tags or ()),
         recurrence=payload.recurrence,
-        notes=payload.notes,
     )
-    db.add(tx)
-    db.commit()
-    db.refresh(tx)
-
-    # Automatically reconcile any unlinked receipts and internal/cross-currency transfers
-    reconcile_unlinked_receipts(db)
-    reconcile_transfers(db)
-
-    return load_hydrated_transaction(db, tx.id, populate_existing=True)
+    try:
+        result = record_transaction(db, entry, policy=MANUAL_WRITE_POLICY)
+    except LedgerEntryError as exc:
+        _raise_ledger_http_error(exc)
+    return result.transaction
 
 
 @router.post("/reconcile-transfers")

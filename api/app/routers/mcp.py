@@ -18,10 +18,15 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from app.config import settings
-from app.models import Account, AssetSnapshot, Transaction
+from app.models import Account, AssetSnapshot
+from app.services.ai_gateway import AiGateway
 from app.services.burn_service import get_latest_account_balances
 from app.services.ingestion_service import upsert_account_snapshot
-from app.services.receipt_ingestion import reconcile_unlinked_receipts
+from app.services.ledger_entry import (
+    MCP_EXPENSE_WRITE_POLICY,
+    TransactionWriteInput,
+    record_transaction,
+)
 from app.services.runway import (
     calculate_compounding_runway,
     calculate_emergency_runway,
@@ -29,7 +34,6 @@ from app.services.runway import (
     calculate_weekly_growth_rate,
 )
 from app.services.spending_projection import project_burn
-from app.services.statement_parser import generate_transaction_hash
 from app.services.transfer_service import reconcile_transfers
 
 
@@ -135,34 +139,39 @@ def _run_plutus_log_expense(
     *,
     db: Session | None = None,
     reference_date: date | None = None,
+    ai_gateway: AiGateway | None = None,
 ) -> str:
-    """Log a quick NZD expense into the primary active checking account."""
+    """Log a quick expense into the primary active checking account."""
     today = reference_date or date.today()
-    spend_amount = -abs(amount)
     with _session_scope(db) as session:
-        account = session.scalar(select(Account).where(Account.account_type == "checking", Account.is_active == True))
-        if not account:
-            account = Account(name="Primary Checking", account_type="checking", tier="cash", institution="Bank", currency="NZD")
-            session.add(account)
-            session.commit()
-            session.refresh(account)
-
-        raw_hash = generate_transaction_hash(today, spend_amount, merchant, account.id)
-        if session.scalar(select(Transaction).where(Transaction.raw_hash == raw_hash)):
-            return json.dumps({"status": "duplicate", "message": f"Transaction already logged on {today}"})
-
-        tx = Transaction(
-            transaction_date=today, account_id=account.id, amount=spend_amount, currency="NZD",
-            merchant=merchant, category=category, raw_description=f"AgentLog: {merchant}",
-            raw_hash=raw_hash, notes=notes,
+        result = record_transaction(
+            session,
+            TransactionWriteInput(
+                transaction_date=today,
+                amount=-abs(amount),
+                currency=None,
+                merchant=merchant,
+                category=category,
+                raw_description=f"AgentLog: {merchant}",
+                notes=notes or None,
+            ),
+            policy=MCP_EXPENSE_WRITE_POLICY,
+            ai_gateway=ai_gateway,
         )
-        session.add(tx)
-        session.commit()
-        session.refresh(tx)
-        reconcile_unlinked_receipts(session)
-        reconcile_transfers(session)
-        session.refresh(tx)
-        return json.dumps({"status": "success", "id": tx.id, "merchant": merchant, "amount": spend_amount, "category": category})
+        if not result.created:
+            return json.dumps(
+                {"status": "duplicate", "message": f"Transaction already logged on {today}"}
+            )
+        tx = result.transaction
+        return json.dumps(
+            {
+                "status": "success",
+                "id": tx.id,
+                "merchant": tx.merchant,
+                "amount": tx.amount,
+                "category": tx.category,
+            }
+        )
 
 
 def _run_plutus_record_snapshot(
