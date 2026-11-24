@@ -41,30 +41,66 @@ class PlainEmailHtmlParser(HTMLParser):
         "blockquote",
     }
 
-    def __init__(self) -> None:
+    _ANNOTATION_BLOCK_TAGS = _BLOCK_TAGS | {"table"}
+    _INLINE_TAGS = {"td", "th"}
+    _ANNOTATION_INLINE_TAGS = {"td", "th", "span"}
+    _NOISE_ARIA_VALUES = frozenset({"close", "menu", "logo"})
+    _NOISE_ALT_VALUES = frozenset({"logo", "spacer", "pixel", "icon", "image", "banner"})
+
+    def __init__(self, *, preserve_annotations: bool = False) -> None:
         super().__init__(convert_charrefs=True)
+        self._preserve_annotations = preserve_annotations
+        self._block_tags = (
+            self._ANNOTATION_BLOCK_TAGS if preserve_annotations else self._BLOCK_TAGS
+        )
+        self._inline_tags = (
+            self._ANNOTATION_INLINE_TAGS if preserve_annotations else self._INLINE_TAGS
+        )
         self._skip = 0
         self._chunks: list[str] = []
+
+    def _append_annotations(
+        self,
+        lower_tag: str,
+        attrs: list[tuple[str, Optional[str]]],
+    ) -> None:
+        attr_map = {k.lower(): (v or "").strip() for k, v in attrs}
+        aria_label = attr_map.get("aria-label")
+        if (
+            aria_label
+            and len(aria_label) >= 2
+            and aria_label.lower() not in self._NOISE_ARIA_VALUES
+        ):
+            self._chunks.append(f" [aria: {aria_label}] ")
+        if lower_tag == "img":
+            alt_text = attr_map.get("alt")
+            if alt_text and len(alt_text) >= 4 and alt_text.lower() not in self._NOISE_ALT_VALUES:
+                self._chunks.append(f" [item: {alt_text}] ")
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
         lower = tag.lower()
         if lower in self._SKIP_TAGS:
             self._skip += 1
-        elif self._skip == 0:
-            if lower in self._BLOCK_TAGS:
-                self._chunks.append("\n")
-            elif lower in ("td", "th"):
-                self._chunks.append(" ")
+            return
+        if self._skip > 0:
+            return
+        if self._preserve_annotations:
+            self._append_annotations(lower, attrs)
+        if lower in self._block_tags:
+            self._chunks.append("\n")
+        elif lower in self._inline_tags:
+            self._chunks.append(" ")
 
     def handle_endtag(self, tag: str) -> None:
         lower = tag.lower()
         if lower in self._SKIP_TAGS:
             if self._skip > 0:
                 self._skip -= 1
-        elif self._skip == 0:
-            if lower in self._BLOCK_TAGS:
+            return
+        if self._skip == 0:
+            if lower in self._block_tags:
                 self._chunks.append("\n")
-            elif lower in ("td", "th"):
+            elif lower in self._inline_tags:
                 self._chunks.append(" ")
 
     def handle_data(self, data: str) -> None:
@@ -77,11 +113,15 @@ class PlainEmailHtmlParser(HTMLParser):
         return "\n".join(line for line in lines if line)
 
 
-def html_to_plain_text(html_body: Optional[str]) -> str:
+def html_to_plain_text(
+    html_body: Optional[str],
+    *,
+    preserve_annotations: bool = False,
+) -> str:
     """Convert an HTML email excerpt to clean plain text lines."""
     if not html_body:
         return ""
-    parser = PlainEmailHtmlParser()
+    parser = PlainEmailHtmlParser(preserve_annotations=preserve_annotations)
     parser.feed(html_body)
     parser.close()
     return parser.get_text()
