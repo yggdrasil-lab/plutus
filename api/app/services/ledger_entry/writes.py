@@ -323,26 +323,36 @@ def record_transaction(
     db.add(tx)
     db.commit()
     db.refresh(tx)
-
-    if policy.reconcile_post_write:
-        reconcile_unlinked_receipts(db)
-        reconcile_transfers(db)
-
-    if (
-        policy.apply_counterpart_rules
-        and resolved.matched_rule is not None
-        and resolved.matched_rule.counterpart_account_id is not None
-    ):
-        db.refresh(tx)
-        if apply_counterpart_account_for_rule(
-            db,
-            tx,
-            resolved.matched_rule,
-            fetcher=fx_fetcher,
-        ):
-            db.commit()
-
+    _run_post_write_reconciliation(
+        db,
+        tx,
+        matched_rule=resolved.matched_rule,
+        policy=policy,
+        fx_fetcher=fx_fetcher,
+    )
     return TransactionWriteResult(
         transaction=load_hydrated_transaction(db, tx.id, populate_existing=True),
         created=True,
     )
+
+
+def _run_post_write_reconciliation(
+    db: Session,
+    tx: Transaction,
+    *,
+    matched_rule: Optional[CategorizationRule],
+    policy: TransactionWritePolicy,
+    fx_fetcher: FxRateFetcher | None,
+) -> None:
+    """Run post-write receipt/transfer matching and rule counterpart mirroring."""
+    if policy.reconcile_post_write:
+        reconcile_unlinked_receipts(db)
+        reconcile_transfers(db)
+    if (
+        policy.apply_counterpart_rules
+        and matched_rule is not None
+        and matched_rule.counterpart_account_id is not None
+    ):
+        db.refresh(tx)
+        if apply_counterpart_account_for_rule(db, tx, matched_rule, fetcher=fx_fetcher):
+            db.commit()
