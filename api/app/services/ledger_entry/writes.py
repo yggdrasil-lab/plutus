@@ -14,11 +14,12 @@ from sqlalchemy.orm import Session
 
 from app.models import Account, CategorizationRule, Transaction
 from app.services.ai_gateway import AiGateway, get_default_ai_gateway
-from app.services.fx_service import FxRateFetcher, get_exchange_rate
+from app.services.fx_service import FxRateFetcher
 from app.services.jev_client import (
     classify_transaction_jev_with_tags,
     get_extra_jev_categories,
 )
+from app.services.ledger_entry._fx import resolve_nzd_exchange_rate
 from app.services.ledger_entry._types import (
     MANUAL_WRITE_POLICY,
     HydratedTransaction,
@@ -253,18 +254,14 @@ def _resolve_reporting_exchange_rate(
     """Use explicit exchange_rate or resolve currency->NZD rate when configured by policy."""
     if entry.exchange_rate is not None:
         return entry.exchange_rate
-    if not policy.resolve_reporting_fx or tx_currency == "NZD":
+    if not policy.resolve_reporting_fx:
         return None
-    resolved = get_exchange_rate(
+    return resolve_nzd_exchange_rate(
         db,
-        rate_date=entry.transaction_date,
-        from_currency=tx_currency,
-        to_currency="NZD",
-        fetcher=fx_fetcher,
+        tx_currency,
+        entry.transaction_date,
+        fx_fetcher=fx_fetcher,
     )
-    if resolved is not None and resolved[0] > 0:
-        return round(float(resolved[0]), 8)
-    return None
 
 
 def record_transaction(

@@ -1,4 +1,4 @@
-"""Deep Ledger Entry package for tag utilities, transaction hydration, writes, and split mutations."""
+"""Deep Ledger Entry package for tag utilities, hydration, writes, mutations, statements, and inbound email."""
 
 from app.services.ledger_entry._types import (
     MANUAL_WRITE_POLICY,
@@ -7,11 +7,15 @@ from app.services.ledger_entry._types import (
     UNSET,
     HydratedManualSplit,
     HydratedTransaction,
+    InboundEmailDispatchOutcome,
     LedgerEntryBadRequestError,
     LedgerEntryError,
     LedgerEntryNotFoundError,
+    LedgerEntryUpstreamError,
     LedgerEntryValidationError,
     ManualSplitLineInput,
+    StatementUploadInput,
+    StatementUploadResult,
     TransactionPatch,
     TransactionWriteInput,
     TransactionWritePolicy,
@@ -22,9 +26,14 @@ from app.services.ledger_entry.hydration import (
     load_hydrated_transaction,
     transaction_load_options,
 )
+from app.services.ledger_entry.inbound_email import dispatch_inbound_email
 from app.services.ledger_entry.mutations import (
     replace_manual_splits,
     update_transaction,
+)
+from app.services.ledger_entry.statements import (
+    commit_parsed_statement,
+    process_statement_upload,
 )
 from app.services.ledger_entry.tags import (
     collect_existing_tags,
@@ -40,24 +49,31 @@ from app.services.ledger_entry.writes import (
 __all__ = [
     "HydratedManualSplit",
     "HydratedTransaction",
+    "InboundEmailDispatchOutcome",
     "LedgerEntryBadRequestError",
     "LedgerEntryError",
     "LedgerEntryNotFoundError",
+    "LedgerEntryUpstreamError",
     "LedgerEntryValidationError",
     "MANUAL_WRITE_POLICY",
     "MCP_EXPENSE_WRITE_POLICY",
     "ManualSplitLineInput",
     "QUICK_LOG_WRITE_POLICY",
+    "StatementUploadInput",
+    "StatementUploadResult",
     "TransactionPatch",
     "TransactionWriteInput",
     "TransactionWritePolicy",
     "TransactionWriteResult",
     "UNSET",
     "collect_existing_tags",
+    "commit_parsed_statement",
+    "dispatch_inbound_email",
     "hydrate_transaction",
     "load_hydrated_transaction",
     "normalize_tags",
     "parse_rule_tags",
+    "process_statement_upload",
     "record_transaction",
     "replace_manual_splits",
     "resolve_default_account",
