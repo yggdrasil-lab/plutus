@@ -36,8 +36,9 @@ from app.services.ledger_entry.tags import (
     strip_redundant_tags,
 )
 from app.services.receipt_ingestion.matching import reconcile_unlinked_receipts
-from app.services.rules_engine import apply_counterpart_account_for_rule, matches_rule
+from app.services.rules_engine import matches_rule
 from app.services.statement_parser import auto_categorize, generate_transaction_hash
+from app.services.transfer_reconciliation import apply_counterpart_account_for_rule
 from app.services.transfer_service import reconcile_transfers
 
 
@@ -333,7 +334,12 @@ def record_transaction(
         and resolved.matched_rule.counterpart_account_id is not None
     ):
         db.refresh(tx)
-        if apply_counterpart_account_for_rule(db, tx, resolved.matched_rule):
+        if apply_counterpart_account_for_rule(
+            db,
+            tx,
+            resolved.matched_rule,
+            fetcher=fx_fetcher,
+        ):
             db.commit()
 
     return TransactionWriteResult(

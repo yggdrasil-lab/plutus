@@ -20,7 +20,7 @@ from app.config import settings
 from app.models import Account, AssetSnapshot, CategorizationRule, Transaction
 from app.schemas import SyncAccountSummary, SyncResult
 from app.services.ai_gateway import AiGateway
-from app.services.fx_service import get_exchange_rate
+from app.services.fx_service import FxRateFetcher, get_exchange_rate
 from app.services.jev_client import classify_transaction_jev_with_tags, get_extra_jev_categories
 from app.services.ledger_entry import (
     collect_existing_tags,
@@ -29,11 +29,12 @@ from app.services.ledger_entry import (
     strip_redundant_tags,
 )
 from app.services.receipt_ingestion import reconcile_unlinked_receipts
-from app.services.rules_engine import (
-    apply_counterpart_account_for_rule,
-    evaluate_rules,
-)
+from app.services.rules_engine import evaluate_rules
 from app.services.statement_parser import auto_categorize, generate_transaction_hash
+from app.services.transfer_reconciliation import (
+    apply_counterpart_account_for_rule,
+    unlink_transfer_pair,
+)
 from app.services.transfer_service import reconcile_transfers
 
 
@@ -410,23 +411,30 @@ def _refresh_existing_btc_transaction(
     account: Account,
     item: NormalizedTx,
     existing_tx: Transaction,
+    *,
+    fetcher: Optional[FxRateFetcher] = None,
 ) -> bool:
     reconcile_needed = existing_tx.linked_transaction_id is None
     date_changed = existing_tx.transaction_date != item.transaction_date
+    unlinked = False
     if date_changed:
         existing_tx.transaction_date = item.transaction_date
         if existing_tx.linked_transaction_id is not None:
-            partner = db.get(Transaction, existing_tx.linked_transaction_id)
-            existing_tx.linked_transaction_id = None
-            if partner is not None:
-                partner.linked_transaction_id = None
-                if (partner.currency or "").strip().upper() == "NZD":
-                    partner.exchange_rate = 1.0
+            unlink_transfer_pair(db, existing_tx, fetcher=fetcher)
+            unlinked = True
         reconcile_needed = True
-    if date_changed or existing_tx.exchange_rate is None or float(existing_tx.exchange_rate) < 1.0:
+    if (
+        (not unlinked and date_changed)
+        or existing_tx.exchange_rate is None
+        or float(existing_tx.exchange_rate) < 1.0
+    ):
         tx_currency = (item.currency or account.currency or "BTC")[:10].upper()
         resolved = get_exchange_rate(
-            db, rate_date=item.transaction_date, from_currency=tx_currency, to_currency="NZD"
+            db,
+            rate_date=item.transaction_date,
+            from_currency=tx_currency,
+            to_currency="NZD",
+            fetcher=fetcher,
         )
         if resolved is not None and resolved[0] > 0:
             existing_tx.exchange_rate = round(float(resolved[0]), 8)

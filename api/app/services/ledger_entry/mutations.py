@@ -10,7 +10,6 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import Account, Loan, Transaction, TransactionSplit
-from app.services.ledger_entry._fx import resolve_nzd_exchange_rate
 from app.services.ledger_entry._types import (
     MAX_SPLIT_CATEGORY_LENGTH,
     TRANSFER_CATEGORIES,
@@ -28,6 +27,7 @@ from app.services.ledger_entry.hydration import (
     transaction_load_options,
 )
 from app.services.ledger_entry.tags import normalize_tags
+from app.services.transfer_reconciliation import unlink_transfer_pair
 
 
 def _load_mutable_transaction(db: Session, transaction_id: int) -> Transaction:
@@ -42,15 +42,6 @@ def _load_mutable_transaction(db: Session, transaction_id: int) -> Transaction:
     return tx
 
 
-def _resolve_unlinked_fx_rate(db: Session, leg: Transaction) -> Optional[float]:
-    """Return None for NZD or resolved currency->NZD rate for unlinked non-NZD transactions."""
-    return resolve_nzd_exchange_rate(
-        db,
-        leg.currency or "NZD",
-        leg.transaction_date,
-    )
-
-
 def _apply_category_update(db: Session, tx: Transaction, raw_category: str) -> None:
     """Apply category change and unlink paired transfer legs when moving off Transfers."""
     cat = raw_category.strip()
@@ -63,15 +54,7 @@ def _apply_category_update(db: Session, tx: Transaction, raw_category: str) -> N
     tx.category = cat
     if cat.lower() in TRANSFER_CATEGORIES or not was_transfer_or_linked:
         return
-    if tx.linked_transaction_id is not None:
-        partner = db.get(Transaction, tx.linked_transaction_id)
-        if partner is not None:
-            partner.linked_transaction_id = None
-            partner.fee_amount = None
-            partner.exchange_rate = _resolve_unlinked_fx_rate(db, partner)
-    tx.linked_transaction_id = None
-    tx.fee_amount = None
-    tx.exchange_rate = _resolve_unlinked_fx_rate(db, tx)
+    unlink_transfer_pair(db, tx, restore_self_when_unlinked=True)
 
 
 def _apply_counterpart_account_update(
