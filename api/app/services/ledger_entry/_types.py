@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Optional
 
+from app.services.statement_parser import StatementParseResult
+
 TRANSFER_CATEGORIES: tuple[str, ...] = ("transfers", "transfer")
 MAX_SPLIT_CATEGORY_LENGTH = 50
 
@@ -37,6 +39,10 @@ class LedgerEntryBadRequestError(LedgerEntryError):
 
 class LedgerEntryValidationError(LedgerEntryError):
     """Raised when patch or manual split line inputs violate validation rules."""
+
+
+class LedgerEntryUpstreamError(LedgerEntryError):
+    """Raised when an upstream AI or connector dependency fails during ingestion."""
 
 
 @dataclass(frozen=True)
@@ -166,3 +172,45 @@ class TransactionWriteResult:
 
     transaction: HydratedTransaction
     created: bool
+
+
+@dataclass(frozen=True)
+class StatementUploadInput:
+    """Immutable command input for parsing and optionally committing a bank statement."""
+
+    filename: str
+    content: bytes
+    institution: str = "auto"
+    commit: bool = False
+    account_id: Optional[int] = None
+    closing_balance: Optional[float] = None
+    tier: Optional[str] = None
+    account_type: Optional[str] = None
+    account_name: Optional[str] = None
+    currency: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class StatementUploadResult:
+    """Result returned by statement upload or commit workflows."""
+
+    parse_result: StatementParseResult
+    committed: bool = False
+    account_id: Optional[int] = None
+    account_created: bool = False
+    snapshot_upserted: bool = False
+
+
+@dataclass(frozen=True)
+class InboundEmailDispatchOutcome:
+    """Detached immutable outcome of dispatching one inbound email through Plutus."""
+
+    status: str
+    route_target: str
+    message_id: str
+    duplicate: bool = False
+    consumer_ref: Optional[str] = None
+    transaction_id: Optional[int] = None
+    receipt_id: Optional[int] = None
+    receipt_ids: tuple[int, ...] = ()
+    error_detail: Optional[str] = None

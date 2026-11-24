@@ -4,17 +4,15 @@
 # 1. IMPORTS & CONSTANTS
 # ============================================================================
 import asyncio
+from collections.abc import Callable, Mapping
 import logging
-from typing import Callable
 
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.db import SessionLocal
 from app.schemas import SyncResult
-from app.services.connectors.akahu import sync_akahu
-from app.services.connectors.bitcoin import sync_bitcoin
-from app.services.connectors.wise import sync_wise
+from app.services.connectors.registry import SYNC_HANDLERS
 
 logger = logging.getLogger("plutus.sync_scheduler")
 
@@ -39,31 +37,30 @@ def get_configured_providers() -> list[str]:
 # ============================================================================
 # 3. SYNC RUNNER & LIFESPAN LOOP
 # ============================================================================
-PROVIDER_HANDLERS: dict[str, Callable[[Session, int], SyncResult]] = {
-    "akahu": lambda db, days: sync_akahu(db, days=days),
-    "wise": lambda db, days: sync_wise(db, days=days),
-    "bitcoin": lambda db, _days: sync_bitcoin(db),
-}
-
-
 def run_scheduled_sync_once(
     *,
     db_factory: Callable[[], Session] = SessionLocal,
-    handlers: dict[str, Callable[[Session, int], SyncResult]] = PROVIDER_HANDLERS,
+    handlers: Mapping[str, Callable[..., SyncResult]] | None = None,
     providers: list[str] | None = None,
     days: int = DEFAULT_LOOKBACK_DAYS,
 ) -> dict[str, SyncResult | str]:
     """Execute one sync pass across all configured providers with error isolation."""
     targets = providers if providers is not None else get_configured_providers()
     outcomes: dict[str, SyncResult | str] = {}
+    use_registry = handlers is None
+    active_handlers = SYNC_HANDLERS if use_registry else handlers
 
     for provider in targets:
-        handler = handlers.get(provider)
+        handler = active_handlers.get(provider)
         if not handler:
             continue
         db = db_factory()
         try:
-            res = handler(db, days)
+            res = (
+                handler(db, days, None, None, False)
+                if use_registry
+                else handler(db, days)
+            )
             outcomes[provider] = res
             logger.info(
                 "Scheduled sync [%s]: accounts=%d created=%d skipped=%d snapshots=%d",

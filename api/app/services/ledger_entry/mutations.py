@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import Account, Loan, Transaction, TransactionSplit
-from app.services.fx_service import get_exchange_rate
+from app.services.ledger_entry._fx import resolve_nzd_exchange_rate
 from app.services.ledger_entry._types import (
     MAX_SPLIT_CATEGORY_LENGTH,
     TRANSFER_CATEGORIES,
@@ -44,18 +44,11 @@ def _load_mutable_transaction(db: Session, transaction_id: int) -> Transaction:
 
 def _resolve_unlinked_fx_rate(db: Session, leg: Transaction) -> Optional[float]:
     """Return None for NZD or resolved currency->NZD rate for unlinked non-NZD transactions."""
-    currency = (leg.currency or "NZD").strip().upper()
-    if currency == "NZD":
-        return None
-    resolved = get_exchange_rate(
+    return resolve_nzd_exchange_rate(
         db,
-        rate_date=leg.transaction_date,
-        from_currency=currency,
-        to_currency="NZD",
+        leg.currency or "NZD",
+        leg.transaction_date,
     )
-    if resolved is not None and resolved[0] > 0:
-        return round(float(resolved[0]), 8)
-    return None
 
 
 def _apply_category_update(db: Session, tx: Transaction, raw_category: str) -> None:
