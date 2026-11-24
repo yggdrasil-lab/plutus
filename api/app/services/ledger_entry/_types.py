@@ -120,3 +120,49 @@ class TransactionPatch:
     counterpart_account_id: int | None | _UnsetType = UNSET
     loan_id: int | None | _UnsetType = UNSET
     loan_payment_amount: float | None | _UnsetType = UNSET
+
+
+@dataclass(frozen=True)
+class TransactionWritePolicy:
+    """Policy switches governing rules, Jev fallback, FX, tags, dedup, and reconciliation."""
+
+    apply_rules: bool = True
+    use_jev_fallback: bool = False
+    resolve_reporting_fx: bool = True
+    normalize_tags: bool = True
+    deduplicate: bool = True
+    reconcile_post_write: bool = True
+    apply_counterpart_rules: bool = True
+
+
+MANUAL_WRITE_POLICY = TransactionWritePolicy(use_jev_fallback=False)
+QUICK_LOG_WRITE_POLICY = TransactionWritePolicy(use_jev_fallback=True)
+MCP_EXPENSE_WRITE_POLICY = TransactionWritePolicy(use_jev_fallback=True)
+
+
+@dataclass(frozen=True)
+class TransactionWriteInput:
+    """Immutable command input for recording a transaction via the unified write seam."""
+
+    transaction_date: date
+    amount: float
+    merchant: str
+    account_id: Optional[int] = None
+    account_name: Optional[str] = None
+    currency: Optional[str] = None
+    category: Optional[str] = "General"
+    raw_description: Optional[str] = None
+    notes: Optional[str] = None
+    linked_transaction_id: Optional[int] = None
+    exchange_rate: Optional[float] = None
+    fee_amount: Optional[float] = None
+    tags: Sequence[str] = ()
+    recurrence: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class TransactionWriteResult:
+    """Result returned by record_transaction containing the detached snapshot and created flag."""
+
+    transaction: HydratedTransaction
+    created: bool

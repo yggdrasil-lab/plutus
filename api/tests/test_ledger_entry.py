@@ -5,9 +5,11 @@ from __future__ import annotations
 from collections.abc import Iterator
 from dataclasses import FrozenInstanceError
 from datetime import date
+import json
 from pathlib import Path
 import sys
 
+from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
@@ -15,10 +17,12 @@ from sqlalchemy.pool import StaticPool
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.db import Base
+from app.db import Base, get_db
+from app.main import app
 from app.models import (
     Account,
     CategorizationRule,
+    Category,
     ExchangeRate,
     Loan,
     Receipt,
@@ -27,7 +31,12 @@ from app.models import (
     TransactionSplit,
 )
 from app.schemas import TransactionRead
+from app.services.ai_gateway import InMemoryAiGateway, get_ai_gateway
+from app.services.fx_service import cache_exchange_rate
 from app.services.ledger_entry import (
+    MANUAL_WRITE_POLICY,
+    MCP_EXPENSE_WRITE_POLICY,
+    QUICK_LOG_WRITE_POLICY,
     HydratedManualSplit,
     HydratedTransaction,
     LedgerEntryBadRequestError,
@@ -35,12 +44,17 @@ from app.services.ledger_entry import (
     LedgerEntryValidationError,
     ManualSplitLineInput,
     TransactionPatch,
+    TransactionWriteInput,
+    TransactionWritePolicy,
+    TransactionWriteResult,
     collect_existing_tags,
     hydrate_transaction,
     load_hydrated_transaction,
     normalize_tags,
     parse_rule_tags,
+    record_transaction,
     replace_manual_splits,
+    resolve_default_account,
     strip_redundant_tags,
     transaction_load_options,
     update_transaction,
@@ -604,3 +618,449 @@ def test_replace_manual_splits_validation_and_lifecycle(db_session: Session) -> 
     assert cleared.splits == ()
     assert cleared.loan_id == loan.id
     assert cleared.loan_payment_amount == 50.0
+
+
+class _StubFxFetcher:
+    """Deterministic in-memory FxRateFetcher stub recording lookup calls."""
+
+    def __init__(self, rates: dict[tuple[str, str], tuple[float, str]]) -> None:
+        self._rates = rates
+        self.calls: list[tuple[date, str, str]] = []
+
+    def fetch_rate(
+        self,
+        *,
+        rate_date: date,
+        from_currency: str,
+        to_currency: str,
+    ) -> tuple[float, str] | None:
+        self.calls.append((rate_date, from_currency, to_currency))
+        return self._rates.get((from_currency.upper(), to_currency.upper()))
+
+
+def test_resolve_default_account_matches_active_or_creates_checking(db_session: Session) -> None:
+    inactive_checking = Account(
+        name="Closed Checking",
+        institution="North Bank",
+        account_type="checking",
+        tier="cash",
+        currency="NZD",
+        is_active=False,
+    )
+    savings = _create_account(db_session, name="Goal Saver", account_type="savings")
+    db_session.add(inactive_checking)
+    db_session.commit()
+
+    # No active checking exists yet: creates Primary Checking even if inactive checking exists.
+    created = resolve_default_account(db_session, account_name="Closed")
+    assert created.name == "Primary Checking"
+    assert created.account_type == "checking"
+    assert created.currency == "NZD"
+    assert created.is_active is True
+
+    # Active named account matches case-insensitively with whitespace stripped.
+    matched_savings = resolve_default_account(db_session, account_name="  goal saver ")
+    assert matched_savings.id == savings.id
+
+    # Missing named account falls back to first active checking.
+    fallback = resolve_default_account(db_session, account_name="Nonexistent Account")
+    assert fallback.id == created.id
+
+
+def test_record_transaction_manual_policy_validation_fx_and_detached_snapshot(
+    db_session: Session,
+) -> None:
+    with pytest.raises(LedgerEntryNotFoundError, match="Account not found"):
+        record_transaction(
+            db_session,
+            TransactionWriteInput(
+                transaction_date=date(2026, 11, 20),
+                account_id=999999,
+                amount=-25.0,
+                merchant="Cafe Meridian",
+            ),
+            policy=MANUAL_WRITE_POLICY,
+        )
+
+    sgd_acc = _create_account(db_session, name="North SGD", currency="SGD")
+    db_session.commit()
+    fetcher = _StubFxFetcher({("SGD", "NZD"): (1.285, "stub")})
+    gateway = InMemoryAiGateway()
+
+    result = record_transaction(
+        db_session,
+        TransactionWriteInput(
+            transaction_date=date(2026, 11, 21),
+            account_id=sgd_acc.id,
+            amount=-40.0,
+            currency=None,
+            merchant="Cafe Meridian",
+            category="General",
+            tags=("#Coffee", "Morning Run", "coffee"),
+        ),
+        policy=MANUAL_WRITE_POLICY,
+        ai_gateway=gateway,
+        fx_fetcher=fetcher,
+    )
+    assert isinstance(result, TransactionWriteResult)
+    assert result.created is True
+    assert len(gateway.jev_requests) == 0
+    assert len(fetcher.calls) == 1
+
+    # Explicit exchange_rate bypasses fx_fetcher.
+    explicit_fx = record_transaction(
+        db_session,
+        TransactionWriteInput(
+            transaction_date=date(2026, 11, 21),
+            account_id=sgd_acc.id,
+            amount=-15.0,
+            currency="SGD",
+            merchant="Bookshop 1001",
+            category="Shopping",
+            exchange_rate=1.31,
+        ),
+        policy=MANUAL_WRITE_POLICY,
+        fx_fetcher=fetcher,
+    )
+    assert len(fetcher.calls) == 1
+    assert explicit_fx.transaction.exchange_rate == pytest.approx(1.31)
+
+    snapshot = result.transaction
+    db_session.close()
+    assert snapshot.currency == "SGD"
+    assert snapshot.exchange_rate == pytest.approx(1.285)
+    assert snapshot.category == "General"
+    assert snapshot.tags == ("coffee", "morning-run")
+
+
+def _seed_sample_rules(db: Session, savings_id: int, loan_id: int) -> None:
+    db.add_all(
+        [
+            CategorizationRule(
+                name="Low Priority Broad",
+                description_pattern="Cafe",
+                match_type="contains",
+                target_category="Food",
+                priority=20,
+                is_active=True,
+            ),
+            CategorizationRule(
+                name="Exact Merchant Priority",
+                description_pattern="Cafe Meridian",
+                match_type="exact",
+                target_category="Dining",
+                target_tags='["Coffee", "#Morning"]',
+                target_recurrence="weekly",
+                rename_merchant="Cafe Meridian CBD",
+                loan_id=loan_id,
+                priority=5,
+                is_active=True,
+            ),
+            CategorizationRule(
+                name="StartsWith Prefix Rule",
+                description_pattern="QuickLog: Metro",
+                match_type="starts_with",
+                target_category="Transit",
+                counterpart_account_id=savings_id,
+                priority=10,
+                is_active=True,
+            ),
+            CategorizationRule(
+                name="Transfer Auto Mirror Rule",
+                description_pattern="Vault Sweep",
+                match_type="contains",
+                direction="outflow",
+                target_category="Transfers",
+                target_tags='["savings-sweep"]',
+                counterpart_account_id=savings_id,
+                priority=12,
+                is_active=True,
+            ),
+        ]
+    )
+    db.commit()
+
+
+def test_record_transaction_rules_matching_priority_and_counterpart_attribution(
+    db_session: Session,
+) -> None:
+    checking = _create_account(db_session, name="Main Checking", currency="NZD")
+    savings = _create_account(db_session, name="Vault Savings", account_type="savings")
+    loan = _create_loan(db_session, name="Auto Loan 1001")
+    _seed_sample_rules(db_session, savings.id, loan.id)
+    gateway = InMemoryAiGateway()
+
+    exact_res = record_transaction(
+        db_session,
+        TransactionWriteInput(
+            transaction_date=date(2026, 11, 22),
+            account_id=checking.id,
+            amount=-6.50,
+            merchant="Cafe Meridian",
+            raw_description="QuickLog: Cafe Meridian",
+            category="General",
+        ),
+        policy=QUICK_LOG_WRITE_POLICY,
+        ai_gateway=gateway,
+    )
+    assert len(gateway.jev_requests) == 0
+    assert exact_res.created is True
+    assert exact_res.transaction.merchant == "Cafe Meridian CBD"
+    assert exact_res.transaction.category == "Dining"
+    assert exact_res.transaction.tags == ("coffee", "morning")
+    assert exact_res.transaction.recurrence == "weekly"
+    assert exact_res.transaction.loan_id == loan.id
+
+    exact_rule = db_session.scalar(
+        select(CategorizationRule).where(CategorizationRule.name == "Exact Merchant Priority")
+    )
+    assert exact_rule is not None and exact_rule.match_count == 1
+
+    starts_res = record_transaction(
+        db_session,
+        TransactionWriteInput(
+            transaction_date=date(2026, 11, 22),
+            account_id=checking.id,
+            amount=-12.0,
+            merchant="Metro Pass",
+            raw_description="QuickLog: Metro Pass",
+        ),
+        policy=QUICK_LOG_WRITE_POLICY,
+        ai_gateway=gateway,
+    )
+    assert starts_res.transaction.category == "Transit"
+    assert starts_res.transaction.counterpart_account_id == savings.id
+    assert starts_res.transaction.linked_transaction_id is None
+
+
+def test_record_transaction_transfer_rule_creates_counterpart_mirror(
+    db_session: Session,
+) -> None:
+    checking = _create_account(db_session, name="Main Checking", currency="NZD")
+    savings = _create_account(db_session, name="Vault Savings", account_type="savings")
+    loan = _create_loan(db_session, name="Auto Loan 1001")
+    _seed_sample_rules(db_session, savings.id, loan.id)
+
+    sweep_res = record_transaction(
+        db_session,
+        TransactionWriteInput(
+            transaction_date=date(2026, 11, 22),
+            account_id=checking.id,
+            amount=-250.0,
+            merchant="Vault Sweep 1001",
+            raw_description="AgentLog: Vault Sweep 1001",
+        ),
+        policy=MCP_EXPENSE_WRITE_POLICY,
+        ai_gateway=InMemoryAiGateway(),
+    )
+    assert sweep_res.transaction.category == "Transfers"
+    assert sweep_res.transaction.counterpart_account_id == savings.id
+    assert sweep_res.transaction.linked_transaction_id is not None
+    mirror = load_hydrated_transaction(db_session, sweep_res.transaction.linked_transaction_id)
+    assert mirror.account_id == savings.id
+    assert mirror.amount == pytest.approx(250.0)
+    assert mirror.counterpart_account_id == checking.id
+
+
+def test_record_transaction_jev_fallback_and_dedup_policies(db_session: Session) -> None:
+    checking = _create_account(db_session, name="Checking NZD", currency="NZD")
+    db_session.commit()
+    gateway = InMemoryAiGateway(
+        jev_responses=[
+            json.dumps(
+                {
+                    "category": "Groceries",
+                    "is_anomaly": True,
+                    "tags": ["General", "#Groceries", "weekly shop"],
+                }
+            )
+        ]
+    )
+    first = record_transaction(
+        db_session,
+        TransactionWriteInput(
+            transaction_date=date(2026, 11, 22),
+            account_id=checking.id,
+            amount=-48.50,
+            merchant="Harbour Market",
+            category="General",
+            notes="Dinner prep",
+        ),
+        policy=QUICK_LOG_WRITE_POLICY,
+        ai_gateway=gateway,
+    )
+    assert first.created is True
+    assert first.transaction.category == "Groceries"
+    assert first.transaction.tags == ("weekly-shop",)
+    assert first.transaction.notes == "Dinner prep [Anomaly Detected]"
+    assert len(gateway.jev_requests) == 1
+
+    # Duplicate short-circuits BEFORE Jev and returns created=False.
+    dup = record_transaction(
+        db_session,
+        TransactionWriteInput(
+            transaction_date=date(2026, 11, 22),
+            account_id=checking.id,
+            amount=-48.50,
+            merchant="Harbour Market",
+            category="General",
+        ),
+        policy=QUICK_LOG_WRITE_POLICY,
+        ai_gateway=gateway,
+    )
+    assert dup.created is False
+    assert dup.transaction.id == first.transaction.id
+    assert len(gateway.jev_requests) == 1
+
+    # deduplicate=False salts hash and permits a second row.
+    second = record_transaction(
+        db_session,
+        TransactionWriteInput(
+            transaction_date=date(2026, 11, 22),
+            account_id=checking.id,
+            amount=-48.50,
+            merchant="Harbour Market",
+            category="Groceries",
+        ),
+        policy=TransactionWritePolicy(use_jev_fallback=True, deduplicate=False),
+        ai_gateway=gateway,
+    )
+    assert second.created is True
+    assert second.transaction.id != first.transaction.id
+    assert second.transaction.raw_hash != first.transaction.raw_hash
+
+
+def test_record_transaction_reconciles_receipt_and_transfer_partner(
+    db_session: Session,
+) -> None:
+    checking = _create_account(db_session, name="Checking NZD", currency="NZD")
+    savings = _create_account(db_session, name="Savings NZD", account_type="savings")
+    receipt = Receipt(
+        receipt_date=date(2026, 11, 22),
+        merchant="Harbour Market",
+        total_amount=48.50,
+        currency="NZD",
+        status="unlinked",
+    )
+    partner = _create_tx(
+        db_session,
+        account_id=savings.id,
+        raw_hash="hash-transfer-partner",
+        amount=150.0,
+        merchant="Transfer from Checking",
+        category="Transfers",
+        tx_date=date(2026, 11, 22),
+    )
+    db_session.add(receipt)
+    db_session.commit()
+
+    expense_res = record_transaction(
+        db_session,
+        TransactionWriteInput(
+            transaction_date=date(2026, 11, 22),
+            account_id=checking.id,
+            amount=-48.50,
+            merchant="Harbour Market",
+            category="Groceries",
+        ),
+        policy=MANUAL_WRITE_POLICY,
+    )
+    assert expense_res.transaction.has_receipt is True
+    assert expense_res.transaction.receipt_id == receipt.id
+
+    transfer_res = record_transaction(
+        db_session,
+        TransactionWriteInput(
+            transaction_date=date(2026, 11, 22),
+            account_id=checking.id,
+            amount=-150.0,
+            merchant="Transfer to Savings",
+            category="Transfers",
+        ),
+        policy=MANUAL_WRITE_POLICY,
+    )
+    assert transfer_res.transaction.linked_transaction_id == partner.id
+
+
+def test_quick_log_http_parity_rules_fx_and_dedup_before_jev() -> None:
+    session_factory, engine = _new_memory_session_factory()
+    db = session_factory()
+    gateway = InMemoryAiGateway(
+        jev_responses=[
+            json.dumps({"category": "Shopping", "is_anomaly": False, "tags": ["electronics"]})
+        ]
+    )
+
+    try:
+        sgd_acc = _create_account(db, name="North SGD Checking", currency="SGD")
+        db.add(Category(name="Dining", is_system=True, is_active=True))
+        db.add(
+            CategorizationRule(
+                name="Cafe Rule",
+                description_pattern="Cafe Meridian",
+                match_type="exact",
+                target_category="Dining",
+                target_tags='["coffee"]',
+                rename_merchant="Cafe Meridian Roastery",
+                priority=1,
+                is_active=True,
+            )
+        )
+        cache_exchange_rate(
+            db, rate_date=date(2026, 11, 22), from_currency="SGD", to_currency="NZD",
+            rate=1.29, source="stub",
+        )
+        db.commit()
+        app.dependency_overrides[get_db] = lambda: (yield db)
+        app.dependency_overrides[get_ai_gateway] = lambda: gateway
+        client = TestClient(app)
+
+        rule_res = client.post(
+            "/integrations/quick-log",
+            json={
+                "amount": 8.50,
+                "merchant": "Cafe Meridian",
+                "category": "General",
+                "transaction_date": "2026-11-22",
+            },
+        )
+        assert rule_res.status_code == 201
+        rule_body = rule_res.json()
+        assert rule_body["account_id"] == sgd_acc.id
+        assert rule_body["currency"] == "SGD"
+        assert rule_body["exchange_rate"] == pytest.approx(1.29)
+        assert rule_body["merchant"] == "Cafe Meridian Roastery"
+        assert rule_body["category"] == "Dining"
+        assert rule_body["tags"] == ["coffee"]
+        assert len(gateway.jev_requests) == 0
+
+        jev_res = client.post(
+            "/integrations/quick-log",
+            json={
+                "amount": 55.00,
+                "merchant": "Harbour Gadgets 1001",
+                "category": "General",
+                "transaction_date": "2026-11-22",
+            },
+        )
+        assert jev_res.status_code == 201
+        assert jev_res.json()["category"] == "Shopping"
+        assert len(gateway.jev_requests) == 1
+
+        dup_res = client.post(
+            "/integrations/quick-log",
+            json={
+                "amount": 55.00,
+                "merchant": "Harbour Gadgets 1001",
+                "category": "General",
+                "transaction_date": "2026-11-22",
+            },
+        )
+        assert dup_res.status_code == 201
+        assert dup_res.json()["id"] == jev_res.json()["id"]
+        assert len(gateway.jev_requests) == 1
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides.pop(get_ai_gateway, None)
+        db.close()
+        Base.metadata.drop_all(bind=engine)
