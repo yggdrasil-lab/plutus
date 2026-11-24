@@ -20,7 +20,7 @@ from app.services.receipt_ingestion._types import (
     SemanticDuplicateMatch,
     TransactionCandidateSnapshot,
 )
-from app.services.rules_engine import parse_rule_tags
+from app.services.ledger_entry import parse_rule_tags
 from app.services.receipt_ingestion.sanitization import (
     _MERCHANT_STOPWORDS,
     normalize_merchant_key,

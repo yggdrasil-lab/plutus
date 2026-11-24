@@ -403,7 +403,7 @@ class ReceiptItem(Base):
         """Return normalized tags inherited from the linked parent transaction."""
         if not self.receipt or not self.receipt.transaction:
             return []
-        from app.services.rules_engine import parse_rule_tags
+        from app.services.ledger_entry.tags import parse_rule_tags
 
         return parse_rule_tags(self.receipt.transaction.tags)
 

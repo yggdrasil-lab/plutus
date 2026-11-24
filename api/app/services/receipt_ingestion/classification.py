@@ -18,6 +18,12 @@ from app.services.jev_client import (
     classify_transaction_jev_with_tags,
     get_extra_jev_categories,
 )
+from app.services.ledger_entry import (
+    collect_existing_tags,
+    normalize_tags,
+    parse_rule_tags,
+    strip_redundant_tags,
+)
 from app.services.product_catalog import get_or_create_product
 from app.services.receipt_ingestion._types import (
     ItemClassification,
@@ -26,13 +32,7 @@ from app.services.receipt_ingestion._types import (
     ReceiptItemSnapshot,
     ReceiptNotFoundError,
 )
-from app.services.rules_engine import (
-    collect_existing_tags,
-    match_receipt_item_rule,
-    normalize_tags,
-    parse_rule_tags,
-    strip_redundant_tags,
-)
+from app.services.rules_engine import match_receipt_item_rule
 
 _SKINCARE_KEYWORDS = (
     "serum",

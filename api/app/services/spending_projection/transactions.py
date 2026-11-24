@@ -6,7 +6,7 @@ from typing import Optional
 from sqlalchemy.orm import Session
 
 from app.models import Transaction, TransactionSplit
-from app.services.rules_engine import normalize_tags, parse_rule_tags
+from app.services.ledger_entry import normalize_tags, parse_rule_tags
 from app.services.spending_projection._lines import (
     _is_lent_loan,
     _iter_active_recurring_allocations,

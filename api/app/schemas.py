@@ -220,7 +220,7 @@ class TransactionBase(BaseModel):
                     return [str(t) for t in parsed if str(t).strip()]
             except Exception:
                 return [t.strip() for t in v.split(",") if t.strip()]
-        if isinstance(v, list):
+        if isinstance(v, (list, tuple)):
             return [str(t) for t in v if str(t).strip()]
         return []
 

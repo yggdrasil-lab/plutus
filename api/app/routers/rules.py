@@ -16,10 +16,10 @@ from app.schemas import (
     ClassifyUncategorizedResponse,
 )
 from app.services.ai_gateway import AiGateway, get_ai_gateway
+from app.services.ledger_entry import normalize_tags
 from app.services.rules_engine import (
     apply_rules_to_existing_transactions,
     classify_uncategorized_transactions,
-    normalize_tags,
 )
 
 router = APIRouter(prefix="/rules", tags=["Categorization Rules"])

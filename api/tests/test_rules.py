@@ -17,7 +17,8 @@ from app.db import Base, get_db
 from app.main import app
 from app.models import Account, CategorizationRule, Category, Receipt, ReceiptItem, Transaction
 from app.services.ai_gateway import InMemoryAiGateway, JevGateRequest, get_ai_gateway
-from app.services.rules_engine import collect_existing_tags, evaluate_rules, matches_rule
+from app.services.ledger_entry import collect_existing_tags
+from app.services.rules_engine import evaluate_rules, matches_rule
 
 TEST_DB_URL = "sqlite:///:memory:"
 engine = create_engine(

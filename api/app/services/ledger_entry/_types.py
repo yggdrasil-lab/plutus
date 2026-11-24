@@ -1,0 +1,122 @@
+"""Detached frozen domain contracts, sentinels, and typed exceptions for Ledger Entry."""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import date, datetime
+from typing import Optional
+
+TRANSFER_CATEGORIES: tuple[str, ...] = ("transfers", "transfer")
+MAX_SPLIT_CATEGORY_LENGTH = 50
+
+
+class _UnsetType:
+    """Sentinel distinguishing omitted patch fields from explicit None values."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "UNSET"
+
+
+UNSET = _UnsetType()
+
+
+class LedgerEntryError(ValueError):
+    """Base domain exception for ledger entry hydration and mutation operations."""
+
+
+class LedgerEntryNotFoundError(LedgerEntryError):
+    """Raised when a requested transaction, counterpart account, or loan does not exist."""
+
+
+class LedgerEntryBadRequestError(LedgerEntryError):
+    """Raised when a ledger mutation violates state or relationship preconditions."""
+
+
+class LedgerEntryValidationError(LedgerEntryError):
+    """Raised when patch or manual split line inputs violate validation rules."""
+
+
+@dataclass(frozen=True)
+class HydratedManualSplit:
+    """Detached-session-safe immutable view of one manual TransactionSplit row."""
+
+    id: int
+    transaction_id: int
+    amount: float
+    category: str
+    tags: tuple[str, ...] = ()
+    loan_id: Optional[int] = None
+    loan_name: Optional[str] = None
+    loan_type: Optional[str] = None
+    notes: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class HydratedTransaction:
+    """Detached-session-safe immutable TransactionRead projection without ORM references."""
+
+    id: int
+    transaction_date: date
+    account_id: int
+    amount: float
+    currency: str
+    merchant: str
+    category: str
+    raw_hash: str
+    created_at: datetime
+    account_name: Optional[str] = None
+    raw_description: Optional[str] = None
+    notes: Optional[str] = None
+    linked_transaction_id: Optional[int] = None
+    linked_account_name: Optional[str] = None
+    linked_amount: Optional[float] = None
+    linked_currency: Optional[str] = None
+    counterpart_account_id: Optional[int] = None
+    counterpart_account_name: Optional[str] = None
+    counterpart_account_type: Optional[str] = None
+    loan_id: Optional[int] = None
+    loan_name: Optional[str] = None
+    loan_type: Optional[str] = None
+    loan_payment_amount: Optional[float] = None
+    exchange_rate: Optional[float] = None
+    fee_amount: Optional[float] = None
+    tags: tuple[str, ...] = ()
+    recurrence: Optional[str] = None
+    has_receipt: bool = False
+    receipt_id: Optional[int] = None
+    receipt_document_type: Optional[str] = None
+    is_receipt_split: bool = False
+    splits: tuple[HydratedManualSplit, ...] = ()
+    is_split: bool = False
+    is_amortized_commitment: bool = False
+    amortized_period_amount_nzd: Optional[float] = None
+    amortized_cadence: Optional[str] = None
+    excluded_from_period_budget: bool = False
+
+
+@dataclass(frozen=True)
+class ManualSplitLineInput:
+    """Immutable command input representing one line of a manual split replacement."""
+
+    amount: float
+    category: str
+    tags: Sequence[str] = ()
+    loan_id: Optional[int] = None
+    notes: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class TransactionPatch:
+    """Immutable tri-state patch command for updating an existing transaction."""
+
+    category: str | None | _UnsetType = UNSET
+    merchant: str | None | _UnsetType = UNSET
+    notes: str | None | _UnsetType = UNSET
+    tags: Sequence[str] | None | _UnsetType = UNSET
+    recurrence: str | None | _UnsetType = UNSET
+    counterpart_account_id: int | None | _UnsetType = UNSET
+    loan_id: int | None | _UnsetType = UNSET
+    loan_payment_amount: float | None | _UnsetType = UNSET
