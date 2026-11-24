@@ -32,7 +32,6 @@ from app.schemas import (
     SyncResult,
     TransactionRead,
 )
-from app.routers.transactions import _transaction_load_options, hydrate_transaction
 from app.services.ai_gateway import AiGateway, get_ai_gateway
 from app.services.connectors import ConnectorConfigError, ConnectorUpstreamError
 from app.services.connectors.akahu import sync_akahu
@@ -45,6 +44,12 @@ from app.services.ingestion_service import (
     upsert_account_snapshot,
 )
 from app.services.jev_client import classify_transaction_jev_with_tags, get_extra_jev_categories
+from app.services.ledger_entry import (
+    collect_existing_tags,
+    load_hydrated_transaction,
+    normalize_tags,
+    strip_redundant_tags,
+)
 from app.services.receipt_ingestion import (
     PdfTextExtractor,
     ReceiptParseError,
@@ -56,7 +61,7 @@ from app.services.receipt_ingestion import (
     reconcile_unlinked_receipts,
 )
 from app.services.transfer_service import reconcile_transfers
-from app.services.rules_engine import collect_existing_tags, evaluate_rules, strip_redundant_tags
+from app.services.rules_engine import evaluate_rules
 from app.services.statement_parser import (
     auto_categorize,
     generate_transaction_hash,
@@ -170,11 +175,9 @@ def quick_log_expense(
     raw_hash = generate_transaction_hash(
         tx_date=tx_date, amount=spend_amount, merchant=payload.merchant, account_id=target_account.id
     )
-    existing = db.scalar(
-        select(Transaction).options(*_transaction_load_options()).where(Transaction.raw_hash == raw_hash)
-    )
-    if existing:
-        return hydrate_transaction(existing)
+    existing_id = db.scalar(select(Transaction.id).where(Transaction.raw_hash == raw_hash))
+    if existing_id is not None:
+        return load_hydrated_transaction(db, existing_id)
 
     category, jev_tags, notes = _resolve_quick_log_category_and_notes(db, payload, ai_gateway)
     tx = Transaction(
@@ -186,7 +189,7 @@ def quick_log_expense(
         category=category,
         raw_description=f"QuickLog: {payload.merchant}",
         raw_hash=raw_hash,
-        tags=json.dumps(jev_tags),
+        tags=json.dumps(normalize_tags(jev_tags)),
         notes=notes,
     )
     db.add(tx)
@@ -194,10 +197,7 @@ def quick_log_expense(
     db.refresh(tx)
     reconcile_unlinked_receipts(db)
     reconcile_transfers(db)
-    hydrated = db.scalar(
-        select(Transaction).options(*_transaction_load_options()).where(Transaction.id == tx.id)
-    )
-    return hydrate_transaction(hydrated or tx)
+    return load_hydrated_transaction(db, tx.id, populate_existing=True)
 
 
 @router.post("/statement", response_model=StatementParseResult)
@@ -414,13 +414,8 @@ def receive_dbs_alert(
     try:
         result = ingest_dbs_alert(db, payload, gateway=ai_gateway)
         if result.transaction is not None:
-            hydrated = db.scalar(
-                select(Transaction)
-                .options(*_transaction_load_options())
-                .where(Transaction.id == result.transaction.id)
-            )
-            if hydrated is not None:
-                result.transaction = TransactionRead.model_validate(hydrate_transaction(hydrated))
+            hydrated = load_hydrated_transaction(db, result.transaction.id)
+            result.transaction = TransactionRead.model_validate(hydrated)
         return result
     except ValueError as exc:
         raise HTTPException(

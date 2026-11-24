@@ -13,7 +13,7 @@ from app.services.category_taxonomy import (
     get_root_category,
 )
 from app.services.fx_service import to_nzd_amount
-from app.services.rules_engine import normalize_tags, parse_rule_tags
+from app.services.ledger_entry import normalize_tags, parse_rule_tags
 from app.services.spending_projection._types import (
     DAYS_PER_YEAR,
     RECURRENCE_LOOKBACK_DAYS,

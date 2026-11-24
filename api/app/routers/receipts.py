@@ -14,7 +14,7 @@ from app.services.product_catalog import (
     ProductStatisticsSnapshot,
     compute_product_statistics,
 )
-from app.services.rules_engine import normalize_tags
+from app.services.ledger_entry import normalize_tags
 from app.schemas import (
     ProductStatisticItem,
     ProductStatisticsResponse,
