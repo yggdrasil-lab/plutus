@@ -70,12 +70,12 @@ def ingest_purchase_receipt_email(
         payload.received_at, ZoneInfo(settings.timezone)
     )
     outcome = _extract_receipt_orders_from_attachments(
-        payload.attachments, ai_gateway=ai_gateway, pdf_text_extractor=pdf_text_extractor,
+        db, payload.attachments, ai_gateway=ai_gateway, pdf_text_extractor=pdf_text_extractor,
     )
     orders, stored_media, raw_text = outcome.orders, outcome.stored_media, outcome.raw_text
     if not orders:
         orders, fallback_date, raw_text = _extract_orders_from_email_body(
-            payload, ai_gateway=ai_gateway
+            db, payload, ai_gateway=ai_gateway
         )
         if orders and stored_media is None and outcome.fallback_attachment is not None:
             stored_media = compress_stored_media(outcome.fallback_attachment)
@@ -128,6 +128,7 @@ def _normalize_parsed_orders(parsed: Optional[dict[str, Any]]) -> list[dict[str,
 
 
 def _parse_single_attachment(
+    db: Session,
     raw_bytes: bytes,
     filename: Optional[str],
     mime_type: str,
@@ -140,16 +141,17 @@ def _parse_single_attachment(
         filename,
         mime_type,
         text_parser=lambda txt: parse_receipt_orders_text_with_llm(
-            txt, raise_on_error=False, gateway=ai_gateway
+            txt, db=db, raise_on_error=False, gateway=ai_gateway
         ),
         fallback_parser=lambda b, f, m: parse_receipt_with_llm(
-            b, f, m, gateway=ai_gateway, pdf_text_extractor=pdf_text_extractor
+            b, f, m, db=db, gateway=ai_gateway, pdf_text_extractor=pdf_text_extractor
         ),
         pdf_text_extractor=pdf_text_extractor,
     )
 
 
 def _extract_receipt_orders_from_attachments(
+    db: Session,
     attachments: list[Any],
     *,
     ai_gateway: Optional[AiGateway] = None,
@@ -159,7 +161,7 @@ def _extract_receipt_orders_from_attachments(
         attachments,
         min_pdf_bytes=MIN_RECEIPT_ATTACHMENT_BYTES,
         attachment_parser=lambda b, f, m: _parse_single_attachment(
-            b, f, m, ai_gateway=ai_gateway, pdf_text_extractor=pdf_text_extractor
+            db, b, f, m, ai_gateway=ai_gateway, pdf_text_extractor=pdf_text_extractor
         ),
         normalizer=_normalize_parsed_orders,
     )
@@ -172,6 +174,7 @@ def _extract_receipt_orders_from_attachments(
 
 
 def _extract_orders_from_email_body(
+    db: Session,
     payload: Any,
     *,
     ai_gateway: Optional[AiGateway] = None,
@@ -189,7 +192,7 @@ def _extract_orders_from_email_body(
             "Purchase receipt email contains no readable receipt content or valid attachment."
         )
     parsed_body = parse_receipt_orders_text_with_llm(
-        sanitized.prompt_text, raise_on_error=True, gateway=ai_gateway
+        sanitized.prompt_text, db=db, raise_on_error=True, gateway=ai_gateway
     )
     return (
         _normalize_parsed_orders(parsed_body),

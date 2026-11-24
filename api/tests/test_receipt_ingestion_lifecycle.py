@@ -20,7 +20,7 @@ from sqlalchemy.pool import StaticPool
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.db import Base
-from app.models import Account, Product, Receipt, ReceiptItem, Transaction
+from app.models import Account, Category, Product, Receipt, ReceiptItem, Transaction
 from app.schemas import EmailAttachmentPayload, InboundEmailDispatchPayload
 from app.services.ai_gateway import (
     AiInvalidResponseError,
@@ -28,6 +28,7 @@ from app.services.ai_gateway import (
     InMemoryAiGateway,
     JevGateRequest,
 )
+from app.services.category_taxonomy import ensure_default_categories
 from app.services.receipt_ingestion import (
     ManualReceiptInput,
     PayslipEmailIngestionResult,
@@ -451,5 +452,41 @@ def test_lifecycle_domain_exceptions() -> None:
                         text_body="",
                     ),
                 )
+    finally:
+        Base.metadata.drop_all(bind=engine)
+
+
+def test_purchase_email_prompt_includes_custom_active_category_taxonomy() -> None:
+    session_factory, engine = _new_memory_session_factory()
+    try:
+        pdf_bytes = _make_pdf_bytes(16000)
+        order = {"orders": [{"merchant": "Hobby Co", "receipt_date": "2026-11-23", "total_amount": 25.0, "items": []}]}
+        gateway = InMemoryAiGateway(text_responses=[order, order])
+        with session_factory() as db:
+            ensure_default_categories(db)
+            db.add(Category(name="Model Kits", is_active=True, is_system=False, sort_order=150))
+            db.commit()
+            att = EmailAttachmentPayload(
+                filename="order.pdf", content_type="application/pdf",
+                size_bytes=len(pdf_bytes), content_base64=base64.b64encode(pdf_bytes).decode("ascii"),
+            )
+            ingest_purchase_receipt_email(
+                db,
+                InboundEmailDispatchPayload(
+                    message_id="<tax-att@example.com>", route_target="plutus_purchase_receipt",
+                    subject="Order", attachments=[att],
+                ),
+                ai_gateway=gateway, pdf_text_extractor=lambda _: "Hobby Co Model Kit 25.00",
+            )
+            ingest_purchase_receipt_email(
+                db,
+                InboundEmailDispatchPayload(
+                    message_id="<tax-body@example.com>", route_target="plutus_purchase_receipt",
+                    subject="Order Body", text_body="Hobby Co Model Kit 25.00 NZD",
+                ),
+                ai_gateway=gateway,
+            )
+        assert len(gateway.text_requests) == 2
+        assert all("Model Kits" in req.user_prompt for req in gateway.text_requests)
     finally:
         Base.metadata.drop_all(bind=engine)
