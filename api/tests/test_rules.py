@@ -17,7 +17,6 @@ from app.db import Base, get_db
 from app.main import app
 from app.models import Account, CategorizationRule, Category, Receipt, ReceiptItem, Transaction
 from app.services.ai_gateway import InMemoryAiGateway, JevGateRequest, get_ai_gateway
-from app.services.receipt_service import collect_existing_tags as receipt_collect_existing_tags
 from app.services.rules_engine import collect_existing_tags, evaluate_rules, matches_rule
 
 TEST_DB_URL = "sqlite:///:memory:"
@@ -504,9 +503,7 @@ class TestCategorizationRules(unittest.TestCase):
         self.assertIsNone(cleared["max_amount"])
         self.assertIsNone(cleared["direction"])
 
-    def test_collect_existing_tags_reexport_and_vocab_cleanup(self):
-        self.assertIs(collect_existing_tags, receipt_collect_existing_tags)
-
+    def test_collect_existing_tags_vocab_cleanup(self):
         r = Receipt(receipt_date=date(2026, 11, 1), merchant="Chemist", total_amount=20.0)
         self.db.add(r)
         self.db.flush()

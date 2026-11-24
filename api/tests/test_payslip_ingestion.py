@@ -5,7 +5,6 @@ from collections.abc import Iterator
 from datetime import date, timedelta
 import io
 import json
-from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -20,9 +19,10 @@ from app.main import app
 from app.models import Account, IngestedEmail, Product, Receipt, ReceiptItem, Transaction
 from app.services.ai_gateway import AiUpstreamError, InMemoryAiGateway, get_ai_gateway
 from app.services.category_taxonomy import ensure_default_categories
-from app.services.receipt_service import (
+from app.services.receipt_ingestion import (
     MIN_PAYSLIP_PDF_BYTES,
     PAYSLIP_PARSING_PROMPT,
+    get_pdf_text_extractor,
     parse_payslip_text_with_llm,
     parse_payslip_with_llm,
     reconcile_unlinked_receipts,
@@ -164,30 +164,36 @@ def test_payslip_email_pdf_ingests_skips_items_matches_inflow_and_hydrates_tx(
     }
 
     gateway = InMemoryAiGateway(text_responses=[llm_payslip_json])
-    app.dependency_overrides[get_ai_gateway] = lambda: gateway
+    pdf_calls: list[bytes] = []
 
-    with patch("app.services.receipt_service.extract_pdf_text", return_value=extracted_pdf_text) as mock_pdf:
-        resp = client.post(
-            "/integrations/email",
-            json={
-                "email_id": 11,
-                "message_id": "<payslip-acme-1@acme.example>",
-                "route_target": "plutus_payslip",
-                "from_address": "payroll@acme.example",
-                "subject": "Fwd: Your November Payslip",
-                "received_at": "2026-11-15T04:00:00Z",
-                "text_body": "Hi Alex Tan, your payslip is attached.",
-                "attachments": [
-                    {
-                        "filename": "payslip.pdf",
-                        "content_type": "application/pdf",
-                        "size_bytes": len(pdf_bytes),
-                        "content_base64": base64.b64encode(pdf_bytes).decode("ascii"),
-                    }
-                ],
-            },
-        )
-    mock_pdf.assert_called_once()
+    def _fake_pdf_extractor(raw: bytes) -> str:
+        pdf_calls.append(raw)
+        return extracted_pdf_text
+
+    app.dependency_overrides[get_ai_gateway] = lambda: gateway
+    app.dependency_overrides[get_pdf_text_extractor] = lambda: _fake_pdf_extractor
+
+    resp = client.post(
+        "/integrations/email",
+        json={
+            "email_id": 11,
+            "message_id": "<payslip-acme-1@acme.example>",
+            "route_target": "plutus_payslip",
+            "from_address": "payroll@acme.example",
+            "subject": "Fwd: Your November Payslip",
+            "received_at": "2026-11-15T04:00:00Z",
+            "text_body": "Hi Alex Tan, your payslip is attached.",
+            "attachments": [
+                {
+                    "filename": "payslip.pdf",
+                    "content_type": "application/pdf",
+                    "size_bytes": len(pdf_bytes),
+                    "content_base64": base64.b64encode(pdf_bytes).decode("ascii"),
+                }
+            ],
+        },
+    )
+    assert len(pdf_calls) == 1
 
     assert resp.status_code == 200
     body = resp.json()
@@ -547,8 +553,13 @@ def test_payslip_vision_fallback_for_scanned_pdf_and_image_and_422_on_unparseabl
     app.dependency_overrides[get_ai_gateway] = lambda: gateway
 
     # 1. Scanned PDF (extract_pdf_text == "") -> vision LLM with application/pdf mime
-    with patch("app.services.receipt_service.extract_pdf_text", return_value=""):
-        scanned = parse_payslip_with_llm(raw_pdf, "scanned.pdf", "application/pdf", gateway=gateway)
+    scanned = parse_payslip_with_llm(
+        raw_pdf,
+        "scanned.pdf",
+        "application/pdf",
+        gateway=gateway,
+        pdf_text_extractor=lambda _: "",
+    )
     assert scanned is not None
     assert scanned["employer"] == "Acme Corp"
     assert len(gateway.vision_requests) == 1

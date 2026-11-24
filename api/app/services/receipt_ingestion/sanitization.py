@@ -198,3 +198,11 @@ def normalize_merchant_key(merchant: str) -> str:
         if tok not in _MERCHANT_STOPWORDS
     ]
     return " ".join(tokens) or re.sub(r"[^a-z0-9]+", " ", (merchant or "").lower()).strip()
+
+
+def resolve_order_date(raw_date: Any, fallback_date: date) -> date:
+    """Parse an ISO YYYY-MM-DD date string or return the provided fallback date."""
+    try:
+        return date.fromisoformat(str(raw_date or ""))
+    except ValueError:
+        return fallback_date

@@ -21,7 +21,7 @@ from app.config import settings
 from app.models import Account, AssetSnapshot, Transaction
 from app.services.burn_service import get_latest_account_balances
 from app.services.ingestion_service import upsert_account_snapshot
-from app.services.receipt_service import reconcile_unlinked_receipts
+from app.services.receipt_ingestion import reconcile_unlinked_receipts
 from app.services.runway import (
     calculate_compounding_runway,
     calculate_emergency_runway,

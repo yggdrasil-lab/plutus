@@ -1,8 +1,8 @@
 """Router for receipt management, line-item extraction, cross-domain statistics, and transaction reconciliation."""
 
-from datetime import date
+from datetime import datetime
 import json
-from typing import Any, Optional
+from typing import NoReturn, Optional
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload, selectinload
@@ -19,29 +19,147 @@ from app.schemas import (
     ProductStatisticItem,
     ProductStatisticsResponse,
     ReceiptCreate,
-    ReceiptItemCreate,
     ReceiptItemRead,
     ReceiptItemUpdate,
     ReceiptRead,
     TransactionCandidateRead,
 )
-from app.services.receipt_service import (
-    apply_parsed_payslip_fields,
-    apply_receipt_discounts_with_jev,
-    compress_receipt_image,
-    create_classified_receipt_item,
+from app.services.receipt_ingestion import (
+    ManualReceiptInput,
+    PdfTextExtractor,
+    ReceiptIngestionError,
+    ReceiptItemDraft,
+    ReceiptItemSnapshot,
+    ReceiptNotFoundError,
+    ReceiptParseError,
+    ReceiptSnapshot,
+    ReceiptUpstreamError,
+    ReceiptValidationError,
+    TransactionCandidateSnapshot,
+    create_manual_receipt,
     find_receipt_transaction_candidates,
-    infer_receipt_mime_type,
-    load_receipt_rule_context,
-    match_receipt_to_transaction,
-    normalize_order_number,
-    normalize_receipt_currency,
-    parse_payslip_with_llm,
-    parse_receipt_with_llm,
+    get_pdf_text_extractor,
     reconcile_unlinked_receipts,
+    reprocess_receipt_media,
+    upload_receipt_media,
 )
 
 router = APIRouter(prefix="/receipts", tags=["Receipts & Itemized Tracking"])
+
+_EXCEPTION_STATUS_MAP: tuple[tuple[type[ReceiptIngestionError], int], ...] = (
+    (ReceiptNotFoundError, status.HTTP_404_NOT_FOUND),
+    (ReceiptValidationError, status.HTTP_400_BAD_REQUEST),
+    (ReceiptParseError, status.HTTP_422_UNPROCESSABLE_ENTITY),
+    (ReceiptUpstreamError, status.HTTP_503_SERVICE_UNAVAILABLE),
+)
+
+
+def _raise_http_error(exc: ReceiptIngestionError) -> NoReturn:
+    for exc_type, http_status in _EXCEPTION_STATUS_MAP:
+        if isinstance(exc, exc_type):
+            raise HTTPException(status_code=http_status, detail=str(exc)) from exc
+    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+def _to_receipt_item_read(
+    item: ReceiptItemSnapshot,
+    fallback_created_at: datetime,
+) -> ReceiptItemRead:
+    return ReceiptItemRead(
+        id=item.id,
+        receipt_id=item.receipt_id,
+        product_id=item.product_id,
+        item_name=item.item_name,
+        brand=item.brand,
+        quantity=item.quantity,
+        unit_price=item.unit_price,
+        discount_amount=item.discount_amount,
+        total_price=item.total_price,
+        category=item.category,
+        domain=item.domain,
+        product_type=item.product_type,
+        tags=list(item.tags),
+        volume_ml=item.volume_ml,
+        notes=item.notes,
+        inherited_tags=list(item.inherited_tags),
+        created_at=item.created_at or fallback_created_at,
+    )
+
+
+def _to_receipt_read(snapshot: ReceiptSnapshot) -> ReceiptRead:
+    return ReceiptRead(
+        id=snapshot.id,
+        transaction_id=snapshot.transaction_id,
+        document_type=snapshot.document_type,
+        receipt_date=snapshot.receipt_date,
+        merchant=snapshot.merchant,
+        total_amount=snapshot.total_amount,
+        currency=snapshot.currency,
+        tax_amount=snapshot.tax_amount,
+        order_number=snapshot.order_number,
+        source_email_message_id=snapshot.source_email_message_id,
+        status=snapshot.status,
+        image_path=snapshot.image_path,
+        image_mime_type=snapshot.image_mime_type,
+        image_filename=snapshot.image_filename,
+        has_image=snapshot.has_image,
+        is_processed=snapshot.is_processed,
+        raw_text=snapshot.raw_text,
+        notes=snapshot.notes,
+        items=[_to_receipt_item_read(item, snapshot.created_at) for item in snapshot.items],
+        created_at=snapshot.created_at,
+        updated_at=snapshot.updated_at,
+    )
+
+
+def _to_candidate_read(candidate: TransactionCandidateSnapshot) -> TransactionCandidateRead:
+    return TransactionCandidateRead(
+        transaction_id=candidate.transaction_id,
+        transaction_date=candidate.transaction_date,
+        merchant=candidate.merchant,
+        raw_description=candidate.raw_description,
+        amount=candidate.amount,
+        currency=candidate.currency,
+        account_id=candidate.account_id,
+        account_name=candidate.account_name,
+        original_amount=candidate.original_amount,
+        original_currency=candidate.original_currency,
+        estimated_receipt_amount=candidate.estimated_receipt_amount,
+        confidence=candidate.confidence,
+        match_reason=candidate.match_reason,
+    )
+
+
+def _to_manual_receipt_input(payload: ReceiptCreate) -> ManualReceiptInput:
+    drafts = tuple(
+        ReceiptItemDraft(
+            item_name=item.item_name,
+            brand=item.brand,
+            quantity=item.quantity,
+            unit_price=item.unit_price,
+            discount_amount=item.discount_amount,
+            total_price=item.total_price,
+            explicit_category=item.category,
+            explicit_domain=item.domain,
+            explicit_product_type=item.product_type,
+            explicit_volume_ml=item.volume_ml,
+            explicit_tags=tuple(item.tags),
+            notes=item.notes,
+        )
+        for item in payload.items
+    )
+    return ManualReceiptInput(
+        receipt_date=payload.receipt_date,
+        merchant=payload.merchant,
+        total_amount=payload.total_amount,
+        document_type=payload.document_type,
+        currency=payload.currency,
+        tax_amount=payload.tax_amount,
+        order_number=payload.order_number,
+        status=payload.status,
+        notes=payload.notes,
+        items=drafts,
+    )
 
 
 @router.get("", response_model=list[ReceiptRead])
@@ -64,38 +182,6 @@ def list_receipts(
     )
 
 
-def _persist_payload_receipt_items(
-    db: Session,
-    receipt: Receipt,
-    items: list[Any],
-    *,
-    gateway: AiGateway | None = None,
-) -> None:
-    """Classify and persist line items submitted via ReceiptCreate."""
-    active_rules, existing_tags, extra_categories = load_receipt_rule_context(db)
-    for item in items:
-        create_classified_receipt_item(
-            db,
-            receipt=receipt,
-            item_name=item.item_name,
-            brand=item.brand,
-            quantity=item.quantity,
-            unit_price=item.unit_price,
-            discount_amount=item.discount_amount,
-            total_price=item.total_price,
-            explicit_category=item.category,
-            explicit_domain=item.domain,
-            explicit_product_type=item.product_type,
-            explicit_volume_ml=item.volume_ml,
-            explicit_tags=item.tags,
-            notes=item.notes,
-            active_rules=active_rules,
-            existing_tags=existing_tags,
-            extra_categories=extra_categories,
-            gateway=gateway,
-        )
-
-
 @router.post("", response_model=ReceiptRead, status_code=status.HTTP_201_CREATED)
 def create_receipt(
     payload: ReceiptCreate,
@@ -103,81 +189,15 @@ def create_receipt(
     ai_gateway: AiGateway = Depends(get_ai_gateway),
 ):
     """Create a structured receipt or payslip and attempt auto-matching."""
-    receipt = Receipt(
-        document_type=payload.document_type,
-        receipt_date=payload.receipt_date,
-        merchant=payload.merchant.strip(),
-        total_amount=payload.total_amount,
-        currency=normalize_receipt_currency(payload.currency, fallback="NZD"),
-        tax_amount=payload.tax_amount,
-        order_number=normalize_order_number(payload.order_number),
-        status=payload.status,
-        notes=payload.notes,
-    )
-    db.add(receipt)
-    db.flush()
-    if payload.document_type != "payslip" and payload.items:
-        _persist_payload_receipt_items(db, receipt, payload.items, gateway=ai_gateway)
-    db.commit()
-    db.refresh(receipt)
-    match_receipt_to_transaction(receipt, db)
-    return receipt
-
-
-def _apply_parsed_receipt_fields(
-    receipt: Receipt,
-    parsed: dict[str, Any],
-    db: Session,
-    *,
-    gateway: AiGateway | None = None,
-) -> None:
-    """Populate receipt header fields and itemized line items from parsed LLM JSON."""
     try:
-        r_date = date.fromisoformat(parsed.get("receipt_date", date.today().isoformat()))
-    except (TypeError, ValueError):
-        r_date = date.today()
-
-    receipt.receipt_date = r_date
-    receipt.merchant = str(parsed.get("merchant") or "Unknown Merchant").strip()[:150]
-    receipt.total_amount = float(parsed.get("total_amount", 0.0) or 0.0)
-    receipt.currency = normalize_receipt_currency(
-        parsed.get("currency"), fallback=receipt.currency or "NZD"
-    )
-    order_num = normalize_order_number(parsed.get("order_number"))
-    if order_num:
-        receipt.order_number = order_num
-    receipt.tax_amount = float(parsed["tax_amount"]) if parsed.get("tax_amount") is not None else None
-    receipt.is_processed = True
-    receipt.notes = None
-
-    receipt.items.clear()
-    db.flush()
-
-    active_rules, existing_tags, extra_categories = load_receipt_rule_context(db)
-    resolved_items = apply_receipt_discounts_with_jev(parsed.get("items", []), gateway=gateway)
-    for it in resolved_items:
-        create_classified_receipt_item(
+        snapshot = create_manual_receipt(
             db,
-            receipt=receipt,
-            item_name=str(it.get("item_name") or "Item"),
-            brand=it.get("brand"),
-            quantity=float(it.get("quantity", 1.0) or 1.0),
-            unit_price=float(it.get("unit_price", 0.0) or 0.0),
-            discount_amount=(
-                float(it["discount_amount"]) if it.get("discount_amount") is not None else None
-            ),
-            total_price=float(it.get("total_price", 0.0) or 0.0),
-            explicit_category=it.get("category"),
-            explicit_domain=it.get("domain"),
-            explicit_product_type=it.get("product_type"),
-            explicit_volume_ml=it.get("volume_ml"),
-            explicit_tags=it.get("tags"),
-            notes=it.get("notes"),
-            active_rules=active_rules,
-            existing_tags=existing_tags,
-            extra_categories=extra_categories,
-            gateway=gateway,
+            _to_manual_receipt_input(payload),
+            ai_gateway=ai_gateway,
         )
+    except ReceiptIngestionError as exc:
+        _raise_http_error(exc)
+    return _to_receipt_read(snapshot)
 
 
 @router.post("/upload", response_model=ReceiptRead, status_code=status.HTTP_201_CREATED)
@@ -185,64 +205,22 @@ async def upload_receipt(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     ai_gateway: AiGateway = Depends(get_ai_gateway),
+    pdf_text_extractor: PdfTextExtractor = Depends(get_pdf_text_extractor),
 ):
-    """Upload a receipt photo/PDF/text, parse with Hydrogen Vision, and store in DB.
-
-    Processed images are downscaled and WebP-compressed to save database space.
-    Unprocessed receipts retain their original image quality for later reprocessing.
-    """
+    """Upload a receipt photo/PDF/text, parse with Vision/Text LLM, and store in DB."""
     content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="Uploaded receipt file is empty")
-
-    mime_type = infer_receipt_mime_type(file.filename, file.content_type)
-    raw_text: Optional[str] = None
-    if mime_type.startswith("text/"):
-        try:
-            raw_text = content.decode("utf-8")
-        except UnicodeDecodeError:
-            raw_text = None
-
-    parsed = parse_receipt_with_llm(content, file.filename, mime_type, gateway=ai_gateway)
-
-    if parsed and "merchant" in parsed and "total_amount" in parsed:
-        stored_bytes, stored_mime = compress_receipt_image(content, mime_type)
-        receipt = Receipt(
-            receipt_date=date.today(),
-            merchant="Pending",
-            total_amount=0.0,
-            raw_text=raw_text,
-            image_data=stored_bytes,
-            image_mime_type=stored_mime,
-            image_filename=file.filename,
-            is_processed=True,
-            status="unlinked",
+    try:
+        snapshot = upload_receipt_media(
+            db,
+            content=content,
+            filename=file.filename,
+            content_type=file.content_type,
+            ai_gateway=ai_gateway,
+            pdf_text_extractor=pdf_text_extractor,
         )
-        db.add(receipt)
-        db.flush()
-        _apply_parsed_receipt_fields(receipt, parsed, db, gateway=ai_gateway)
-        db.commit()
-        db.refresh(receipt)
-        match_receipt_to_transaction(receipt, db)
-        return receipt
-
-    # Unprocessed fallback: preserve original image quality in DB for manual linking or reprocessing
-    receipt = Receipt(
-        receipt_date=date.today(),
-        merchant=file.filename or "Unprocessed Receipt",
-        total_amount=0.0,
-        raw_text=raw_text,
-        image_data=content,
-        image_mime_type=mime_type,
-        image_filename=file.filename,
-        is_processed=False,
-        status="unlinked",
-        notes="Pending vision processing (original quality preserved)",
-    )
-    db.add(receipt)
-    db.commit()
-    db.refresh(receipt)
-    return receipt
+    except ReceiptIngestionError as exc:
+        _raise_http_error(exc)
+    return _to_receipt_read(snapshot)
 
 
 @router.get("/{receipt_id}/image")
@@ -268,43 +246,19 @@ def reprocess_receipt(
     receipt_id: int,
     db: Session = Depends(get_db),
     ai_gateway: AiGateway = Depends(get_ai_gateway),
+    pdf_text_extractor: PdfTextExtractor = Depends(get_pdf_text_extractor),
 ):
     """Re-run LLM parsing on a stored receipt or payslip and compress image attachments on success."""
-    receipt = db.get(Receipt, receipt_id)
-    if not receipt:
-        raise HTTPException(status_code=404, detail="Receipt not found")
-    if not receipt.image_data:
-        raise HTTPException(status_code=400, detail="Receipt has no stored image to reprocess")
-
-    mime_type = receipt.image_mime_type or infer_receipt_mime_type(receipt.image_filename, None)
-    if receipt.document_type == "payslip":
-        parsed = parse_payslip_with_llm(
-            receipt.image_data, receipt.image_filename, mime_type, gateway=ai_gateway
+    try:
+        snapshot = reprocess_receipt_media(
+            db,
+            receipt_id,
+            ai_gateway=ai_gateway,
+            pdf_text_extractor=pdf_text_extractor,
         )
-        if not apply_parsed_payslip_fields(receipt, parsed, db):
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="Payslip parsing failed; original document preserved.",
-            )
-    else:
-        parsed = parse_receipt_with_llm(
-            receipt.image_data, receipt.image_filename, mime_type, gateway=ai_gateway
-        )
-        if not parsed or "merchant" not in parsed or "total_amount" not in parsed:
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="Receipt vision parsing failed; original image preserved.",
-            )
-        _apply_parsed_receipt_fields(receipt, parsed, db, gateway=ai_gateway)
-
-    compressed_bytes, compressed_mime = compress_receipt_image(receipt.image_data, mime_type)
-    receipt.image_data = compressed_bytes
-    receipt.image_mime_type = compressed_mime
-    db.commit()
-    db.refresh(receipt)
-    if receipt.status in ("unlinked", "needs_review"):
-        match_receipt_to_transaction(receipt, db)
-    return receipt
+    except ReceiptIngestionError as exc:
+        _raise_http_error(exc)
+    return _to_receipt_read(snapshot)
 
 
 @router.get("/{receipt_id}/candidates", response_model=list[TransactionCandidateRead])
@@ -313,10 +267,11 @@ def list_receipt_candidates(
     db: Session = Depends(get_db),
 ):
     """Return top 5 sorted candidate matching transactions for linking to this receipt."""
-    receipt = db.get(Receipt, receipt_id)
-    if not receipt:
-        raise HTTPException(status_code=404, detail="Receipt not found")
-    return find_receipt_transaction_candidates(db, receipt, limit=5)
+    try:
+        candidates = find_receipt_transaction_candidates(db, receipt_id, limit=5)
+    except ReceiptIngestionError as exc:
+        _raise_http_error(exc)
+    return [_to_candidate_read(candidate) for candidate in candidates]
 
 
 def _to_product_statistics_response(

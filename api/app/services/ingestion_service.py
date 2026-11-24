@@ -22,7 +22,7 @@ from app.schemas import SyncAccountSummary, SyncResult
 from app.services.ai_gateway import AiGateway
 from app.services.fx_service import get_exchange_rate
 from app.services.jev_client import classify_transaction_jev_with_tags, get_extra_jev_categories
-from app.services.receipt_service import reconcile_unlinked_receipts
+from app.services.receipt_ingestion import reconcile_unlinked_receipts
 from app.services.rules_engine import (
     apply_counterpart_account_for_rule,
     collect_existing_tags,

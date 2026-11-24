@@ -21,7 +21,7 @@ from app.schemas import (
     TransactionUpdate,
 )
 from app.services.fx_service import get_exchange_rate
-from app.services.receipt_service import reconcile_unlinked_receipts
+from app.services.receipt_ingestion import reconcile_unlinked_receipts
 from app.services.rules_engine import normalize_tags
 from app.services.spending_projection import (
     TRANSFER_CATEGORIES,

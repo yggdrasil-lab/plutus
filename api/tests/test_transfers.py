@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.db import Base, get_db
 from app.main import app
 from app.models import Account, Receipt, Transaction
-from app.services.receipt_service import reconcile_unlinked_receipts
+from app.services.receipt_ingestion import reconcile_unlinked_receipts
 from app.services.statement_parser import parse_csv_statement
 from app.services.transfer_service import match_transfer_pair, reconcile_transfers
 
