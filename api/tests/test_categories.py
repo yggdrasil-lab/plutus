@@ -27,7 +27,7 @@ from app.models import (
     TransactionSplit,
 )
 from app.services.category_taxonomy import normalize_existing_legacy_categories
-from app.services.receipt_service import classify_line_item
+from app.services.receipt_ingestion import classify_line_item
 from app.services.statement_parser import auto_categorize
 
 TEST_DB_URL = "sqlite:///:memory:"
@@ -525,8 +525,8 @@ class TestCategoriesRouterAndHierarchy(unittest.TestCase):
         self.assertEqual(auto_categorize("Salami By Microv"), "General")
         self.assertEqual(auto_categorize("The Picasso Botique"), "Travel")
         self.assertEqual(auto_categorize("Super Liquor"), "Alcohol")
-        self.assertEqual(classify_line_item("Copper & Oak Pant")[0], "Clothing")
-        self.assertEqual(classify_line_item("Tefal Nonstick Frypan")[0], "Household")
+        self.assertEqual(classify_line_item("Copper & Oak Pant").category, "Clothing")
+        self.assertEqual(classify_line_item("Tefal Nonstick Frypan").category, "Household")
 
     def test_http_contract_schema_fields_and_error_mapping(self):
         cats = self.client.get("/categories").json()

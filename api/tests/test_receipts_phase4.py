@@ -7,7 +7,6 @@ import json
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from PIL import Image, ImageDraw
@@ -29,8 +28,9 @@ from app.services.ai_gateway import (
     InMemoryAiGateway,
     get_ai_gateway,
 )
-from app.services.connectors import ConnectorUpstreamError
-from app.services.receipt_service import (
+from app.services.receipt_ingestion import (
+    ReceiptParseError,
+    ReceiptUpstreamError,
     ingest_purchase_receipt_email,
     match_receipt_to_transaction,
     normalize_receipt_currency,
@@ -146,7 +146,7 @@ class TestReceiptsPhase4(unittest.TestCase):
             "<p>Track at https://tracker.example.com/gp/r.html?C=1234567890&K=ABCDEFGHIJKLMNOPQRSTUVWXYZ12345</p>"
             "<script>var x=1;</script></body></html>"
         )
-        cleaned, fb_date = sanitize_receipt_email_content(
+        sanitized = sanitize_receipt_email_content(
             subject="Fwd: Your Amazon.com.au order",
             from_address="alex@example.com",
             received_at=None,
@@ -154,6 +154,7 @@ class TestReceiptsPhase4(unittest.TestCase):
             html_excerpt=html,
             raw_excerpt=None,
         )
+        cleaned, fb_date = sanitized.prompt_text, sanitized.fallback_date
         self.assertEqual(fb_date, date(2026, 11, 7))
         self.assertIn("AUD 179.74", cleaned)
         self.assertIn("Anker Prime 100W USB-C GaN Charger 3-Port", cleaned)
@@ -657,11 +658,11 @@ class TestReceiptsPhase4(unittest.TestCase):
                 AiUpstreamError("Gateway timeout", status_code=503),
             ]
         )
-        with self.assertRaises(ValueError):
+        with self.assertRaises(ReceiptParseError):
             parse_receipt_orders_text_with_llm("Order 1", raise_on_error=True, gateway=gateway)
-        with self.assertRaises(ValueError):
+        with self.assertRaises(ReceiptParseError):
             parse_receipt_orders_text_with_llm("Order 2", raise_on_error=True, gateway=gateway)
-        with self.assertRaises(ConnectorUpstreamError):
+        with self.assertRaises(ReceiptUpstreamError):
             parse_receipt_orders_text_with_llm("Order 3", raise_on_error=True, gateway=gateway)
         self.assertIsNone(
             parse_receipt_orders_text_with_llm("Order 4", raise_on_error=False, gateway=gateway)
@@ -719,9 +720,9 @@ class TestReceiptsPhase4(unittest.TestCase):
         self.db.commit()
         self.db.refresh(receipt)
 
-        matched_tx = match_receipt_to_transaction(receipt, self.db)
-        self.assertIsNotNone(matched_tx)
-        self.assertEqual(matched_tx.id, tx.id)
+        outcome = match_receipt_to_transaction(self.db, receipt.id)
+        self.db.refresh(receipt)
+        self.assertEqual(outcome.matched_transaction_id, tx.id)
         self.assertEqual(receipt.status, "matched")
         self.assertEqual(receipt.transaction_id, tx.id)
 
@@ -789,13 +790,16 @@ class TestReceiptsPhase4(unittest.TestCase):
             text_responses=[fallback_orders],
             jev_handler=lambda _req: '{"category": "Travel", "is_anomaly": false, "primary_tag": "none"}',
         )
-        created = ingest_purchase_receipt_email(self.db, img_payload, gateway=gateway)
+        result = ingest_purchase_receipt_email(self.db, img_payload, ai_gateway=gateway)
         self.assertEqual(len(gateway.vision_requests), 1)
         self.assertEqual(len(gateway.text_requests), 1)
 
+        created = result.receipts
         self.assertEqual(len(created), 1)
         rec = created[0]
-        self.assertIsNotNone(rec.image_data)
+        db_rec = self.db.get(Receipt, rec.id)
+        self.assertIsNotNone(db_rec)
+        self.assertIsNotNone(db_rec.image_data)
         self.assertTrue(rec.has_image)
         self.assertEqual(rec.image_mime_type, "image/webp")
         self.assertEqual(rec.image_filename, "deposit_receipt.png")
@@ -834,13 +838,20 @@ class TestReceiptsPhase4(unittest.TestCase):
         )
 
         gateway = InMemoryAiGateway(text_responses=[pdf_fallback_orders])
-        with patch("app.services.receipt_service.extract_pdf_text", return_value=""):
-            pdf_created = ingest_purchase_receipt_email(self.db, pdf_payload, gateway=gateway)
+        pdf_result = ingest_purchase_receipt_email(
+            self.db,
+            pdf_payload,
+            ai_gateway=gateway,
+            pdf_text_extractor=lambda _: "",
+        )
 
         self.assertEqual(len(gateway.text_requests), 1)
+        pdf_created = pdf_result.receipts
         self.assertEqual(len(pdf_created), 1)
         pdf_rec = pdf_created[0]
-        self.assertEqual(pdf_rec.image_data, raw_pdf)
+        db_pdf = self.db.get(Receipt, pdf_rec.id)
+        self.assertIsNotNone(db_pdf)
+        self.assertEqual(db_pdf.image_data, raw_pdf)
         self.assertEqual(pdf_rec.image_mime_type, "application/pdf")
         self.assertEqual(pdf_rec.image_filename, "itinerary.pdf")
         self.assertEqual(pdf_rec.currency, "EUR")

@@ -45,7 +45,12 @@ from app.services.ingestion_service import (
     upsert_account_snapshot,
 )
 from app.services.jev_client import classify_transaction_jev_with_tags, get_extra_jev_categories
-from app.services.receipt_service import (
+from app.services.receipt_ingestion import (
+    PdfTextExtractor,
+    ReceiptParseError,
+    ReceiptUpstreamError,
+    ReceiptValidationError,
+    get_pdf_text_extractor,
     ingest_payslip_email,
     ingest_purchase_receipt_email,
     reconcile_unlinked_receipts,
@@ -471,6 +476,7 @@ def _dispatch_dbs_alert_email(
     db: Session,
     payload: InboundEmailDispatchPayload,
     gateway: AiGateway | None = None,
+    _pdf_text_extractor: Optional[PdfTextExtractor] = None,
 ) -> _EmailDispatchOutcome:
     effective_text = (
         (payload.text_body or "").strip()
@@ -503,9 +509,15 @@ def _dispatch_purchase_receipt_email(
     db: Session,
     payload: InboundEmailDispatchPayload,
     gateway: AiGateway | None = None,
+    pdf_text_extractor: Optional[PdfTextExtractor] = None,
 ) -> _EmailDispatchOutcome:
-    receipts = ingest_purchase_receipt_email(db, payload, gateway=gateway)
-    ids = tuple(r.id for r in receipts)
+    result = ingest_purchase_receipt_email(
+        db,
+        payload,
+        ai_gateway=gateway,
+        pdf_text_extractor=pdf_text_extractor,
+    )
+    ids = result.receipt_ids
     consumer_ref = (
         f"receipt:{ids[0]}"
         if len(ids) == 1
@@ -522,12 +534,18 @@ def _dispatch_payslip_email(
     db: Session,
     payload: InboundEmailDispatchPayload,
     gateway: AiGateway | None = None,
+    pdf_text_extractor: Optional[PdfTextExtractor] = None,
 ) -> _EmailDispatchOutcome:
-    receipt = ingest_payslip_email(db, payload, gateway=gateway)
+    result = ingest_payslip_email(
+        db,
+        payload,
+        ai_gateway=gateway,
+        pdf_text_extractor=pdf_text_extractor,
+    )
     return _EmailDispatchOutcome(
         status="processed",
-        consumer_ref=f"receipt:{receipt.id}",
-        receipt_ids=(receipt.id,),
+        consumer_ref=f"receipt:{result.receipt.id}",
+        receipt_ids=(result.receipt.id,),
     )
 
 
@@ -535,6 +553,7 @@ def _dispatch_bank_statement_email(
     _db: Session,
     _payload: InboundEmailDispatchPayload,
     _gateway: AiGateway | None = None,
+    _pdf_text_extractor: Optional[PdfTextExtractor] = None,
 ) -> _EmailDispatchOutcome:
     return _EmailDispatchOutcome(
         status="needs_review",
@@ -544,7 +563,10 @@ def _dispatch_bank_statement_email(
 
 _EMAIL_ROUTE_DISPATCHERS: dict[
     str,
-    Callable[[Session, InboundEmailDispatchPayload, AiGateway | None], _EmailDispatchOutcome],
+    Callable[
+        [Session, InboundEmailDispatchPayload, AiGateway | None, Optional[PdfTextExtractor]],
+        _EmailDispatchOutcome,
+    ],
 ] = {
     "plutus_dbs_alert": _dispatch_dbs_alert_email,
     "plutus_purchase_receipt": _dispatch_purchase_receipt_email,
@@ -616,6 +638,7 @@ def receive_routed_email(
     payload: InboundEmailDispatchPayload,
     db: Session = Depends(get_db),
     ai_gateway: AiGateway = Depends(get_ai_gateway),
+    pdf_text_extractor: PdfTextExtractor = Depends(get_pdf_text_extractor),
     _authorized: bool = Depends(verify_integration_token),
 ):
     """Unified idempotent email ingestion endpoint routed from Iris Notification Gateway."""
@@ -630,7 +653,7 @@ def receive_routed_email(
             detail=f"Unsupported route_target '{payload.route_target}'.",
         )
     try:
-        outcome = dispatcher(db, payload, ai_gateway)
+        outcome = dispatcher(db, payload, ai_gateway, pdf_text_extractor)
         receipt_ids = _upsert_processed_ingested_email(db, payload, outcome)
         db.commit()
         return InboundEmailDispatchResult(
@@ -643,9 +666,9 @@ def receive_routed_email(
             receipt_id=receipt_ids[0] if receipt_ids else None,
             receipt_ids=receipt_ids,
         )
-    except ValueError as exc:
+    except (ValueError, ReceiptValidationError, ReceiptParseError) as exc:
         _upsert_failed_ingested_email(db, payload, str(exc))
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
-    except ConnectorUpstreamError as exc:
+    except (ConnectorUpstreamError, ReceiptUpstreamError) as exc:
         _upsert_failed_ingested_email(db, payload, str(exc))
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc

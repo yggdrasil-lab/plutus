@@ -22,7 +22,9 @@ from app.services.ai_gateway import (
     JevGateRequest,
     get_ai_gateway,
 )
-from app.services.receipt_service import (
+from app.services.receipt_ingestion import (
+    ReceiptItemDraft,
+    apply_receipt_discounts_with_jev,
     classify_line_item,
     extract_tags_for_line_item,
     match_receipt_to_transaction,
@@ -72,24 +74,24 @@ class TestReceiptsRouter(unittest.TestCase):
 
     def test_classify_line_item_heuristics(self):
         # 1. Personal Care / Skincare (Area 02-Skin)
-        cat, dom, ptype, vol = classify_line_item("Geek & Gorgeous C-Glow 15% Vitamin C 30ml")
-        self.assertEqual(cat, "Personal Care")
-        self.assertEqual(dom, "02-skin")
-        self.assertEqual(ptype, "vitamin_c_serum")
-        self.assertEqual(vol, "30ml")
+        res1 = classify_line_item("Geek & Gorgeous C-Glow 15% Vitamin C 30ml")
+        self.assertEqual(res1.category, "Personal Care")
+        self.assertEqual(res1.domain, "02-skin")
+        self.assertEqual(res1.product_type, "vitamin_c_serum")
+        self.assertEqual(res1.volume_ml, "30ml")
 
         # 2. Supplements (Area 01-Health)
-        cat, dom, ptype, vol = classify_line_item("Optimum Nutrition Gold Standard 100% Whey 1kg")
-        self.assertEqual(cat, "Supplements")
-        self.assertEqual(dom, "01-health")
-        self.assertEqual(ptype, "protein_powder")
-        self.assertEqual(vol, "1kg")
+        res2 = classify_line_item("Optimum Nutrition Gold Standard 100% Whey 1kg")
+        self.assertEqual(res2.category, "Supplements")
+        self.assertEqual(res2.domain, "01-health")
+        self.assertEqual(res2.product_type, "protein_powder")
+        self.assertEqual(res2.volume_ml, "1kg")
 
         # 3. Hardware / Tech (Area 20-Home)
-        cat, dom, ptype, vol = classify_line_item("Anker USB-C Fast Charger Adapter")
-        self.assertEqual(cat, "Tech")
-        self.assertEqual(dom, "20-home")
-        self.assertEqual(ptype, "tech")
+        res3 = classify_line_item("Anker USB-C Fast Charger Adapter")
+        self.assertEqual(res3.category, "Tech")
+        self.assertEqual(res3.domain, "20-home")
+        self.assertEqual(res3.product_type, "tech")
 
     def test_create_receipt_and_auto_match(self):
         # Seed an existing credit card transaction
@@ -432,22 +434,20 @@ class TestReceiptsRouter(unittest.TestCase):
         self.assertIn("TPD Coca Cola No S", coke["notes"])
 
     def test_apply_receipt_discounts_heuristic_fallback_when_jev_offline(self):
-        from app.services.receipt_service import apply_receipt_discounts_with_jev
-
-        items = [
-            {"item_name": "CP Wonton Noodle", "quantity": 1.0, "unit_price": 29.99, "total_price": 29.99},
-            {"item_name": "Coca Cola Zero 36P", "quantity": 1.0, "unit_price": 34.99, "total_price": 34.99},
-            {"item_name": "TPD Coca Cola No S", "quantity": 1.0, "unit_price": -7.00, "total_price": -7.00},
-        ]
+        items = (
+            ReceiptItemDraft(item_name="CP Wonton Noodle", quantity=1.0, unit_price=29.99, total_price=29.99),
+            ReceiptItemDraft(item_name="Coca Cola Zero 36P", quantity=1.0, unit_price=34.99, total_price=34.99),
+            ReceiptItemDraft(item_name="TPD Coca Cola No S", quantity=1.0, unit_price=-7.00, total_price=-7.00),
+        )
         gateway = InMemoryAiGateway(
             jev_responses=[AiUpstreamError("Jev offline", status_code=503)]
         )
         resolved = apply_receipt_discounts_with_jev(items, gateway=gateway)
 
         self.assertEqual(len(resolved), 2)
-        self.assertEqual(resolved[1]["unit_price"], 34.99)
-        self.assertEqual(resolved[1]["discount_amount"], 7.0)
-        self.assertEqual(resolved[1]["total_price"], 27.99)
+        self.assertEqual(resolved[1].unit_price, 34.99)
+        self.assertEqual(resolved[1].discount_amount, 7.0)
+        self.assertEqual(resolved[1].total_price, 27.99)
 
     def test_matched_receipt_splits_transaction_categories_in_breakdown_and_burn(self):
         today = date.today()
@@ -748,13 +748,13 @@ class TestReceiptsRouter(unittest.TestCase):
         self.assertEqual(refreshed_yonex["tags"], ["badminton", "sport-gear"])
 
     def test_extract_tags_omits_general_fallback_tag(self):
-        self.assertEqual(extract_tags_for_line_item("Mystery Item"), [])
-        self.assertEqual(extract_tags_for_line_item("Mystery Item", domain="general"), [])
+        self.assertEqual(extract_tags_for_line_item("Mystery Item"), ())
+        self.assertEqual(extract_tags_for_line_item("Mystery Item", domain="general"), ())
         self.assertEqual(
             extract_tags_for_line_item(
                 "Copper & Oak Pant", domain="general", product_type="clothing"
             ),
-            ["clothing"],
+            ("clothing",),
         )
 
         gateway = InMemoryAiGateway(

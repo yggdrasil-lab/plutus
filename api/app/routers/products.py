@@ -30,7 +30,7 @@ from app.services.product_catalog import (
     list_products as list_product_snapshots,
     update_product as update_product_record,
 )
-from app.services.receipt_service import extract_tags_for_line_item
+from app.services.receipt_ingestion import extract_tags_for_line_item
 
 router = APIRouter(prefix="/products", tags=["Product Catalog & Price Tracking"])
 

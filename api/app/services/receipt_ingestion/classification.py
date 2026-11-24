@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 import json
 import re
-from typing import Optional
+from typing import Any, Optional
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -414,6 +414,8 @@ def _to_receipt_item_snapshot(
         tags=tags,
         volume_ml=row.volume_ml,
         notes=row.notes,
+        inherited_tags=tuple(row.inherited_tags),
+        created_at=row.created_at,
     )
 
 
@@ -611,3 +613,38 @@ def apply_receipt_discounts_with_jev(
         unmatched_discounts.append(disc)
 
     return tuple(positive_items + unmatched_discounts)
+
+
+def _draft_from_mapping(item: Mapping[str, Any]) -> ReceiptItemDraft:
+    raw_tags = item.get("tags")
+    explicit_tags = (
+        tuple(str(tag) for tag in raw_tags) if isinstance(raw_tags, (list, tuple)) else ()
+    )
+    raw_discount = item.get("discount_amount")
+    return ReceiptItemDraft(
+        item_name=str(item.get("item_name") or "Item"),
+        brand=str(item["brand"]) if item.get("brand") is not None else None,
+        quantity=float(item.get("quantity", 1.0) or 1.0),
+        unit_price=float(item.get("unit_price", 0.0) or 0.0),
+        discount_amount=float(raw_discount) if raw_discount is not None else None,
+        total_price=float(item.get("total_price", 0.0) or 0.0),
+        explicit_category=str(item["category"]) if item.get("category") is not None else None,
+        explicit_domain=str(item["domain"]) if item.get("domain") is not None else None,
+        explicit_product_type=(
+            str(item["product_type"]) if item.get("product_type") is not None else None
+        ),
+        explicit_volume_ml=str(item["volume_ml"]) if item.get("volume_ml") is not None else None,
+        explicit_tags=explicit_tags,
+        notes=str(item["notes"]) if item.get("notes") is not None else None,
+    )
+
+
+def drafts_from_parsed_items(raw_items: Sequence[Any]) -> tuple[ReceiptItemDraft, ...]:
+    """Convert raw parsed LLM line-item dicts or drafts into immutable ReceiptItemDraft tuples."""
+    drafts: list[ReceiptItemDraft] = []
+    for item in raw_items:
+        if isinstance(item, ReceiptItemDraft):
+            drafts.append(item)
+        elif isinstance(item, Mapping):
+            drafts.append(_draft_from_mapping(item))
+    return tuple(drafts)

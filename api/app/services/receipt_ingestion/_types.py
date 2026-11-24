@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from typing import Optional
 
 PdfTextExtractor = Callable[[bytes], str]
@@ -105,6 +105,68 @@ class ReceiptItemSnapshot:
     tags: tuple[str, ...]
     volume_ml: Optional[str]
     notes: Optional[str]
+    inherited_tags: tuple[str, ...] = ()
+    created_at: Optional[datetime] = None
+
+
+@dataclass(frozen=True)
+class ManualReceiptInput:
+    """Immutable command contract for creating a manual receipt or payslip."""
+
+    receipt_date: date
+    merchant: str
+    total_amount: float
+    document_type: str = "receipt"
+    currency: str = "NZD"
+    tax_amount: Optional[float] = None
+    order_number: Optional[str] = None
+    status: str = "unlinked"
+    notes: Optional[str] = None
+    items: tuple[ReceiptItemDraft, ...] = ()
+
+
+@dataclass(frozen=True)
+class ReceiptSnapshot:
+    """Detached immutable view of a persisted receipt or payslip and its items."""
+
+    id: int
+    transaction_id: Optional[int]
+    document_type: str
+    receipt_date: date
+    merchant: str
+    total_amount: float
+    currency: str
+    tax_amount: Optional[float]
+    order_number: Optional[str]
+    source_email_message_id: Optional[str]
+    status: str
+    image_path: Optional[str]
+    image_mime_type: Optional[str]
+    image_filename: Optional[str]
+    has_image: bool
+    is_processed: bool
+    raw_text: Optional[str]
+    notes: Optional[str]
+    items: tuple[ReceiptItemSnapshot, ...]
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True)
+class PurchaseEmailIngestionResult:
+    """Detached outcome of ingesting a single- or multi-order purchase receipt email."""
+
+    receipts: tuple[ReceiptSnapshot, ...]
+    receipt_ids: tuple[int, ...]
+    deduplicated_count: int = 0
+
+
+@dataclass(frozen=True)
+class PayslipEmailIngestionResult:
+    """Detached outcome of ingesting an automated payslip email."""
+
+    receipt: ReceiptSnapshot
+    deduplicated: bool = False
 
 
 @dataclass(frozen=True)

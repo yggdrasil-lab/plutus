@@ -8,17 +8,23 @@ import re
 from typing import Optional
 
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, selectinload
 
-from app.models import Receipt, Transaction
+from app.models import Receipt, ReceiptItem, Transaction
 from app.services.fx_service import get_exchange_rate
 from app.services.receipt_ingestion._types import (
+    ReceiptItemSnapshot,
     ReceiptMatchOutcome,
     ReceiptNotFoundError,
+    ReceiptSnapshot,
     SemanticDuplicateMatch,
     TransactionCandidateSnapshot,
 )
-from app.services.receipt_ingestion.sanitization import normalize_merchant_key
+from app.services.rules_engine import parse_rule_tags
+from app.services.receipt_ingestion.sanitization import (
+    _MERCHANT_STOPWORDS,
+    normalize_merchant_key,
+)
 
 _ORIG_FX_DESC_RE = re.compile(
     r"\bof\s+([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s+([A-Z]{3})\b",
@@ -34,42 +40,6 @@ _FX_DESC_PATTERNS: tuple[tuple[re.Pattern[str], bool], ...] = (
 )
 _MONTH_CODES = frozenset(
     {"JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"}
-)
-_MERCHANT_STOPWORDS = frozenset(
-    {
-        "the",
-        "pty",
-        "ltd",
-        "inc",
-        "limited",
-        "co",
-        "corp",
-        "llc",
-        "card",
-        "transaction",
-        "issued",
-        "by",
-        "payment",
-        "purchase",
-        "pos",
-        "eftpos",
-        "online",
-        "store",
-        "shop",
-        "marketplace",
-        "com",
-        "www",
-        "nz",
-        "au",
-        "sg",
-        "us",
-        "uk",
-        "at",
-        "to",
-        "of",
-        "in",
-        "on",
-    }
 )
 
 
@@ -550,3 +520,59 @@ def find_semantic_duplicate_receipt(
         if normalize_merchant_key(existing.merchant) == target_key:
             return _to_duplicate_match(existing, matched_by="merchant_date_amount")
     return None
+
+
+def _item_row_to_snapshot(row: ReceiptItem) -> ReceiptItemSnapshot:
+    return ReceiptItemSnapshot(
+        id=row.id,
+        receipt_id=row.receipt_id,
+        product_id=row.product_id,
+        item_name=row.item_name,
+        brand=row.brand,
+        quantity=float(row.quantity),
+        unit_price=float(row.unit_price),
+        discount_amount=float(row.discount_amount) if row.discount_amount is not None else None,
+        total_price=float(row.total_price),
+        category=row.category,
+        domain=row.domain,
+        product_type=row.product_type,
+        tags=tuple(parse_rule_tags(row.tags)),
+        volume_ml=row.volume_ml,
+        notes=row.notes,
+        inherited_tags=tuple(row.inherited_tags),
+        created_at=row.created_at,
+    )
+
+
+def load_receipt_snapshot(db: Session, receipt_id: int) -> ReceiptSnapshot:
+    """Load a receipt with items and return a detached immutable ReceiptSnapshot."""
+    receipt = db.scalar(
+        select(Receipt)
+        .options(joinedload(Receipt.transaction), selectinload(Receipt.items))
+        .where(Receipt.id == receipt_id)
+    )
+    if receipt is None:
+        raise ReceiptNotFoundError(f"Receipt {receipt_id} not found")
+    return ReceiptSnapshot(
+        id=receipt.id,
+        transaction_id=receipt.transaction_id,
+        document_type=receipt.document_type,
+        receipt_date=receipt.receipt_date,
+        merchant=receipt.merchant,
+        total_amount=float(receipt.total_amount),
+        currency=receipt.currency,
+        tax_amount=float(receipt.tax_amount) if receipt.tax_amount is not None else None,
+        order_number=receipt.order_number,
+        source_email_message_id=receipt.source_email_message_id,
+        status=receipt.status,
+        image_path=receipt.image_path,
+        image_mime_type=receipt.image_mime_type,
+        image_filename=receipt.image_filename,
+        has_image=receipt.has_image,
+        is_processed=bool(receipt.is_processed),
+        raw_text=receipt.raw_text,
+        notes=receipt.notes,
+        items=tuple(_item_row_to_snapshot(item) for item in receipt.items),
+        created_at=receipt.created_at,
+        updated_at=receipt.updated_at,
+    )
