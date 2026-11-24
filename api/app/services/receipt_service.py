@@ -3,7 +3,6 @@
 import base64
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from html.parser import HTMLParser
 import io
 import json
 import logging
@@ -36,6 +35,7 @@ from app.services.category_taxonomy import get_canonical_category_names
 from app.services.connectors import ConnectorUpstreamError
 from app.services.email_utils import (
     extract_and_strip_forwarded_header,
+    html_to_plain_text,
     strip_invisible_unicode,
 )
 from app.services.fx_service import get_exchange_rate
@@ -54,7 +54,6 @@ logger = logging.getLogger(__name__)
 MIN_RECEIPT_ATTACHMENT_BYTES = 15 * 1024
 MIN_PAYSLIP_PDF_BYTES = 512
 _TRACKING_URL_RE = re.compile(r"https?://\S{40,}", re.IGNORECASE)
-_INVISIBLE_FORMAT_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff\u00ad\u034f]")
 _ORIG_FX_DESC_RE = re.compile(
     r"\bof\s+([0-9][0-9,]*(?:\.[0-9]{1,2})?)\s+([A-Z]{3})\b",
     re.IGNORECASE,
@@ -735,81 +734,6 @@ def parse_payslip_with_llm(
     return parse_payslip_text_with_llm(raw_text, raise_on_error=False, gateway=gateway)
 
 
-class _ReceiptHTMLSanitizer(HTMLParser):
-    """Sanitize HTML purchase receipts while preserving aria-label prices and img alt titles."""
-
-    _SKIP_TAGS = {"script", "style", "noscript", "head", "title"}
-    _BLOCK_TAGS = {
-        "p",
-        "div",
-        "tr",
-        "li",
-        "br",
-        "hr",
-        "h1",
-        "h2",
-        "h3",
-        "h4",
-        "h5",
-        "h6",
-        "table",
-        "section",
-        "article",
-        "header",
-        "footer",
-        "blockquote",
-    }
-    _NOISE_ALT_VALUES = frozenset({"logo", "spacer", "pixel", "icon", "image", "banner"})
-
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self._skip = 0
-        self._chunks: list[str] = []
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
-        lower = tag.lower()
-        if lower in self._SKIP_TAGS:
-            self._skip += 1
-            return
-        if self._skip > 0:
-            return
-
-        attr_map = {k.lower(): (v or "").strip() for k, v in attrs}
-        aria_label = attr_map.get("aria-label")
-        if aria_label and len(aria_label) >= 2 and aria_label.lower() not in {"close", "menu", "logo"}:
-            self._chunks.append(f" [aria: {aria_label}] ")
-
-        if lower == "img":
-            alt_text = attr_map.get("alt")
-            if alt_text and len(alt_text) >= 4 and alt_text.lower() not in self._NOISE_ALT_VALUES:
-                self._chunks.append(f" [item: {alt_text}] ")
-
-        if lower in self._BLOCK_TAGS:
-            self._chunks.append("\n")
-        elif lower in ("td", "th", "span"):
-            self._chunks.append(" ")
-
-    def handle_endtag(self, tag: str) -> None:
-        lower = tag.lower()
-        if lower in self._SKIP_TAGS:
-            if self._skip > 0:
-                self._skip -= 1
-            return
-        if self._skip == 0:
-            if lower in self._BLOCK_TAGS:
-                self._chunks.append("\n")
-            elif lower in ("td", "th", "span"):
-                self._chunks.append(" ")
-
-    def handle_data(self, data: str) -> None:
-        if self._skip == 0 and data:
-            self._chunks.append(data)
-
-    def get_text(self) -> str:
-        raw = "".join(self._chunks)
-        return _clean_receipt_text_lines(raw)
-
-
 def _clean_receipt_text_lines(raw: str) -> str:
     """Normalize whitespace, strip invisible spacers and long tracking URLs from text."""
     cleaned = strip_invisible_unicode(raw)
@@ -832,10 +756,9 @@ def sanitize_receipt_email_content(
 
     html_clean = ""
     if html_excerpt and html_excerpt.strip():
-        parser = _ReceiptHTMLSanitizer()
-        parser.feed(html_excerpt)
-        parser.close()
-        html_clean = parser.get_text()
+        html_clean = _clean_receipt_text_lines(
+            html_to_plain_text(html_excerpt, preserve_annotations=True)
+        )
 
     raw_source_for_fwd = (text_body or raw_excerpt or "").strip() or html_clean
     clean_subject, stripped_text, ref_local_dt = extract_and_strip_forwarded_header(
