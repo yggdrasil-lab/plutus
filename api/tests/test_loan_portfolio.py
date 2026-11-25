@@ -13,16 +13,22 @@ from sqlalchemy.pool import StaticPool
 from app.db import Base
 from app.models import Account, ExchangeRate, Loan, Transaction, TransactionSplit
 from app.services.loan_service import (
+    LoanCreateInput,
     LoanFxConversionError,
+    LoanNotFoundError,
     LoanPaymentSnapshot,
     LoanPortfolioSummary,
     LoanStatusSnapshot,
+    LoanValidationError,
     add_months,
     compute_loan_status,
+    create_loan,
+    delete_loan,
     get_loan_portfolio_summary,
     get_loan_status,
     load_loan_with_transactions,
     summarize_loans,
+    update_loan,
 )
 
 _RAW_HASH_SEQ = itertools.count(1)
@@ -434,5 +440,153 @@ def test_unresolvable_cross_currency_rate_fails_loud():
         assert loaded_sgd is not None
         with pytest.raises(LoanFxConversionError, match="USD->SGD"):
             compute_loan_status(loaded_sgd, tx_day, db=None, fetcher=empty_fetcher)
+
+    engine.dispose()
+
+
+def test_create_loan_normalizes_detaches_and_validates():
+    engine, SessionLocal = _create_test_session()
+    with SessionLocal() as db:
+        lent_snap = create_loan(
+            db,
+            LoanCreateInput(
+                name="  Family Advance  ",
+                lender="  Alex Tan  ",
+                loan_type=" LENT ",
+                principal_amount=750.0,
+                start_date=date(2025, 1, 1),
+                currency=" sgd ",
+                notes="  repay when able  ",
+            ),
+            as_of=date(2025, 1, 15),
+        )
+        blank_curr = create_loan(
+            db,
+            LoanCreateInput(
+                name="Studio Loan",
+                lender="Beta Bank",
+                loan_type="borrowed",
+                principal_amount=1200.0,
+                annual_interest_rate=0.05,
+                term_months=12,
+                monthly_payment=105.0,
+                start_date=date(2025, 1, 1),
+                currency="   ",
+            ),
+            as_of=date(2025, 1, 15),
+        )
+        trunc_curr = create_loan(
+            db,
+            LoanCreateInput(
+                name="Overseas Advance",
+                lender="Jordan Kim",
+                loan_type="lent",
+                principal_amount=300.0,
+                start_date=date(2025, 1, 1),
+                currency=" audx ",
+            ),
+            as_of=date(2025, 1, 15),
+        )
+
+    assert isinstance(lent_snap, LoanStatusSnapshot)
+    assert lent_snap.name == "Family Advance"
+    assert lent_snap.lender == "Alex Tan"
+    assert lent_snap.loan_type == "lent"
+    assert lent_snap.currency == "SGD"
+    assert lent_snap.notes == "repay when able"
+    assert blank_curr.currency == "NZD"
+    assert trunc_curr.currency == "AUD"
+    with pytest.raises(FrozenInstanceError):
+        lent_snap.name = "Mutated"  # type: ignore[misc]
+
+    invalid_payloads = [
+        LoanCreateInput(name="X", lender="Y", loan_type="other", principal_amount=100.0, start_date=date(2025, 1, 1)),
+        LoanCreateInput(name="  ", lender="Y", loan_type="lent", principal_amount=100.0, start_date=date(2025, 1, 1)),
+        LoanCreateInput(name="X", lender="  ", loan_type="lent", principal_amount=100.0, start_date=date(2025, 1, 1)),
+        LoanCreateInput(name="X", lender="Y", loan_type="lent", principal_amount=0.0, start_date=date(2025, 1, 1)),
+        LoanCreateInput(name="X", lender="Y", loan_type="lent", principal_amount=100.0, annual_interest_rate=-0.01, start_date=date(2025, 1, 1)),
+        LoanCreateInput(name="X", lender="Y", loan_type="lent", principal_amount=100.0, annual_interest_rate=1.01, start_date=date(2025, 1, 1)),
+        LoanCreateInput(name="X", lender="Y", loan_type="lent", principal_amount=100.0, term_months=-1, start_date=date(2025, 1, 1)),
+        LoanCreateInput(name="X", lender="Y", loan_type="lent", principal_amount=100.0, term_months=601, start_date=date(2025, 1, 1)),
+        LoanCreateInput(name="X", lender="Y", loan_type="lent", principal_amount=100.0, monthly_payment=-1.0, start_date=date(2025, 1, 1)),
+        LoanCreateInput(name="X", lender="Y", loan_type="lent", principal_amount=100.0, asset_value=-5.0, start_date=date(2025, 1, 1)),
+        LoanCreateInput(name="X", lender="Y", loan_type="borrowed", principal_amount=100.0, term_months=0, monthly_payment=50.0, start_date=date(2025, 1, 1)),
+        LoanCreateInput(name="X", lender="Y", loan_type="borrowed", principal_amount=100.0, term_months=6, monthly_payment=0.0, start_date=date(2025, 1, 1)),
+    ]
+    with SessionLocal() as db:
+        for bad in invalid_payloads:
+            with pytest.raises(LoanValidationError):
+                create_loan(db, bad, as_of=date(2025, 1, 15))
+
+    engine.dispose()
+
+
+def test_update_and_delete_loan_lifecycle_and_atomic_validation():
+    engine, SessionLocal = _create_test_session()
+    with SessionLocal() as db:
+        lent = create_loan(
+            db,
+            LoanCreateInput(
+                name="Open Receivable",
+                lender="Taylor Lee",
+                loan_type="lent",
+                principal_amount=600.0,
+                start_date=date(2025, 1, 1),
+                asset_value=700.0,
+                notes="initial note",
+            ),
+            as_of=date(2025, 1, 15),
+        )
+        updated = update_loan(
+            db,
+            lent.id,
+            {"name": "  Updated Receivable  ", "lender": "  Taylor L  ", "asset_value": None, "notes": None},
+            as_of=date(2025, 1, 15),
+        )
+        assert updated.name == "Updated Receivable"
+        assert updated.lender == "Taylor L"
+        assert updated.asset_value is None
+        assert updated.notes is None
+
+        with pytest.raises(LoanNotFoundError):
+            update_loan(db, 999999, {"name": "Ghost"}, as_of=date(2025, 1, 15))
+
+        with pytest.raises(LoanValidationError, match="Unsupported loan update"):
+            update_loan(db, lent.id, {"unknown_field": 123}, as_of=date(2025, 1, 15))
+
+        # Every non-nullable field set to None must fail and leave DB row untouched
+        for field_name in (
+            "name", "lender", "loan_type", "principal_amount",
+            "annual_interest_rate", "term_months", "monthly_payment",
+            "start_date", "is_active",
+        ):
+            with pytest.raises(LoanValidationError, match=f"{field_name} cannot be null"):
+                update_loan(db, lent.id, {"notes": "should not persist", field_name: None}, as_of=date(2025, 1, 15))
+
+        reloaded = get_loan_status(db, lent.id, as_of=date(2025, 1, 15))
+        assert reloaded is not None and reloaded.notes is None and reloaded.name == "Updated Receivable"
+
+        # Switching open-term lent -> borrowed fails without term & payment, succeeds with both
+        with pytest.raises(LoanValidationError, match="Borrowed loans require"):
+            update_loan(db, lent.id, {"loan_type": "borrowed"}, as_of=date(2025, 1, 15))
+
+        switched = update_loan(
+            db,
+            lent.id,
+            {"loan_type": "borrowed", "term_months": 6, "monthly_payment": 100.0},
+            as_of=date(2025, 1, 15),
+        )
+        assert switched.loan_type == "borrowed"
+        assert switched.term_months == 6
+
+        with pytest.raises(LoanValidationError, match="Borrowed loans require"):
+            update_loan(db, lent.id, {"term_months": 0}, as_of=date(2025, 1, 15))
+        with pytest.raises(LoanValidationError, match="Borrowed loans require"):
+            update_loan(db, lent.id, {"monthly_payment": 0.0}, as_of=date(2025, 1, 15))
+
+        delete_loan(db, lent.id)
+        assert get_loan_status(db, lent.id, as_of=date(2025, 1, 15)) is None
+        with pytest.raises(LoanNotFoundError):
+            delete_loan(db, lent.id)
 
     engine.dispose()
