@@ -1,11 +1,42 @@
-"""Deep Transfer Reconciliation package for canonical link, unlink, and counterpart primitives."""
+"""Deep Transfer Reconciliation package for link, unlink, counterpart, scoring, and matching."""
 
 from app.services.transfer_reconciliation.constants import (
     CRYPTO_CURRENCIES,
+    EXPLICIT_RATE_MAX_REL_DIFF,
+    HIGH_DENOM_FIAT,
+    MARKET_RATE_MAX_REL_DIFF,
+    MATCHABLE_TRANSFER_CATEGORIES,
+    MAX_IMPLIED_CRYPTO_FEE_RATIO,
+    MAX_SAME_CURRENCY_IMPLIED_FEE,
+    MIN_IMPLIED_CRYPTO_FEE_FIAT,
+    MIN_IMPLIED_CRYPTO_FEE_RATIO,
+    SAME_CURRENCY_TOLERANCE,
     TRANSFER_CATEGORIES,
+    TRANSFER_MATCH_WINDOW_DAYS,
+    fx_rate_precision,
 )
 from app.services.transfer_reconciliation.counterpart import (
     apply_counterpart_account_for_rule,
+)
+from app.services.transfer_reconciliation.keywords import (
+    CRYPTO_COUNTERPARTY_KEYWORD_TOKENS,
+    CRYPTO_COUNTERPARTY_KEYWORDS,
+    NON_TRANSFER_NOISE,
+    NON_TRANSFER_NOISE_TOKENS,
+    SUBACCOUNT_TAG_RE,
+    TRANSFER_KEYWORD_TOKENS,
+    TRANSFER_KEYWORDS,
+    build_reconciliation_candidate_filter,
+    extract_subaccount_tag,
+    is_plausible_offline_fx_rate,
+    is_transfer_like,
+)
+from app.services.transfer_reconciliation.matching import (
+    RateResolver,
+    extract_fiat_to_crypto_fee,
+    has_exact_pair_rate,
+    match_transfer_pair,
+    reconcile_transfers,
 )
 from app.services.transfer_reconciliation.primitives import (
     UnlinkTransferResult,
@@ -13,13 +44,58 @@ from app.services.transfer_reconciliation.primitives import (
     resolve_unlinked_reporting_rate,
     unlink_transfer_pair,
 )
+from app.services.transfer_reconciliation.scoring import (
+    MarketRateLookup,
+    TransferCandidate,
+    TransferMatchDecision,
+    compute_implied_crypto_fee,
+    orient_transfer_legs,
+    score_cross_currency_match,
+    score_same_currency_match,
+    score_transfer_match,
+)
 
 __all__ = [
+    "CRYPTO_COUNTERPARTY_KEYWORDS",
+    "CRYPTO_COUNTERPARTY_KEYWORD_TOKENS",
     "CRYPTO_CURRENCIES",
+    "EXPLICIT_RATE_MAX_REL_DIFF",
+    "HIGH_DENOM_FIAT",
+    "MARKET_RATE_MAX_REL_DIFF",
+    "MATCHABLE_TRANSFER_CATEGORIES",
+    "MAX_IMPLIED_CRYPTO_FEE_RATIO",
+    "MAX_SAME_CURRENCY_IMPLIED_FEE",
+    "MIN_IMPLIED_CRYPTO_FEE_FIAT",
+    "MIN_IMPLIED_CRYPTO_FEE_RATIO",
+    "MarketRateLookup",
+    "NON_TRANSFER_NOISE",
+    "NON_TRANSFER_NOISE_TOKENS",
+    "RateResolver",
+    "SAME_CURRENCY_TOLERANCE",
+    "SUBACCOUNT_TAG_RE",
     "TRANSFER_CATEGORIES",
+    "TRANSFER_KEYWORDS",
+    "TRANSFER_KEYWORD_TOKENS",
+    "TRANSFER_MATCH_WINDOW_DAYS",
+    "TransferCandidate",
+    "TransferMatchDecision",
     "UnlinkTransferResult",
     "apply_counterpart_account_for_rule",
+    "build_reconciliation_candidate_filter",
+    "compute_implied_crypto_fee",
+    "extract_fiat_to_crypto_fee",
+    "extract_subaccount_tag",
+    "fx_rate_precision",
+    "has_exact_pair_rate",
+    "is_plausible_offline_fx_rate",
+    "is_transfer_like",
     "link_transfer_pair",
+    "match_transfer_pair",
+    "orient_transfer_legs",
+    "reconcile_transfers",
     "resolve_unlinked_reporting_rate",
+    "score_cross_currency_match",
+    "score_same_currency_match",
+    "score_transfer_match",
     "unlink_transfer_pair",
 ]

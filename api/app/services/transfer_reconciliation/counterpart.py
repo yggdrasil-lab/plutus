@@ -13,6 +13,7 @@ from app.services.fx_service import FxRateFetcher, get_exchange_rate
 from app.services.transfer_reconciliation.constants import (
     CRYPTO_CURRENCIES,
     TRANSFER_CATEGORIES,
+    fx_rate_precision,
 )
 from app.services.transfer_reconciliation.primitives import link_transfer_pair
 
@@ -159,7 +160,7 @@ def _resolve_cross_currency_mirror(
     decimals = 8 if dst_currency in CRYPTO_CURRENCIES else 2
     mirror_amount = round(-tx_amt * conv_rate, decimals)
     if tx_amt < 0:
-        tx.exchange_rate = round(conv_rate, _fx_rate_precision(conv_rate))
+        tx.exchange_rate = round(conv_rate, fx_rate_precision(conv_rate))
         mirror_fx = (
             1.0
             if dst_currency == "NZD"
@@ -168,7 +169,7 @@ def _resolve_cross_currency_mirror(
         return mirror_currency, mirror_amount, mirror_fx
 
     inv_rate = 1.0 / conv_rate
-    mirror_fx = round(inv_rate, _fx_rate_precision(inv_rate))
+    mirror_fx = round(inv_rate, fx_rate_precision(inv_rate))
     if src_currency == "NZD":
         tx.exchange_rate = 1.0
     elif tx.exchange_rate is None:
@@ -192,8 +193,3 @@ def _lookup_nzd_rate(
         fetcher=fetcher,
     )
     return round(float(resolved[0]), 8) if resolved and resolved[0] > 0 else None
-
-
-def _fx_rate_precision(rate: float) -> int:
-    """Return canonical decimal rounding precision for FX rates by magnitude."""
-    return 8 if rate < 0.01 else 6 if rate < 1.0 else 4
