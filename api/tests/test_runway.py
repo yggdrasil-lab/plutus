@@ -1,11 +1,13 @@
 """Unit and integration tests for Plutus runway math, batched balance tiers, and HTTP/MCP parity."""
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import date, timedelta
 import json
+import os
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event
@@ -15,6 +17,7 @@ from sqlalchemy.pool import StaticPool
 # Add api directory to sys.path so app can be imported
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from app.config import Settings
 from app.db import Base, get_db
 from app.main import app
 from app.models import Account, AssetSnapshot, BudgetRule, Loan, Transaction
@@ -22,12 +25,15 @@ from app.routers.mcp import _run_plutus_get_runway
 from app.services.runway import (
     PERPETUAL_RUNWAY_WEEKS_SENTINEL,
     PERPETUAL_RUNWAY_YEARS_SENTINEL,
+    ScenarioSimulation,
+    build_scenario_simulation,
     calculate_compounding_runway,
     calculate_emergency_runway,
     calculate_time_banked,
     calculate_weekly_growth_rate,
     get_balance_tier_snapshot,
     get_runway_snapshot,
+    simulate_runway_scenario,
 )
 
 
@@ -390,6 +396,176 @@ class TestRunwayTelemetryAndBatchedSnapshots(unittest.TestCase):
         self.assertEqual(perp_http["primary_runway_years"], PERPETUAL_RUNWAY_YEARS_SENTINEL)
         self.assertEqual(perp_mcp["primary_runway_weeks"], "Infinite (Perpetual Freedom)")
         self.assertEqual(perp_mcp["primary_runway_years"], "Infinite")
+
+    def test_build_scenario_simulation_post_close_frozen_and_loan_payoff(self) -> None:
+        ref_date = date.today()
+        checking = self._add_account(name="Alex Checking 1001", account_type="checking", tier="cash")
+        growth = self._add_account(name="Global Index Fund", account_type="brokerage", tier="growth")
+        locked = self._add_account(name="KiwiSaver Locked", account_type="kiwisaver", tier="locked")
+        self._add_snapshot(account_id=checking.id, snapshot_date=ref_date, balance=30000.0, balance_nzd=30000.0)
+        self._add_snapshot(account_id=growth.id, snapshot_date=ref_date, balance=90000.0, balance_nzd=90000.0)
+        self._add_snapshot(account_id=locked.id, snapshot_date=ref_date, balance=40000.0, balance_nzd=40000.0)
+        self.db.add(BudgetRule(category="Living", weekly_limit=1000.0, monthly_limit=4333.33, is_active=True))
+        self.db.add(
+            Loan(
+                name="Auto Loan",
+                lender="Civic Finance",
+                loan_type="borrowed",
+                principal_amount=20000.0,
+                annual_interest_rate=0.06,
+                term_months=24,
+                monthly_payment=886.41,
+                start_date=ref_date - timedelta(days=30),
+                is_active=True,
+            )
+        )
+        self.db.commit()
+
+        baseline = get_runway_snapshot(self.db, as_of=ref_date)
+        self.db.close()
+
+        # Pure build_scenario_simulation runs post-close and returns a frozen snapshot.
+        sim = build_scenario_simulation(
+            baseline,
+            weekly_burn_adjustment=-100.0,
+            custom_annual_return=0.07,
+            lump_sum_adjustment=15000.0,
+            pay_off_loans=True,
+        )
+        self.assertIsInstance(sim, ScenarioSimulation)
+        with self.assertRaises(FrozenInstanceError):
+            sim.simulated_weekly_burn = 0.0  # type: ignore[misc]
+
+        expected_burn = max(1.0, baseline.effective_weekly_burn - 100.0 - baseline.loan_weekly_relief)
+        expected_liquid = max(0.0, 120000.0 + 15000.0 - 20000.0)
+        self.assertAlmostEqual(sim.simulated_weekly_burn, expected_burn, places=2)
+        self.assertAlmostEqual(sim.simulated_liquid_balance, expected_liquid, places=2)
+        self.assertEqual(sim.simulated_annual_return, 0.07)
+        self.assertEqual(sim.remaining_liabilities, 0.0)
+        self.assertEqual(sim.loan_free_date, baseline.loan_free_date)
+        self.assertEqual(sim.loan_weekly_relief, baseline.loan_weekly_relief)
+        self.assertAlmostEqual(sim.simulated_net_worth, expected_liquid + 40000.0, places=2)
+        self.assertFalse(sim.is_perpetual)
+        self.assertIsNotNone(sim.delta_weeks_compared_to_baseline)
+
+        # Clamping guards: extreme burn reduction floors at $1/wk; extreme withdrawal floors at $0.
+        clamped = build_scenario_simulation(
+            baseline,
+            weekly_burn_adjustment=-50000.0,
+            lump_sum_adjustment=-500000.0,
+        )
+        self.assertEqual(clamped.simulated_weekly_burn, 1.0)
+        self.assertEqual(clamped.simulated_liquid_balance, 0.0)
+        self.assertFalse(clamped.is_perpetual)
+        self.assertEqual(clamped.simulated_runway_weeks, 0.0)
+
+        # Perpetual simulated scenario -> delta_weeks is None.
+        perpetual_sim = build_scenario_simulation(baseline, lump_sum_adjustment=2500000.0)
+        self.assertTrue(perpetual_sim.is_perpetual)
+        self.assertIsNone(perpetual_sim.simulated_runway_weeks)
+        self.assertIsNone(perpetual_sim.simulated_runway_years)
+        self.assertIsNone(perpetual_sim.delta_weeks_compared_to_baseline)
+
+        # Perpetual baseline -> delta_weeks stays None even when simulated scenario is finite.
+        perp_base_snap = replace(
+            baseline,
+            total_liquid_balance=2500000.0,
+            growth_weeks=None,
+            is_perpetual=True,
+        )
+        finite_from_perp = build_scenario_simulation(perp_base_snap, lump_sum_adjustment=-2450000.0)
+        self.assertFalse(finite_from_perp.is_perpetual)
+        self.assertIsNone(finite_from_perp.delta_weeks_compared_to_baseline)
+
+    def test_configured_default_real_annual_return_and_simulate_http_parity(self) -> None:
+        today = date.today()
+        checking = self._add_account(name="Alex Checking 1001", account_type="checking", tier="cash")
+        growth = self._add_account(name="Global Index Fund", account_type="brokerage", tier="growth")
+        self._add_snapshot(account_id=checking.id, snapshot_date=today, balance=25000.0, balance_nzd=25000.0)
+        self._add_snapshot(account_id=growth.id, snapshot_date=today, balance=75000.0, balance_nzd=75000.0)
+        self.db.add(BudgetRule(category="Living", weekly_limit=900.0, monthly_limit=3900.0, is_active=True))
+        self.db.add(
+            Loan(
+                name="Equipment Loan",
+                lender="Civic Finance",
+                loan_type="borrowed",
+                principal_amount=12000.0,
+                annual_interest_rate=0.05,
+                term_months=24,
+                monthly_payment=526.46,
+                start_date=today - timedelta(days=30),
+                is_active=True,
+            )
+        )
+        self.db.commit()
+
+        with patch.dict(os.environ, {"PLUTUS_DEFAULT_REAL_ANNUAL_RETURN": "0.08"}):
+            env_settings = Settings()
+            self.assertEqual(env_settings.default_real_annual_return, 0.08)
+
+        custom_settings = Settings(default_real_annual_return=0.08)
+        with patch("app.services.runway.settings", custom_settings):
+            snap = get_runway_snapshot(self.db)
+            self.assertEqual(snap.annual_return, 0.08)
+
+            sim_keep_loans = simulate_runway_scenario(
+                self.db,
+                weekly_burn_adjustment=-75.0,
+                lump_sum_adjustment=5000.0,
+                pay_off_loans=False,
+            )
+            self.assertEqual(sim_keep_loans.baseline_annual_return, 0.08)
+            self.assertEqual(sim_keep_loans.simulated_annual_return, 0.08)
+
+            http_keep = self.client.post(
+                "/runway/simulate",
+                json={
+                    "weekly_burn_adjustment": -75.0,
+                    "lump_sum_adjustment": 5000.0,
+                    "pay_off_loans": False,
+                },
+            )
+            self.assertEqual(http_keep.status_code, 200)
+            keep_body = http_keep.json()
+            self.assertEqual(keep_body["simulated_runway_weeks"], sim_keep_loans.simulated_runway_weeks)
+            self.assertEqual(keep_body["simulated_runway_years"], sim_keep_loans.simulated_runway_years)
+            self.assertEqual(
+                keep_body["delta_weeks_compared_to_baseline"],
+                sim_keep_loans.delta_weeks_compared_to_baseline,
+            )
+            self.assertEqual(keep_body["total_liabilities"], 12000.0)
+            self.assertEqual(keep_body["simulated_net_worth"], sim_keep_loans.simulated_net_worth)
+
+            sim_pay_loans = simulate_runway_scenario(
+                self.db,
+                weekly_burn_adjustment=-75.0,
+                lump_sum_adjustment=5000.0,
+                pay_off_loans=True,
+            )
+            http_pay = self.client.post(
+                "/runway/simulate",
+                json={
+                    "weekly_burn_adjustment": -75.0,
+                    "lump_sum_adjustment": 5000.0,
+                    "pay_off_loans": True,
+                },
+            )
+            self.assertEqual(http_pay.status_code, 200)
+            pay_body = http_pay.json()
+            self.assertEqual(pay_body["simulated_runway_weeks"], sim_pay_loans.simulated_runway_weeks)
+            self.assertEqual(pay_body["simulated_runway_years"], sim_pay_loans.simulated_runway_years)
+            self.assertEqual(
+                pay_body["delta_weeks_compared_to_baseline"],
+                sim_pay_loans.delta_weeks_compared_to_baseline,
+            )
+            self.assertEqual(pay_body["total_liabilities"], 0.0)
+            self.assertEqual(pay_body["loan_weekly_relief"], sim_pay_loans.loan_weekly_relief)
+            self.assertEqual(pay_body["simulated_net_worth"], sim_pay_loans.simulated_net_worth)
+
+            # GET /runway without annual_return query param honors configured 0.08 baseline.
+            http_get = self.client.get("/runway")
+            self.assertEqual(http_get.status_code, 200)
+            self.assertEqual(http_get.json()["primary_runway_weeks"], snap.primary_runway_weeks)
 
 
 if __name__ == "__main__":

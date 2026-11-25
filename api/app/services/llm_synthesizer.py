@@ -13,7 +13,6 @@ Grounded in peer-reviewed personal finance, portfolio math, and retirement liter
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 import logging
 from typing import Any, Optional
@@ -27,7 +26,7 @@ from app.services.ai_gateway import (
     AiTextRequest,
     get_default_ai_gateway,
 )
-from app.services.runway import calculate_compounding_runway
+from app.services.runway import ScenarioSimulation
 
 logger = logging.getLogger(__name__)
 
@@ -56,36 +55,20 @@ You must respond ONLY with a valid JSON object matching this exact structure:
 """
 
 
-@dataclass(frozen=True)
-class _ScenarioMetrics:
-    baseline_liquid: float
-    baseline_burn: float
-    simulated_burn: float
-    simulated_liquid: float
-    simulated_return: float
-    sim_weeks: Optional[float]
-    sim_years: Optional[float]
-    is_perpetual: bool
-    delta_weeks: Optional[float]
-
-
 def synthesize_runway_deterministic(
-    runway_data: dict[str, Any],
-    simulated_weeks: Optional[float],
-    simulated_years: Optional[float],
-    is_perpetual: bool,
-    delta_weeks: Optional[float],
+    simulation: ScenarioSimulation,
+    *,
     custom_context: Optional[str] = None,
 ) -> RunwayAiSynthesisRead:
     """Deterministic fallback synthesis when Muninn LLM gateway is offline."""
-    burn = float(runway_data.get("weekly_burn_rate", 1000.0))
-    liquid = float(runway_data.get("total_liquid_balance", 0.0))
+    burn = simulation.simulated_weekly_burn
+    liquid = simulation.simulated_liquid_balance
     headline, recs, impact = _build_deterministic_copy(
         burn=burn,
         liquid=liquid,
-        simulated_weeks=simulated_weeks,
-        simulated_years=simulated_years,
-        is_perpetual=is_perpetual,
+        simulated_weeks=simulation.simulated_runway_weeks,
+        simulated_years=simulation.simulated_runway_years,
+        is_perpetual=simulation.is_perpetual,
     )
     rationale = f"Synthesized from total liquid assets (${liquid:,.0f}) and weekly burn (${burn:,.0f}/w)."
     if custom_context:
@@ -98,24 +81,21 @@ def synthesize_runway_deterministic(
         research_citation=_RESEARCH_CITATION,
         impact_summary=impact,
         is_llm_generated=False,
-        simulated_runway_weeks=simulated_weeks,
-        simulated_runway_years=simulated_years,
-        is_perpetual=is_perpetual,
-        delta_weeks_compared_to_baseline=delta_weeks,
+        simulated_runway_weeks=simulation.simulated_runway_weeks,
+        simulated_runway_years=simulation.simulated_runway_years,
+        is_perpetual=simulation.is_perpetual,
+        delta_weeks_compared_to_baseline=simulation.delta_weeks_compared_to_baseline,
     )
 
 
 def synthesize_runway_scenario_llm(
-    runway_data: dict[str, Any],
-    burn_adjustment: float = 0.0,
-    annual_return: Optional[float] = None,
-    lump_sum: float = 0.0,
+    simulation: ScenarioSimulation,
+    *,
     custom_context: Optional[str] = None,
     gateway: AiGateway | None = None,
 ) -> RunwayAiSynthesisRead:
     """Synthesize research-grounded runway insights and recommendations via AI Gateway."""
-    metrics = _compute_scenario_metrics(runway_data, burn_adjustment, annual_return, lump_sum)
-    payload = _build_context_payload(runway_data, metrics, burn_adjustment, lump_sum, custom_context)
+    payload = _build_context_payload(simulation, custom_context)
     request = AiTextRequest(
         system_prompt=SYSTEM_PROMPT,
         user_prompt=f"Synthesize athlete/user financial runway scenario:\n{json.dumps(payload, indent=2)}",
@@ -128,18 +108,14 @@ def synthesize_runway_scenario_llm(
     resolved_gateway = gateway or get_default_ai_gateway()
     try:
         response = resolved_gateway.complete_json(request)
-        return _build_llm_synthesis_read(response.data, metrics)
+        return _build_llm_synthesis_read(response.data, simulation)
     except (AiGatewayError, ValidationError) as exc:
         logger.warning(
             "LLM runway synthesis failed or returned invalid schema (%s); falling back to deterministic synthesis",
             exc,
         )
         return synthesize_runway_deterministic(
-            runway_data=runway_data,
-            simulated_weeks=metrics.sim_weeks,
-            simulated_years=metrics.sim_years,
-            is_perpetual=metrics.is_perpetual,
-            delta_weeks=metrics.delta_weeks,
+            simulation,
             custom_context=custom_context,
         )
 
@@ -183,75 +159,40 @@ def _build_deterministic_copy(
     )
 
 
-def _compute_scenario_metrics(
-    runway_data: dict[str, Any],
-    burn_adjustment: float,
-    annual_return: Optional[float],
-    lump_sum: float,
-) -> _ScenarioMetrics:
-    baseline_liquid = float(runway_data.get("total_liquid_balance", 0.0))
-    baseline_burn = float(runway_data.get("weekly_burn_rate", 1000.0))
-    baseline_return = 0.05
-    simulated_burn = max(1.0, baseline_burn + burn_adjustment)
-    simulated_liquid = max(0.0, baseline_liquid + lump_sum)
-    simulated_return = annual_return if annual_return is not None else baseline_return
-
-    sim_weeks, is_perpetual = calculate_compounding_runway(
-        accessible_assets=simulated_liquid,
-        weekly_burn=simulated_burn,
-        annual_real_return=simulated_return,
-    )
-    sim_years = round(sim_weeks / 52.0, 2) if sim_weeks is not None else None
-    base_weeks, base_perpetual = calculate_compounding_runway(
-        accessible_assets=baseline_liquid,
-        weekly_burn=baseline_burn,
-        annual_real_return=baseline_return,
-    )
-    delta_weeks = None
-    if not is_perpetual and not base_perpetual and sim_weeks is not None and base_weeks is not None:
-        delta_weeks = round(sim_weeks - base_weeks, 2)
-
-    return _ScenarioMetrics(
-        baseline_liquid=baseline_liquid,
-        baseline_burn=baseline_burn,
-        simulated_burn=simulated_burn,
-        simulated_liquid=simulated_liquid,
-        simulated_return=simulated_return,
-        sim_weeks=sim_weeks,
-        sim_years=sim_years,
-        is_perpetual=is_perpetual,
-        delta_weeks=delta_weeks,
-    )
-
-
 def _build_context_payload(
-    runway_data: dict[str, Any],
-    metrics: _ScenarioMetrics,
-    burn_adjustment: float,
-    lump_sum: float,
+    simulation: ScenarioSimulation,
     custom_context: Optional[str],
 ) -> dict[str, Any]:
+    baseline = simulation.baseline
     return {
         "financial_telemetry": {
-            "cash_balance_nzd": runway_data.get("cash_balance", 0.0),
-            "growth_balance_nzd": runway_data.get("growth_balance", 0.0),
-            "locked_balance_nzd": runway_data.get("locked_balance", 0.0),
-            "total_liquid_nzd": metrics.baseline_liquid,
-            "current_weekly_burn_nzd": metrics.baseline_burn,
-            "emergency_weeks": runway_data.get("emergency_weeks", 0.0),
-            "growth_weeks": runway_data.get("growth_weeks"),
-            "is_perpetual": runway_data.get("is_perpetual", False),
+            "cash_balance_nzd": baseline.cash_balance,
+            "growth_balance_nzd": baseline.growth_balance,
+            "locked_balance_nzd": baseline.locked_balance,
+            "total_liquid_nzd": baseline.total_liquid_balance,
+            "current_weekly_burn_nzd": baseline.effective_weekly_burn,
+            "emergency_weeks": baseline.emergency_weeks,
+            "growth_weeks": baseline.growth_weeks,
+            "is_perpetual": baseline.is_perpetual,
+            "total_liabilities_nzd": baseline.total_liabilities,
+            "net_worth_nzd": baseline.net_worth,
+            "observed_weekly_burn_nzd": baseline.observed_weekly_burn,
+            "locked_weeks": baseline.locked_weeks,
+            "baseline_real_annual_return": simulation.baseline_annual_return,
         },
         "scenario_adjustments": {
-            "burn_adjustment_per_week": burn_adjustment,
-            "effective_simulated_burn": metrics.simulated_burn,
-            "lump_sum_adjustment": lump_sum,
-            "effective_simulated_liquid": metrics.simulated_liquid,
-            "expected_real_annual_return": metrics.simulated_return,
-            "simulated_runway_weeks": metrics.sim_weeks,
-            "simulated_runway_years": metrics.sim_years,
-            "is_perpetual": metrics.is_perpetual,
-            "delta_weeks": metrics.delta_weeks,
+            "burn_adjustment_per_week": simulation.weekly_burn_adjustment,
+            "effective_simulated_burn": simulation.simulated_weekly_burn,
+            "lump_sum_adjustment": simulation.lump_sum_adjustment,
+            "effective_simulated_liquid": simulation.simulated_liquid_balance,
+            "expected_real_annual_return": simulation.simulated_annual_return,
+            "simulated_runway_weeks": simulation.simulated_runway_weeks,
+            "simulated_runway_years": simulation.simulated_runway_years,
+            "is_perpetual": simulation.is_perpetual,
+            "delta_weeks": simulation.delta_weeks_compared_to_baseline,
+            "pay_off_loans": simulation.pay_off_loans,
+            "remaining_liabilities_nzd": simulation.remaining_liabilities,
+            "simulated_net_worth_nzd": simulation.simulated_net_worth,
         },
         "user_custom_instructions": custom_context
         or "None provided. Synthesize optimal runway preservation and freedom strategy.",
@@ -260,7 +201,7 @@ def _build_context_payload(
 
 def _build_llm_synthesis_read(
     content_data: dict[str, Any],
-    metrics: _ScenarioMetrics,
+    simulation: ScenarioSimulation,
 ) -> RunwayAiSynthesisRead:
     return RunwayAiSynthesisRead(
         headline=content_data.get("headline", "Autoregulated Financial Freedom Scenario"),
@@ -269,8 +210,8 @@ def _build_llm_synthesis_read(
         research_citation=content_data.get("research_citation", _RESEARCH_CITATION),
         impact_summary=content_data.get("impact_summary", "Runway projection synthesized."),
         is_llm_generated=True,
-        simulated_runway_weeks=metrics.sim_weeks,
-        simulated_runway_years=metrics.sim_years,
-        is_perpetual=metrics.is_perpetual,
-        delta_weeks_compared_to_baseline=metrics.delta_weeks,
+        simulated_runway_weeks=simulation.simulated_runway_weeks,
+        simulated_runway_years=simulation.simulated_runway_years,
+        is_perpetual=simulation.is_perpetual,
+        delta_weeks_compared_to_baseline=simulation.delta_weeks_compared_to_baseline,
     )

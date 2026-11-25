@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     timezone: str = "Pacific/Auckland"
     base_currency: str = "NZD"
     default_inflation_rate: float = 0.025
+    default_real_annual_return: float = 0.05
     llm_base_url: str = "http://muninn:4000/v1"
     llm_api_key: str = ""
     llm_model: str = "app-synthesize"

@@ -9,11 +9,17 @@ from typing import Any, Optional
 from sqlalchemy import and_, desc, func, select
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.models import Account, AssetSnapshot
 from app.services.loan_service import get_loan_portfolio_summary
 from app.services.spending_projection import BurnProjection, project_burn
 
 BASELINE_ANNUAL_RETURN = 0.05
+
+
+def get_baseline_annual_return() -> float:
+    """Return the configured baseline real annual return assumption."""
+    return float(settings.default_real_annual_return)
 PERPETUAL_RUNWAY_WEEKS_SENTINEL = 9999.0
 PERPETUAL_RUNWAY_YEARS_SENTINEL = 999.0
 VALID_LIQUIDITY_TIERS = frozenset({"cash", "growth", "locked"})
@@ -86,6 +92,30 @@ class RunwaySnapshot:
     weekly_budget_target: float
     time_banked_this_week: float
     tier_labels: TierLabels
+    loan_free_date: Optional[date] = None
+    loan_weekly_relief: float = 0.0
+
+
+@dataclass(frozen=True)
+class ScenarioSimulation:
+    """Detached, immutable result of simulating burn, lump-sum, return, and loan-payoff changes."""
+
+    baseline: RunwaySnapshot
+    weekly_burn_adjustment: float
+    lump_sum_adjustment: float
+    pay_off_loans: bool
+    baseline_annual_return: float
+    simulated_annual_return: float
+    simulated_weekly_burn: float
+    simulated_liquid_balance: float
+    simulated_runway_weeks: Optional[float]
+    simulated_runway_years: Optional[float]
+    is_perpetual: bool
+    delta_weeks_compared_to_baseline: Optional[float]
+    loan_free_date: Optional[date]
+    loan_weekly_relief: float
+    remaining_liabilities: float
+    simulated_net_worth: float
 
 
 def calculate_weekly_growth_rate(annual_real_return: float) -> float:
@@ -200,19 +230,101 @@ def get_runway_snapshot(
     db: Session,
     *,
     as_of: Optional[date] = None,
-    annual_return: float = BASELINE_ANNUAL_RETURN,
+    annual_return: Optional[float] = None,
 ) -> RunwaySnapshot:
     """Compute unified runway, burn, balance-tier, and net-worth telemetry."""
     effective_as_of = as_of or date.today()
+    resolved_return = annual_return if annual_return is not None else get_baseline_annual_return()
     balances = get_balance_tier_snapshot(db, as_of=as_of)
     burn = project_burn(db, reference_date=effective_as_of)
     loan_summary = get_loan_portfolio_summary(db, as_of=effective_as_of)
     return _assemble_runway_snapshot(
         as_of_date=effective_as_of,
-        annual_return=annual_return,
+        annual_return=resolved_return,
         balances=balances,
         burn=burn,
         total_liabilities=loan_summary.total_liabilities,
+        loan_free_date=loan_summary.latest_payoff_date,
+        loan_weekly_relief=loan_summary.total_weekly_payment,
+    )
+
+
+def build_scenario_simulation(
+    baseline: RunwaySnapshot,
+    *,
+    weekly_burn_adjustment: float = 0.0,
+    custom_annual_return: Optional[float] = None,
+    lump_sum_adjustment: float = 0.0,
+    pay_off_loans: bool = False,
+) -> ScenarioSimulation:
+    """Simulate a what-if scenario purely from a detached baseline RunwaySnapshot."""
+    burn_delta = weekly_burn_adjustment - (baseline.loan_weekly_relief if pay_off_loans else 0.0)
+    liquid_delta = lump_sum_adjustment - (baseline.total_liabilities if pay_off_loans else 0.0)
+    simulated_burn = max(1.0, baseline.effective_weekly_burn + burn_delta)
+    simulated_liquid = max(0.0, baseline.total_liquid_balance + liquid_delta)
+    simulated_return = (
+        custom_annual_return if custom_annual_return is not None else baseline.annual_return
+    )
+    sim_weeks, is_perpetual = calculate_compounding_runway(
+        accessible_assets=simulated_liquid,
+        weekly_burn=simulated_burn,
+        annual_real_return=simulated_return,
+    )
+    sim_years = round(sim_weeks / 52.0, 2) if sim_weeks is not None else None
+    delta_weeks: Optional[float] = None
+    if (
+        not is_perpetual
+        and not baseline.is_perpetual
+        and sim_weeks is not None
+        and baseline.growth_weeks is not None
+    ):
+        delta_weeks = round(sim_weeks - baseline.growth_weeks, 2)
+
+    remaining_liabilities = 0.0 if pay_off_loans else baseline.total_liabilities
+    simulated_net_worth = round(simulated_liquid + baseline.locked_balance - remaining_liabilities, 2)
+
+    return ScenarioSimulation(
+        baseline=baseline,
+        weekly_burn_adjustment=weekly_burn_adjustment,
+        lump_sum_adjustment=lump_sum_adjustment,
+        pay_off_loans=pay_off_loans,
+        baseline_annual_return=baseline.annual_return,
+        simulated_annual_return=simulated_return,
+        simulated_weekly_burn=simulated_burn,
+        simulated_liquid_balance=simulated_liquid,
+        simulated_runway_weeks=sim_weeks,
+        simulated_runway_years=sim_years,
+        is_perpetual=is_perpetual,
+        delta_weeks_compared_to_baseline=delta_weeks,
+        loan_free_date=baseline.loan_free_date,
+        loan_weekly_relief=baseline.loan_weekly_relief,
+        remaining_liabilities=remaining_liabilities,
+        simulated_net_worth=simulated_net_worth,
+    )
+
+
+def simulate_runway_scenario(
+    db: Session,
+    *,
+    as_of: Optional[date] = None,
+    weekly_burn_adjustment: float = 0.0,
+    custom_annual_return: Optional[float] = None,
+    lump_sum_adjustment: float = 0.0,
+    pay_off_loans: bool = False,
+    baseline_annual_return: Optional[float] = None,
+) -> ScenarioSimulation:
+    """Load baseline runway telemetry and simulate a what-if scenario."""
+    baseline = get_runway_snapshot(
+        db,
+        as_of=as_of,
+        annual_return=baseline_annual_return,
+    )
+    return build_scenario_simulation(
+        baseline,
+        weekly_burn_adjustment=weekly_burn_adjustment,
+        custom_annual_return=custom_annual_return,
+        lump_sum_adjustment=lump_sum_adjustment,
+        pay_off_loans=pay_off_loans,
     )
 
 
@@ -282,6 +394,8 @@ def _assemble_runway_snapshot(
     balances: BalanceTierSnapshot,
     burn: BurnProjection,
     total_liabilities: float,
+    loan_free_date: Optional[date] = None,
+    loan_weekly_relief: float = 0.0,
 ) -> RunwaySnapshot:
     """Assemble unified RunwaySnapshot from balance tiers, burn projection, and liabilities."""
     weekly_burn = burn.effective_weekly_burn
@@ -332,4 +446,6 @@ def _assemble_runway_snapshot(
         weekly_budget_target=burn.weekly_budget_target,
         time_banked_this_week=time_banked,
         tier_labels=balances.tier_labels,
+        loan_free_date=loan_free_date,
+        loan_weekly_relief=loan_weekly_relief,
     )

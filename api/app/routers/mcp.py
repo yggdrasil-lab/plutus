@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import hmac
 import json
 from datetime import date
 
@@ -39,14 +40,16 @@ class McpAuthMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request, call_next):
         if request.url.path.rstrip("/") == "/mcp":
-            token = settings.mcp_token
+            token = settings.resolved_mcp_token
             if not token:
                 # Allow in development when no token is configured
                 if settings.environment != "development":
                     return JSONResponse({"error": "mcp token not configured"}, status_code=503)
             else:
                 scheme, _, presented = request.headers.get("authorization", "").partition(" ")
-                if scheme.lower() != "bearer" or presented != token:
+                if scheme.lower() != "bearer" or not hmac.compare_digest(
+                    presented.encode("utf-8"), token.encode("utf-8")
+                ):
                     return JSONResponse(
                         {"error": "unauthorized"},
                         status_code=401,
