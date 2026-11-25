@@ -22,7 +22,7 @@ from app.services.burn_service import (
 )
 from app.services.category_taxonomy import get_active_categories
 from app.services.llm_synthesizer import synthesize_runway_scenario_llm
-from app.services.loan_service import load_loans_with_transactions, summarize_loans
+from app.services.loan_service import get_loan_portfolio_summary
 from app.services.runway import (
     calculate_compounding_runway,
     calculate_emergency_runway,
@@ -58,8 +58,7 @@ def _build_runway_breakdown(
     primary_years = round(primary_weeks / 52.0, 2) if not is_perpetual else 999.0
     locked_weeks = round(locked_bal / weekly_burn, 1) if weekly_burn > 0 else 0.0
 
-    loans = load_loans_with_transactions(db, active_only=True)
-    total_liabilities = float(summarize_loans(loans, today)["total_liabilities"])
+    total_liabilities = get_loan_portfolio_summary(db, as_of=today).total_liabilities
     net_worth = round(total_liquid + locked_bal - total_liabilities, 2)
     breakdown = RunwayTierBreakdown(
         cash_balance=cash_bal, growth_balance=growth_bal, locked_balance=locked_bal,
@@ -117,10 +116,9 @@ def simulate_runway_scenario(
 
     baseline_liquid = balances["cash"] + balances["growth"]
     locked_bal = balances["locked"]
-    loans = load_loans_with_transactions(db, active_only=True)
-    loan_summary = summarize_loans(loans, today)
-    total_liabilities = float(loan_summary["total_liabilities"])
-    loan_weekly_relief = float(loan_summary["total_weekly_payment"])
+    loan_summary = get_loan_portfolio_summary(db, as_of=today)
+    total_liabilities = loan_summary.total_liabilities
+    loan_weekly_relief = loan_summary.total_weekly_payment
 
     baseline_weeks, baseline_perpetual = calculate_compounding_runway(
         accessible_assets=baseline_liquid,
@@ -157,7 +155,7 @@ def simulate_runway_scenario(
         simulated_runway_years=sim_years,
         is_perpetual=is_perpetual,
         delta_weeks_compared_to_baseline=delta_weeks,
-        loan_free_date=loan_summary["latest_payoff_date"],
+        loan_free_date=loan_summary.latest_payoff_date,
         loan_weekly_relief=loan_weekly_relief,
         total_liabilities=remaining_liabilities,
         simulated_net_worth=simulated_net_worth,
