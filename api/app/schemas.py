@@ -4,7 +4,7 @@ from datetime import date, datetime
 import json
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 VALID_BUDGET_PERIODS = {"weekly", "monthly", "annual"}
@@ -1154,6 +1154,8 @@ class LoanUpdate(BaseModel):
 
 
 class LoanPaymentRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     split_id: Optional[int] = None
     transaction_date: date
@@ -1171,6 +1173,8 @@ class LoanPaymentRead(BaseModel):
 
 
 class LoanRead(LoanBase):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     payments_made: int
     payments_remaining: int
@@ -1190,6 +1194,8 @@ class LoanRead(LoanBase):
 
 
 class LoansSummaryResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     loans: list[LoanRead] = Field(default_factory=list)
     total_liabilities: float
     total_receivables: float = 0.0

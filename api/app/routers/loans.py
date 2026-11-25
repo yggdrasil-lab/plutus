@@ -9,9 +9,8 @@ from app.models import Loan
 from app.schemas import LoanCreate, LoanRead, LoansSummaryResponse, LoanUpdate
 from app.services.loan_service import (
     compute_loan_status,
-    load_loan_with_transactions,
-    load_loans_with_transactions,
-    summarize_loans,
+    get_loan_portfolio_summary,
+    get_loan_status,
 )
 
 router = APIRouter(prefix="/loans", tags=["Loans & Financing"])
@@ -20,8 +19,7 @@ router = APIRouter(prefix="/loans", tags=["Loans & Financing"])
 @router.get("", response_model=LoansSummaryResponse)
 def list_loans(db: Session = Depends(get_db)):
     """List all active loans with live payment countdown, remaining principal, and net worth impact."""
-    loans = load_loans_with_transactions(db, active_only=True)
-    return summarize_loans(loans, date.today())
+    return get_loan_portfolio_summary(db, as_of=date.today())
 
 
 @router.post("", response_model=LoanRead, status_code=status.HTTP_201_CREATED)
@@ -43,8 +41,9 @@ def create_loan(payload: LoanCreate, db: Session = Depends(get_db)):
     )
     db.add(loan)
     db.commit()
-    loaded = load_loan_with_transactions(db, loan.id)
-    return compute_loan_status(loaded or loan, date.today())
+    return get_loan_status(db, loan.id, as_of=date.today()) or compute_loan_status(
+        loan, date.today(), db=db
+    )
 
 
 @router.patch("/{loan_id}", response_model=LoanRead)
@@ -87,8 +86,9 @@ def update_loan(loan_id: int, payload: LoanUpdate, db: Session = Depends(get_db)
         )
 
     db.commit()
-    loaded = load_loan_with_transactions(db, loan.id)
-    return compute_loan_status(loaded or loan, date.today())
+    return get_loan_status(db, loan.id, as_of=date.today()) or compute_loan_status(
+        loan, date.today(), db=db
+    )
 
 
 @router.delete("/{loan_id}", status_code=status.HTTP_204_NO_CONTENT)
