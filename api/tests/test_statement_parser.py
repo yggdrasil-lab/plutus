@@ -1,27 +1,45 @@
-"""Unit tests for Plutus statement parser and deduplication hashing."""
+"""Unit tests for Plutus statement parser package, PDF extraction seam, hashing, and ISO dates."""
 
+from datetime import date, datetime, timedelta
+from pathlib import Path
 import sys
 import unittest
-import unittest.mock
-from unittest.mock import patch, MagicMock
-from datetime import date, timedelta
-from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 # Add api directory to sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from app.config import settings
+from app.db import Base
+from app.services.connectors import parse_iso_date
+from app.services.ledger_entry import (
+    LedgerEntryBadRequestError,
+    StatementUploadInput,
+    generate_transaction_hash,
+    process_statement_upload,
+)
 from app.services.statement_parser import (
+    PdfDocumentContent,
+    PdfExtractionError,
+    PdfPageContent,
     auto_categorize,
     clean_merchant_name,
-    generate_transaction_hash,
+    extract_pdf_document,
+    generate_transaction_hash as legacy_generate_transaction_hash,
     parse_csv_statement,
-    parse_pdf_statement,
     parse_dbs_statement,
+    parse_nz_statement,
+    parse_pdf_statement,
+    parse_statement_text,
 )
 
 
 class TestStatementParser(unittest.TestCase):
-    """Test statement parsing, categorization heuristics, and hash generation."""
+    """Test statement parsing, categorization heuristics, PDF seam, and shared primitives."""
 
     def test_auto_categorize(self):
         """Verify common New Zealand merchants map to expected categories."""
@@ -34,8 +52,8 @@ class TestStatementParser(unittest.TestCase):
         self.assertEqual(auto_categorize("Spark New Zealand"), "Bills & Telco")
         self.assertEqual(auto_categorize("Random Corner Dairy"), "General")
 
-    def test_generate_transaction_hash(self):
-        """Hash must be deterministic and identical for same date, amount, merchant, and account."""
+    def test_generate_transaction_hash_and_reexport(self):
+        """Hash from ledger_entry must be deterministic and match transitional re-export."""
         d = date(2026, 11, 4)
         hash1 = generate_transaction_hash(d, -24.50, "Flat White & Bagel", 1)
         hash2 = generate_transaction_hash(d, -24.50, "Flat White & Bagel", 1)
@@ -43,7 +61,8 @@ class TestStatementParser(unittest.TestCase):
 
         self.assertEqual(hash1, hash2)
         self.assertNotEqual(hash1, hash_diff_amt)
-        self.assertEqual(len(hash1), 64)  # SHA-256 length
+        self.assertEqual(len(hash1), 64)
+        self.assertEqual(hash1, legacy_generate_transaction_hash(d, -24.50, "Flat White & Bagel", 1))
 
     def test_parse_csv_statement(self):
         """Parse standard CSV statement lines."""
@@ -134,39 +153,39 @@ DBS Bank Singapore
 
     def test_clean_merchant_name(self):
         """Banking transaction prefixes like AP, BP, DC, DD, VT should be stripped."""
-        self.assertEqual(clean_merchant_name("AP MR & MRS E M TIENZO AUTOMATIC PAYMENT"), "MR & MRS E M TIENZO")
+        self.assertEqual(clean_merchant_name("AP ALEX TAN & JANE DOE AUTOMATIC PAYMENT"), "ALEX TAN & JANE DOE")
         self.assertEqual(clean_merchant_name("DD Auckland Transport Autoload"), "Auckland Transport Autoload")
         self.assertEqual(clean_merchant_name("VT Google One"), "Google One")
         self.assertEqual(clean_merchant_name("DC NZX LIMITED"), "NZX LIMITED")
 
-    @unittest.mock.patch("pdfplumber.open")
-    def test_parse_pdf_anz_statement_unbordered(self, mock_pdf_open):
-        """Verify unbordered bank statement PDFs (like ANZ) parse transactions, balances, and period."""
+    def test_parse_pdf_anz_statement_unbordered_via_fake_extractor(self):
+        """Verify unbordered NZ bank statement PDFs parse transactions, balances, and period."""
         page1_text = """Statement of Accounts
 Your accounts at a glance as at 16 October 2026
 Accounttype Accountnumber Balance
-Freedom 06-0323-0895056-00 7,574.21
+Freedom 06-0100-0001001-00 7,574.21
 Statementperiod 17 Aug 2026 - 16 Oct 2026
 Date Transactiontypeanddetails Withdrawals Deposits Balance
 17 Aug Openingbalance 453.61
-18 Aug DC TRANSFERWISE RAYMUND TIEN 2051669430TW 300.00 753.61
+18 Aug DC TRANSFERWISE ALEX TAN 2000100100TW 300.00 753.61
 19 Aug DC NZX LIMITED PAY A/C B NZX LIMITED 10,097.95 10,851.56
-19 Aug AP MR & MRS E M TIENZO AUTOMATIC PAYMENT 400.00 10,451.56
-26 Aug DD Auckland Transport Autoload 48386545000w 20.00 10,431.56
+19 Aug AP ALEX TAN & JANE DOE AUTOMATIC PAYMENT 400.00 10,451.56
+26 Aug DD Auckland Transport Autoload 40001001000W 20.00 10,431.56
 Totalsatendofperiod $420.00 $10,397.95 $10,431.56
 Your available credit is $10,431.56 as at the closing date of this statement
 ANZ Bank New Zealand Limited
 """
-        mock_page = unittest.mock.MagicMock()
-        mock_page.extract_text.return_value = page1_text
-        mock_page.extract_tables.return_value = []
-        mock_pdf = unittest.mock.MagicMock()
-        mock_pdf.pages = [mock_page]
-        mock_pdf_open.return_value.__enter__.return_value = mock_pdf
 
-        result = parse_pdf_statement(b"%PDF-1.4 mock", institution="Unknown")
+        def fake_extractor(_file_bytes: bytes) -> PdfDocumentContent:
+            return PdfDocumentContent(pages=(PdfPageContent(text=page1_text),))
+
+        result = parse_pdf_statement(
+            b"%PDF-1.4 fake",
+            institution="Unknown",
+            pdf_extractor=fake_extractor,
+        )
         self.assertEqual(result.institution, "ANZ")
-        self.assertEqual(result.account_number_masked, "06-0323-0895056-00")
+        self.assertEqual(result.account_number_masked, "06-0100-0001001-00")
         self.assertEqual(result.account_name, "Freedom")
         self.assertEqual(result.opening_balance, 453.61)
         self.assertEqual(result.closing_balance, 10431.56)
@@ -175,38 +194,72 @@ ANZ Bank New Zealand Limited
         self.assertEqual(result.transactions[1].amount, 10097.95)
         self.assertEqual(result.transactions[2].amount, -400.00)
         self.assertEqual(result.transactions[3].amount, -20.00)
-        self.assertEqual(result.transactions[0].merchant, "TRANSFERWISE RAYMUND TIEN 2051669430TW")
+        self.assertEqual(result.transactions[0].merchant, "TRANSFERWISE ALEX TAN 2000100100TW")
 
-    @unittest.mock.patch("pdfplumber.open")
-    def test_parse_dbs_consolidated_statement(self, mock_pdf_open):
-        """Verify DBS Consolidated (Savings/Multiplier) statement parses accounts, balances, and transactions."""
+    def test_parse_pdf_bordered_tables_via_fake_extractor(self):
+        """Verify bordered table extraction through the PdfPageContent tables seam."""
+        page_text = """ASB Bank
+Account number: 12-3000-0001001-00
+Statement period 01 Nov 2026 - 15 Nov 2026
+Opening balance: $1,000.00
+Closing balance: $835.50
+"""
+        bordered_table = (
+            ("Date", "Description", "Amount"),
+            ("02 Nov 2026", "PAK N SAVE ALBANY", "-150.00"),
+            ("03/11/2026", "COLUMBUS COFFEE", "-14.50"),
+        )
+
+        def fake_extractor(_file_bytes: bytes) -> PdfDocumentContent:
+            return PdfDocumentContent(
+                pages=(PdfPageContent(text=page_text, tables=(bordered_table,)),)
+            )
+
+        result = parse_pdf_statement(b"%PDF-1.4 table", institution="auto", pdf_extractor=fake_extractor)
+        self.assertEqual(result.institution, "ASB")
+        self.assertEqual(result.account_number_masked, "12-3000-0001001-00")
+        self.assertEqual(result.transaction_count, 2)
+        self.assertEqual(result.transactions[0].transaction_date, date(2026, 11, 2))
+        self.assertEqual(result.transactions[0].amount, -150.00)
+        self.assertEqual(result.transactions[0].category, "Groceries")
+        self.assertEqual(result.transactions[1].transaction_date, date(2026, 11, 3))
+        self.assertEqual(result.transactions[1].amount, -14.50)
+        self.assertEqual(result.transactions[1].category, "Dining")
+
+    def test_parse_nz_statement_direct_pure_input(self):
+        """Verify parse_nz_statement runs directly on pure text and tables without PDF I/O."""
+        res = parse_nz_statement(
+            "Kiwibank\nOpening balance: $500.00\nClosing balance: $450.00\n",
+            tables=((("2026-11-10", "BP CONNECT", "-50.00"),),),
+            institution="Kiwibank",
+        )
+        self.assertEqual(res.institution, "Kiwibank")
+        self.assertEqual(res.transaction_count, 1)
+        self.assertEqual(res.transactions[0].category, "Fuel")
+        self.assertEqual(res.currency, "NZD")
+
+    def test_parse_dbs_consolidated_statement_pure(self):
+        """Verify DBS Consolidated statement parses accounts, balances, and transactions purely."""
         page_text = """DBS Bank Ltd
 Account Summary as at 31 Oct 2026
 Consolidated Statement
-DBS Savings Account 019-9-085673 SGD
-DBS Multiplier Account 120-210091-2 SGD
+DBS Savings Account 019-9-100101 SGD
+DBS Multiplier Account 120-200202-2 SGD
 Current and Savings Account Total: SGD Equivalent 300.00
-DBS Savings Account Account No. 019-9-085673
+DBS Savings Account Account No. 019-9-100101
 Balance Brought Forward 0.00
 30/09/2026 Funds Transfer 85.00 85.00
 30/09/2026 Funds Transfer 85.00 0.00
-DBS Multiplier Account Account No. 120-210091-2
+DBS Multiplier Account Account No. 120-200202-2
 Balance Brought Forward 0.00
-19/10/2026 IB:ZABLAN ARNIE RAMOS 305.00 305.00
+19/10/2026 IB:JANE DOE 305.00 305.00
 31/10/2026 Service Charge 5.00 300.00
 Total Balance Carried Forward in SGD: 300.00
 """
-        mock_page = unittest.mock.MagicMock()
-        mock_page.extract_text.return_value = page_text
-        mock_page.extract_tables.return_value = []
-        mock_pdf = unittest.mock.MagicMock()
-        mock_pdf.pages = [mock_page]
-        mock_pdf_open.return_value.__enter__.return_value = mock_pdf
-
-        result = parse_pdf_statement(b"%PDF-1.4 mock dbs", institution="auto")
+        result = parse_statement_text(page_text, institution="auto")
         self.assertEqual(result.institution, "DBS Bank")
         self.assertEqual(result.account_name, "DBS Savings / Multiplier")
-        self.assertEqual(result.account_number_masked, "019-9-085673 / 120-210091-2")
+        self.assertEqual(result.account_number_masked, "019-9-100101 / 120-200202-2")
         self.assertEqual(result.currency, "SGD")
         self.assertEqual(result.closing_balance, 300.00)
         self.assertEqual(result.transaction_count, 4)
@@ -215,11 +268,10 @@ Total Balance Carried Forward in SGD: 300.00
         self.assertEqual(result.transactions[2].amount, 305.00)
         self.assertEqual(result.transactions[3].amount, -5.00)
 
-    @unittest.mock.patch("pdfplumber.open")
-    def test_parse_dbs_cashline_statement(self, mock_pdf_open):
-        """Verify DBS Cashline statement parses credit line, transactions, and balances."""
+    def test_parse_dbs_cashline_statement_pure(self):
+        """Verify DBS Cashline statement parses credit line, transactions, and balances purely."""
         page_text = """DBS Bank Ltd
-CASHLINE ACCOUNT NO: 082-502918-8
+CASHLINE ACCOUNT NO: 082-300303-8
 STATEMENT PRINTED ON 20 Oct 2026
 PREVIOUS BALANCE 228.42
 Total Outstanding Balance S$117.78
@@ -230,17 +282,10 @@ DATE TRANSACTION ACTIVITY AMOUNT
 20 Oct 2026 INTEREST CHARGED THIS STATEMENT 10.00
 CLOSING BALANCE 117.78
 """
-        mock_page = unittest.mock.MagicMock()
-        mock_page.extract_text.return_value = page_text
-        mock_page.extract_tables.return_value = []
-        mock_pdf = unittest.mock.MagicMock()
-        mock_pdf.pages = [mock_page]
-        mock_pdf_open.return_value.__enter__.return_value = mock_pdf
-
-        result = parse_pdf_statement(b"%PDF-1.4 mock cashline", institution="auto")
+        result = parse_dbs_statement(page_text, detected_inst="DBS Bank")
         self.assertEqual(result.institution, "DBS Bank")
         self.assertEqual(result.account_name, "DBS Cashline")
-        self.assertEqual(result.account_number_masked, "082-502918-8")
+        self.assertEqual(result.account_number_masked, "082-300303-8")
         self.assertEqual(result.currency, "SGD")
         self.assertEqual(result.opening_balance, 228.42)
         self.assertEqual(result.closing_balance, 117.78)
@@ -250,11 +295,10 @@ CLOSING BALANCE 117.78
         self.assertEqual(result.transactions[2].amount, -107.10)
         self.assertEqual(result.transactions[3].amount, -10.00)
 
-    @unittest.mock.patch("pdfplumber.open")
-    def test_parse_dbs_credit_card_statement(self, mock_pdf_open):
-        """Verify DBS Credit Card statement parses card details, multi-line transactions, and balances."""
+    def test_parse_dbs_credit_card_statement_pure(self):
+        """Verify DBS Credit Card statement parses card details and multiline transactions purely."""
         page_text = """DBS Bank Ltd
-LIVE FRESH DBS VISA PAYWAVE PLATINUM CARD NO: 4119 1101 0425 2926
+LIVE FRESH DBS VISA PAYWAVE PLATINUM CARD NO: 4111 1111 1111 1001
 STATEMENT DATE 12 Oct 2026
 PREVIOUS BALANCE 347.28
 TOTAL: 377.26
@@ -267,17 +311,10 @@ REF NO 12345
 10 OCT SPOTIFY 17.99
 11 OCT NETFLIX 23.98
 """
-        mock_page = unittest.mock.MagicMock()
-        mock_page.extract_text.return_value = page_text
-        mock_page.extract_tables.return_value = []
-        mock_pdf = unittest.mock.MagicMock()
-        mock_pdf.pages = [mock_page]
-        mock_pdf_open.return_value.__enter__.return_value = mock_pdf
-
-        result = parse_pdf_statement(b"%PDF-1.4 mock card", institution="auto")
+        result = parse_statement_text(page_text, institution="auto")
         self.assertEqual(result.institution, "DBS Bank")
         self.assertEqual(result.account_name, "Live Fresh Dbs Visa Paywave Platinum Card")
-        self.assertEqual(result.account_number_masked, "4119 1101 0425 2926")
+        self.assertEqual(result.account_number_masked, "4111 1111 1111 1001")
         self.assertEqual(result.currency, "SGD")
         self.assertEqual(result.opening_balance, 347.28)
         self.assertEqual(result.closing_balance, 377.26)
@@ -287,6 +324,54 @@ REF NO 12345
         self.assertEqual(result.transactions[2].amount, 0.65)
         self.assertEqual(result.transactions[3].amount, -17.99)
         self.assertEqual(result.transactions[4].amount, -23.98)
+
+    def test_pdf_extraction_fails_loudly(self):
+        """Injected and default PDF extractors must raise PdfExtractionError on failure."""
+        def failing_extractor(_file_bytes: bytes) -> PdfDocumentContent:
+            raise PdfExtractionError("corrupt xref table")
+
+        with self.assertRaises(PdfExtractionError):
+            parse_pdf_statement(b"%PDF-1.4 broken", pdf_extractor=failing_extractor)
+
+        with self.assertRaises(PdfExtractionError):
+            extract_pdf_document(b"")
+
+        with self.assertRaises(PdfExtractionError):
+            extract_pdf_document(b"not-a-valid-pdf")
+
+    def test_process_statement_upload_translates_pdf_error_to_bad_request(self):
+        """Statement upload boundary must translate PdfExtractionError into LedgerEntryBadRequestError."""
+        engine = create_engine(
+            "sqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(bind=engine)
+        SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+        def failing_extractor(_file_bytes: bytes) -> PdfDocumentContent:
+            raise PdfExtractionError("Unreadable PDF stream")
+
+        with SessionLocal() as db:
+            with self.assertRaises(LedgerEntryBadRequestError) as ctx:
+                process_statement_upload(
+                    db,
+                    StatementUploadInput(filename="statement.pdf", content=b"bad"),
+                    pdf_extractor=failing_extractor,
+                )
+            self.assertIn("Unreadable PDF stream", str(ctx.exception))
+        Base.metadata.drop_all(bind=engine)
+
+    def test_parse_iso_date_edge_cases(self):
+        """Shared parse_iso_date handles UTC Z, offsets, naive ISO, empty, and invalid values."""
+        self.assertEqual(parse_iso_date("2026-11-01T12:30:00Z"), date(2026, 11, 2))
+        self.assertEqual(parse_iso_date("2026-11-01T23:30:00+00:00"), date(2026, 11, 2))
+        self.assertEqual(parse_iso_date("2026-11-01T10:15:00"), date(2026, 11, 1))
+        expected_today = datetime.now(ZoneInfo(settings.timezone)).date()
+        self.assertEqual(parse_iso_date(None), expected_today)
+        self.assertEqual(parse_iso_date(""), expected_today)
+        with self.assertRaises(ValueError):
+            parse_iso_date("not-an-iso-date")
 
 
 if __name__ == "__main__":

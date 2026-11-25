@@ -109,10 +109,10 @@ class TestTransactionTagsAndAkahuCategories(unittest.TestCase):
 
     def test_akahu_utc_timestamp_converts_to_auckland_local_date(self):
         from datetime import date
-        from app.services.connectors.akahu import _parse_iso_date
+        from app.services.connectors import parse_iso_date
 
         # 2026-11-01T12:30:00Z is 2026-11-02 01:30 NZDT (UTC+13)
-        self.assertEqual(_parse_iso_date("2026-11-01T12:30:00Z"), date(2026, 11, 2))
+        self.assertEqual(parse_iso_date("2026-11-01T12:30:00Z"), date(2026, 11, 2))
 
     def test_create_update_and_filter_transaction_tags(self):
         res_create = self.client.post(

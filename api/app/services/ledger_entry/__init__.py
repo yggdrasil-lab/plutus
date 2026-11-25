@@ -21,6 +21,7 @@ from app.services.ledger_entry._types import (
     TransactionWritePolicy,
     TransactionWriteResult,
 )
+from app.services.ledger_entry.hashing import generate_transaction_hash
 from app.services.ledger_entry.hydration import (
     hydrate_transaction,
     load_hydrated_transaction,
@@ -69,6 +70,7 @@ __all__ = [
     "collect_existing_tags",
     "commit_parsed_statement",
     "dispatch_inbound_email",
+    "generate_transaction_hash",
     "hydrate_transaction",
     "load_hydrated_transaction",
     "normalize_tags",

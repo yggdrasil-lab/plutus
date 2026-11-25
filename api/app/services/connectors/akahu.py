@@ -3,9 +3,8 @@
 # ============================================================================
 # 1. IMPORTS & CONSTANTS
 # ============================================================================
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime
 from typing import Optional
-from zoneinfo import ZoneInfo
 
 import httpx
 from sqlalchemy.orm import Session
@@ -13,7 +12,11 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.schemas import SyncResult
 from app.services.category_taxonomy import normalize_akahu_category
-from app.services.connectors import ConnectorConfigError, ConnectorUpstreamError
+from app.services.connectors import (
+    ConnectorConfigError,
+    ConnectorUpstreamError,
+    parse_iso_date,
+)
 from app.services.ingestion_service import (
     BankFeedGateway,
     ExternalAccountSpec,
@@ -109,16 +112,6 @@ class HttpAkahuGateway:
 # ============================================================================
 # 3. PURE NORMALIZERS (Zero I/O)
 # ============================================================================
-def _parse_iso_date(value: Optional[str]) -> date:
-    """Parse Akahu ISO-8601 UTC timestamp into the configured local date (e.g. Pacific/Auckland)."""
-    if not value:
-        return datetime.now(ZoneInfo(settings.timezone)).date()
-    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if dt.tzinfo is not None:
-        dt = dt.astimezone(ZoneInfo(settings.timezone))
-    return dt.date()
-
-
 def normalize_akahu_feeds(
     raw_accounts: list[dict],
     raw_transactions: list[dict],
@@ -166,7 +159,7 @@ def normalize_akahu_feeds(
         )
         tx_by_account[ext_acc_id].append(
             NormalizedTx(
-                transaction_date=_parse_iso_date(tx.get("date")),
+                transaction_date=parse_iso_date(tx.get("date")),
                 amount=float(tx["amount"]),
                 currency=currency_by_account[ext_acc_id],
                 merchant=merchant_name,

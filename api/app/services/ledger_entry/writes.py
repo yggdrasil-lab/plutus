@@ -27,6 +27,7 @@ from app.services.ledger_entry._types import (
     TransactionWritePolicy,
     TransactionWriteResult,
 )
+from app.services.ledger_entry.hashing import generate_transaction_hash
 from app.services.ledger_entry.hydration import load_hydrated_transaction
 from app.services.ledger_entry.tags import (
     collect_existing_tags,
@@ -36,7 +37,7 @@ from app.services.ledger_entry.tags import (
 )
 from app.services.receipt_ingestion.matching import reconcile_unlinked_receipts
 from app.services.rules_engine import matches_rule
-from app.services.statement_parser import auto_categorize, generate_transaction_hash
+from app.services.statement_parser import auto_categorize
 from app.services.transfer_reconciliation import (
     apply_counterpart_account_for_rule,
     reconcile_transfers,
