@@ -148,11 +148,20 @@ def sync_external_provider(
     end_date: Optional[date] = Query(default=None, description="Optional inclusive backfill end date (YYYY-MM-DD)"),
     skip_llm: bool = Query(default=False, description="Skip Jev LLM categorization/tagging and use deterministic rules and heuristics"),
     db: Session = Depends(get_db),
+    ai_gateway: AiGateway = Depends(get_ai_gateway),
     _authorized: bool = Depends(verify_integration_token),
 ):
     """Trigger live sync for Akahu, Wise, Bitcoin, or all configured providers."""
     try:
-        return sync_provider(db, provider, days=days, start_date=start_date, end_date=end_date, skip_llm=skip_llm)
+        return sync_provider(
+            db,
+            provider,
+            days=days,
+            start_date=start_date,
+            end_date=end_date,
+            skip_llm=skip_llm,
+            ai_gateway=ai_gateway,
+        )
     except (InvalidSyncDateRangeError, UnsupportedSyncProviderError, ConnectorConfigError, ConnectorUpstreamError) as exc:
         status_code = next(code for exc_type, code in _SYNC_ERROR_STATUS if isinstance(exc, exc_type))
         raise HTTPException(status_code=status_code, detail=str(exc)) from exc

@@ -457,7 +457,7 @@ def test_shared_provider_registry_and_scheduler_integration(db_session: Session)
 
     calls: list[tuple[str, int, date | None, date | None, bool]] = []
 
-    def _fake_akahu(_db: Session, days: int, sd: date | None, ed: date | None, skip: bool) -> SyncResult:
+    def _fake_akahu(_db: Session, days: int, sd: date | None, ed: date | None, skip: bool, _ai_gateway=None) -> SyncResult:
         calls.append(("akahu", days, sd, ed, skip))
         return SyncResult(
             provider="akahu",
@@ -475,7 +475,7 @@ def test_shared_provider_registry_and_scheduler_integration(db_session: Session)
             ],
         )
 
-    def _fake_wise(_db: Session, days: int, sd: date | None, ed: date | None, skip: bool) -> SyncResult:
+    def _fake_wise(_db: Session, days: int, sd: date | None, ed: date | None, skip: bool, _ai_gateway=None) -> SyncResult:
         calls.append(("wise", days, sd, ed, skip))
         return SyncResult(
             provider="wise",
