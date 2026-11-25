@@ -81,7 +81,7 @@ def test_transactions_flow_cors_validation_and_payslip_hydration(
     api_client: TestClient,
     memory_db: Session,
 ) -> None:
-    """Verify CORS Expose-Headers, invalid flow/window errors, and payslip receipt hydration."""
+    """Verify X-Total-Count header, disabled cross-origin CORS, invalid flow/window errors, and payslip receipt hydration."""
     today = date.today()
     acct = _seed_account(memory_db, "Primary Checking")
 
@@ -113,15 +113,19 @@ def test_transactions_flow_cors_validation_and_payslip_hydration(
     memory_db.commit()
     memory_db.refresh(payslip)
 
-    # CORS exposes X-Total-Count header
+    # Same-origin /transactions returns X-Total-Count directly without wildcard CORS
     res = api_client.get(
         "/transactions?flow=inflow&period=month&include_amortized=true",
-        headers={"Origin": "https://midas.example"},
     )
     assert res.status_code == 200
     assert res.headers["X-Total-Count"] == "1"
-    expose_hdr = res.headers.get("Access-Control-Expose-Headers", "")
-    assert "X-Total-Count" in expose_hdr
+
+    cross_origin_res = api_client.get(
+        "/transactions?flow=inflow&period=month&include_amortized=true",
+        headers={"Origin": "https://evil.example"},
+    )
+    assert cross_origin_res.status_code == 200
+    assert "Access-Control-Allow-Origin" not in cross_origin_res.headers
 
     rows = res.json()
     assert len(rows) == 1

@@ -88,8 +88,8 @@ services:
           memory: 128M
       labels:
         - "traefik.enable=true"
-        # Authentik SSO for web/browser API requests under /api/*
-        - "traefik.http.routers.plutus-api.rule=(Host(`plutus.${DOMAIN_NAME}`) || Host(`midas.${DOMAIN_NAME}`)) && PathPrefix(`/api`)"
+        # Authentik SSO for web/browser API requests under /api/* (same-origin via Midas PWA host only)
+        - "traefik.http.routers.plutus-api.rule=Host(`midas.${DOMAIN_NAME}`) && PathPrefix(`/api`)"
         - "traefik.http.routers.plutus-api.entrypoints=websecure"
         - "traefik.http.routers.plutus-api.tls=true"
         - "traefik.http.routers.plutus-api.tls.certresolver=cloudflare"
@@ -97,8 +97,8 @@ services:
         - "traefik.http.routers.plutus-api.service=plutus-api"
         - "traefik.http.routers.plutus-api.middlewares=authentik@docker,plutus-api-strip"
         - "traefik.http.middlewares.plutus-api-strip.stripprefix.prefixes=/api"
-        # Machine-to-machine integrations endpoint (iOS Shortcuts, Siri, Apple Pay webhooks)
-        - "traefik.http.routers.plutus-integrations.rule=Host(`plutus.${DOMAIN_NAME}`) && PathPrefix(`/integrations`)"
+        # Machine-to-machine integrations endpoint (iOS Shortcuts, Siri, Apple Pay webhooks; excludes internal-only /integrations/email)
+        - "traefik.http.routers.plutus-integrations.rule=Host(`plutus.${DOMAIN_NAME}`) && (Path(`/integrations/quick-log`) || Path(`/integrations/dbs-alert`) || Path(`/integrations/statement`) || PathPrefix(`/integrations/sync`))"
         - "traefik.http.routers.plutus-integrations.entrypoints=websecure"
         - "traefik.http.routers.plutus-integrations.tls=true"
         - "traefik.http.routers.plutus-integrations.tls.certresolver=cloudflare"
@@ -114,6 +114,7 @@ services:
         - "traefik.http.routers.plutus-mcp.entrypoints=websecure"
         - "traefik.http.routers.plutus-mcp.tls=true"
         - "traefik.http.routers.plutus-mcp.tls.certresolver=cloudflare"
+        - "traefik.http.routers.plutus-mcp.middlewares=plutus-strip-authentik"
         - "traefik.http.routers.plutus-mcp.service=plutus-api"
         - "traefik.http.services.plutus-api.loadbalancer.server.port=8000"
         - "traefik.docker.network=aether-net"
