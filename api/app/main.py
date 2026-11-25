@@ -14,11 +14,10 @@ from app.config import settings
 from app.db import SessionLocal
 from app.routers import accounts, budgets, categories, health, institutions, integrations, loans, mcp, products, receipts, rules, runway, transactions
 from app.services.ai_gateway import MuninnHttpAdapter
-from app.services.burn_service import repair_transaction_fx_rates
 from app.services.category_taxonomy import normalize_existing_legacy_categories
+from app.services.fx_repair import run_startup_fx_repairs
 from app.services.product_catalog import backfill_unlinked_receipt_item_products
 from app.services.sync_scheduler import periodic_sync_loop
-from app.services.transfer_service import repair_crypto_transfers_and_rates
 
 
 logger = logging.getLogger(__name__)
@@ -54,10 +53,9 @@ async def lifespan(app_instance: FastAPI):
                     "Linked %d unlinked receipt items to catalog products on startup.",
                     linked_products,
                 )
-            repaired_fx = repair_transaction_fx_rates(db)
+            repaired_fx, repaired_crypto = run_startup_fx_repairs(db)
             if repaired_fx:
                 logger.info("Repaired %d transaction FX rates on startup.", repaired_fx)
-            repaired_crypto = repair_crypto_transfers_and_rates(db)
             if repaired_crypto:
                 logger.info("Repaired %d crypto transfer/FX records on startup.", repaired_crypto)
         if settings.sync_interval_hours > 0:

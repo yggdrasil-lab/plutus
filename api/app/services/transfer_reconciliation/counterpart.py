@@ -9,7 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import Account, CategorizationRule, Transaction
-from app.services.fx_service import FxRateFetcher, get_exchange_rate
+from app.services.fx_service import FxRateFetcher, get_exchange_rate, resolve_reporting_rate
 from app.services.transfer_reconciliation.constants import (
     CRYPTO_CURRENCIES,
     TRANSFER_CATEGORIES,
@@ -161,10 +161,12 @@ def _resolve_cross_currency_mirror(
     mirror_amount = round(-tx_amt * conv_rate, decimals)
     if tx_amt < 0:
         tx.exchange_rate = round(conv_rate, fx_rate_precision(conv_rate))
-        mirror_fx = (
-            1.0
-            if dst_currency == "NZD"
-            else _lookup_nzd_rate(db, tx, dst_currency, fetcher=fetcher)
+        mirror_fx = resolve_reporting_rate(
+            db,
+            dst_currency,
+            tx.transaction_date,
+            fetcher=fetcher,
+            nzd_value=1.0,
         )
         return mirror_currency, mirror_amount, mirror_fx
 
@@ -173,23 +175,10 @@ def _resolve_cross_currency_mirror(
     if src_currency == "NZD":
         tx.exchange_rate = 1.0
     elif tx.exchange_rate is None:
-        tx.exchange_rate = _lookup_nzd_rate(db, tx, src_currency, fetcher=fetcher)
+        tx.exchange_rate = resolve_reporting_rate(
+            db,
+            src_currency,
+            tx.transaction_date,
+            fetcher=fetcher,
+        )
     return mirror_currency, mirror_amount, mirror_fx
-
-
-def _lookup_nzd_rate(
-    db: Session,
-    tx: Transaction,
-    currency: str,
-    *,
-    fetcher: Optional[FxRateFetcher] = None,
-) -> Optional[float]:
-    """Resolve rounded 8dp currency-to-NZD reporting rate on tx.transaction_date."""
-    resolved = get_exchange_rate(
-        db,
-        rate_date=tx.transaction_date,
-        from_currency=currency,
-        to_currency="NZD",
-        fetcher=fetcher,
-    )
-    return round(float(resolved[0]), 8) if resolved and resolved[0] > 0 else None

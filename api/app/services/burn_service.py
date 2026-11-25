@@ -1,15 +1,12 @@
-"""Account balance, tier label, and startup FX repair helpers."""
+"""Account balance and tier label repository helpers."""
 
 # ============================================================================
 # 1. IMPORTS & CONSTANTS
 # ============================================================================
-from typing import Optional
-
-from sqlalchemy import desc, func, or_, select
+from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
-from app.models import Account, AssetSnapshot, Transaction
-from app.services.fx_service import FxRateFetcher, get_exchange_rate
+from app.models import Account, AssetSnapshot
 
 
 # ============================================================================
@@ -48,56 +45,3 @@ def resolve_tier_labels(db: Session) -> dict[str, str]:
         "growth": growth_accs[0] if len(growth_accs) == 1 else "Growth",
         "locked": locked_accs[0] if len(locked_accs) == 1 else "Locked Reserve",
     }
-
-
-# ============================================================================
-# 3. FX INTEGRITY REPAIR
-# ============================================================================
-def repair_transaction_fx_rates(
-    db: Session,
-    *,
-    fetcher: Optional[FxRateFetcher] = None,
-) -> int:
-    """Repair corrupted NZD exchange rates and backfill missing foreign-currency FX rates."""
-    candidates = db.scalars(
-        select(Transaction).where(
-            Transaction.linked_transaction_id.is_(None),
-            or_(
-                (func.upper(Transaction.currency) == "NZD")
-                & Transaction.exchange_rate.is_not(None)
-                & (Transaction.exchange_rate != 1.0),
-                (func.upper(Transaction.currency) != "NZD")
-                & (
-                    Transaction.exchange_rate.is_(None)
-                    | (Transaction.exchange_rate <= 0)
-                    | (
-                        (func.upper(Transaction.currency) == "SGD")
-                        & (Transaction.exchange_rate < 1.20)
-                    )
-                ),
-            ),
-        )
-    ).all()
-
-    repaired = 0
-    for tx in candidates:
-        code = (tx.currency or "NZD").strip().upper()
-        if code == "NZD":
-            tx.exchange_rate = 1.0
-            repaired += 1
-            continue
-
-        resolved = get_exchange_rate(
-            db,
-            rate_date=tx.transaction_date,
-            from_currency=code,
-            to_currency="NZD",
-            fetcher=fetcher,
-        )
-        if resolved is not None and resolved[0] > 0:
-            tx.exchange_rate = round(float(resolved[0]), 8)
-            repaired += 1
-
-    if repaired > 0:
-        db.commit()
-    return repaired

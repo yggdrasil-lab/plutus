@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import date, timedelta
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.models import Transaction
@@ -18,7 +18,7 @@ from app.services.transfer_reconciliation.constants import (
     fx_rate_precision,
 )
 from app.services.transfer_reconciliation.keywords import (
-    build_reconciliation_candidate_filter,
+    TRANSFER_KEYWORD_TOKENS,
     is_transfer_like,
 )
 from app.services.transfer_reconciliation.primitives import link_transfer_pair
@@ -29,7 +29,20 @@ from app.services.transfer_reconciliation.scoring import (
     score_transfer_match,
 )
 
+if TYPE_CHECKING:
+    from sqlalchemy.sql.elements import ColumnElement
+
 RateResolver = Callable[..., Optional[tuple[float, str]]]
+
+
+def build_reconciliation_candidate_filter() -> ColumnElement[bool]:
+    """Build SQLAlchemy OR filter matching transfer category or any transfer keyword token."""
+    clauses: list[ColumnElement[bool]] = [Transaction.category.ilike("%transfer%")]
+    for token in TRANSFER_KEYWORD_TOKENS:
+        pattern = f"%{token}%"
+        clauses.append(Transaction.merchant.ilike(pattern))
+        clauses.append(Transaction.raw_description.ilike(pattern))
+    return or_(*clauses)
 
 
 def has_exact_pair_rate(

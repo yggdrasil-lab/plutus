@@ -1,9 +1,9 @@
-"""Unified transfer keyword patterns, noise guards, and SQLAlchemy candidate filters."""
+"""Unified transfer keyword patterns and offline FX/transfer guards."""
 
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 from app.services.transfer_reconciliation.constants import (
     CRYPTO_CURRENCIES,
@@ -12,8 +12,19 @@ from app.services.transfer_reconciliation.constants import (
     TRANSFER_CATEGORIES,
 )
 
-if TYPE_CHECKING:
-    from sqlalchemy.sql.elements import ColumnElement
+CRYPTO_COUNTERPARTY_KEYWORD_TOKENS: tuple[str, ...] = (
+    "crypto",
+    "bitcoin",
+    "btc",
+    "sats",
+    "satoshis",
+    "binance",
+    "easycrypto",
+    "lightning",
+    "coinbase",
+    "kraken",
+    "swyftx",
+)
 
 TRANSFER_KEYWORD_TOKENS: tuple[str, ...] = (
     "transfer",
@@ -38,35 +49,11 @@ TRANSFER_KEYWORD_TOKENS: tuple[str, ...] = (
     "paynow",
     "instapay",
     "pesonet",
-    "crypto",
-    "bitcoin",
-    "btc",
-    "sats",
-    "satoshis",
-    "binance",
-    "easycrypto",
-    "lightning",
-    "coinbase",
-    "kraken",
-    "swyftx",
+    *CRYPTO_COUNTERPARTY_KEYWORD_TOKENS,
     "fx",
     "conversion",
     "exchange",
     "cross-border",
-)
-
-CRYPTO_COUNTERPARTY_KEYWORD_TOKENS: tuple[str, ...] = (
-    "crypto",
-    "bitcoin",
-    "btc",
-    "sats",
-    "satoshis",
-    "binance",
-    "easycrypto",
-    "lightning",
-    "coinbase",
-    "kraken",
-    "swyftx",
 )
 
 NON_TRANSFER_NOISE_TOKENS: tuple[str, ...] = (
@@ -134,17 +121,3 @@ def is_plausible_offline_fx_rate(
     if src in HIGH_DENOM_FIAT or dst in HIGH_DENOM_FIAT:
         return 0.005 <= implied_rate <= 200.0
     return 0.3 <= implied_rate <= 3.5
-
-
-def build_reconciliation_candidate_filter() -> ColumnElement[bool]:
-    """Build SQLAlchemy OR filter matching transfer category or any transfer keyword token."""
-    from sqlalchemy import or_
-
-    from app.models import Transaction
-
-    clauses: list[ColumnElement[bool]] = [Transaction.category.ilike("%transfer%")]
-    for token in TRANSFER_KEYWORD_TOKENS:
-        pattern = f"%{token}%"
-        clauses.append(Transaction.merchant.ilike(pattern))
-        clauses.append(Transaction.raw_description.ilike(pattern))
-    return or_(*clauses)
