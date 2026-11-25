@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from datetime import date
-from typing import Optional
+from typing import Optional, Protocol
 
 from sqlalchemy.orm import Session
 
 from app.schemas import SyncResult
+from app.services.ai_gateway import AiGateway
 from app.services.connectors.akahu import sync_akahu
 from app.services.connectors.bitcoin import sync_bitcoin
 from app.services.connectors.wise import sync_wise
@@ -26,10 +27,18 @@ class UnsupportedSyncProviderError(ProviderSyncError):
     """Raised when a requested provider key is not registered."""
 
 
-ProviderSyncHandler = Callable[
-    [Session, int, Optional[date], Optional[date], bool],
-    SyncResult,
-]
+class ProviderSyncHandler(Protocol):
+    """Callable contract for provider sync adapters."""
+
+    def __call__(
+        self,
+        db: Session,
+        days: int,
+        start_date: Optional[date],
+        end_date: Optional[date],
+        skip_llm: bool,
+        ai_gateway: AiGateway | None = None,
+    ) -> SyncResult: ...
 
 
 def _sync_akahu_adapter(
@@ -38,6 +47,7 @@ def _sync_akahu_adapter(
     start_date: Optional[date],
     end_date: Optional[date],
     skip_llm: bool,
+    ai_gateway: AiGateway | None = None,
 ) -> SyncResult:
     return sync_akahu(
         db,
@@ -45,6 +55,7 @@ def _sync_akahu_adapter(
         start_date=start_date,
         end_date=end_date,
         skip_llm=skip_llm,
+        ai_gateway=ai_gateway,
     )
 
 
@@ -54,6 +65,7 @@ def _sync_wise_adapter(
     start_date: Optional[date],
     end_date: Optional[date],
     skip_llm: bool,
+    ai_gateway: AiGateway | None = None,
 ) -> SyncResult:
     return sync_wise(
         db,
@@ -61,6 +73,7 @@ def _sync_wise_adapter(
         start_date=start_date,
         end_date=end_date,
         skip_llm=skip_llm,
+        ai_gateway=ai_gateway,
     )
 
 
@@ -70,12 +83,14 @@ def _sync_bitcoin_adapter(
     start_date: Optional[date],
     end_date: Optional[date],
     skip_llm: bool,
+    ai_gateway: AiGateway | None = None,
 ) -> SyncResult:
     return sync_bitcoin(
         db,
         start_date=start_date,
         end_date=end_date,
         skip_llm=skip_llm,
+        ai_gateway=ai_gateway,
     )
 
 
@@ -94,6 +109,7 @@ def sync_provider(
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
     skip_llm: bool = False,
+    ai_gateway: AiGateway | None = None,
     handlers: Optional[Mapping[str, ProviderSyncHandler]] = None,
 ) -> SyncResult:
     """Validate sync window/provider and execute one or all registered provider handlers."""
@@ -113,7 +129,7 @@ def sync_provider(
         else [effective_handlers[normalized]]
     )
     results = [
-        handler(db, days, start_date, end_date, skip_llm)
+        handler(db, days, start_date, end_date, skip_llm, ai_gateway)
         for handler in targets
     ]
     if len(results) == 1:

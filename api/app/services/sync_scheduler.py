@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.db import SessionLocal
 from app.schemas import SyncResult
+from app.services.ai_gateway import AiGateway
 from app.services.connectors.registry import SYNC_HANDLERS
 
 logger = logging.getLogger("plutus.sync_scheduler")
@@ -43,6 +44,7 @@ def run_scheduled_sync_once(
     handlers: Mapping[str, Callable[..., SyncResult]] | None = None,
     providers: list[str] | None = None,
     days: int = DEFAULT_LOOKBACK_DAYS,
+    ai_gateway: AiGateway | None = None,
 ) -> dict[str, SyncResult | str]:
     """Execute one sync pass across all configured providers with error isolation."""
     targets = providers if providers is not None else get_configured_providers()
@@ -57,7 +59,7 @@ def run_scheduled_sync_once(
         db = db_factory()
         try:
             res = (
-                handler(db, days, None, None, False)
+                handler(db, days, None, None, False, ai_gateway)
                 if use_registry
                 else handler(db, days)
             )

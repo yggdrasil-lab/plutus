@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.schemas import SyncResult
+from app.services.ai_gateway import AiGateway
 from app.services.category_taxonomy import normalize_akahu_category
 from app.services.connectors import (
     ConnectorConfigError,
@@ -187,6 +188,7 @@ def sync_akahu(
     end_date: Optional[date] = None,
     skip_llm: bool = False,
     gateway: Optional[BankFeedGateway] = None,
+    ai_gateway: AiGateway | None = None,
 ) -> SyncResult:
     """Pull Akahu accounts and transactions via injected or HTTP gateway."""
     resolved_gateway = gateway or HttpAkahuGateway(
@@ -198,4 +200,10 @@ def sync_akahu(
         start_date=start_date,
         end_date=end_date,
     )
-    return sync_provider_feeds(db, provider="akahu", feeds=feeds, skip_llm=skip_llm)
+    return sync_provider_feeds(
+        db,
+        provider="akahu",
+        feeds=feeds,
+        skip_llm=skip_llm,
+        gateway=ai_gateway,
+    )

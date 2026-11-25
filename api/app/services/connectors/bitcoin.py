@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.schemas import SyncResult
+from app.services.ai_gateway import AiGateway
 from app.services.connectors import ConnectorConfigError, ConnectorUpstreamError
 from app.services.ingestion_service import (
     BankFeedGateway,
@@ -486,8 +487,15 @@ def sync_bitcoin(
     end_date: Optional[date] = None,
     skip_llm: bool = True,
     gateway: Optional[BankFeedGateway] = None,
+    ai_gateway: AiGateway | None = None,
 ) -> SyncResult:
     """Sync watch-only Bitcoin wallet balances, transactions, and NZD AssetSnapshots."""
     resolved_gateway = gateway or HttpBitcoinGateway(settings.btc_watch_sources)
     feeds = resolved_gateway.fetch_feeds(start_date=start_date, end_date=end_date)
-    return sync_provider_feeds(db, provider="bitcoin", feeds=feeds, skip_llm=skip_llm)
+    return sync_provider_feeds(
+        db,
+        provider="bitcoin",
+        feeds=feeds,
+        skip_llm=skip_llm,
+        gateway=ai_gateway,
+    )

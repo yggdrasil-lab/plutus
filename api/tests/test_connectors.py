@@ -395,8 +395,8 @@ class TestExternalConnectors(unittest.TestCase):
         with patch.dict(
             integrations_router.SYNC_HANDLERS,
             {
-                "akahu": lambda db, days, sd, ed, _skip_llm=False: integrations_router.SyncResult(**fake_akahu(db, days, sd, ed)),
-                "wise": lambda db, days, sd, ed, _skip_llm=False: integrations_router.SyncResult(**fake_wise(db, days, sd, ed)),
+                "akahu": lambda db, days, sd, ed, _skip_llm=False, _ai_gateway=None: integrations_router.SyncResult(**fake_akahu(db, days, sd, ed)),
+                "wise": lambda db, days, sd, ed, _skip_llm=False, _ai_gateway=None: integrations_router.SyncResult(**fake_wise(db, days, sd, ed)),
             },
             clear=True,
         ):
