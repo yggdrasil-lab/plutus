@@ -26,13 +26,13 @@ from app.services.transfer_reconciliation.keywords import (
     SUBACCOUNT_TAG_RE,
     TRANSFER_KEYWORD_TOKENS,
     TRANSFER_KEYWORDS,
-    build_reconciliation_candidate_filter,
     extract_subaccount_tag,
     is_plausible_offline_fx_rate,
     is_transfer_like,
 )
 from app.services.transfer_reconciliation.matching import (
     RateResolver,
+    build_reconciliation_candidate_filter,
     extract_fiat_to_crypto_fee,
     has_exact_pair_rate,
     match_transfer_pair,

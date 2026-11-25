@@ -4,6 +4,7 @@
 # 1. IMPORTS & CONSTANTS
 # ============================================================================
 from collections import Counter
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
@@ -20,7 +21,7 @@ from app.config import settings
 from app.models import Account, AssetSnapshot, CategorizationRule, Transaction
 from app.schemas import SyncAccountSummary, SyncResult
 from app.services.ai_gateway import AiGateway
-from app.services.fx_service import FxRateFetcher, get_exchange_rate
+from app.services.fx_service import FxRateFetcher, HttpFxRateFetcher, get_exchange_rate
 from app.services.jev_client import classify_transaction_jev_with_tags, get_extra_jev_categories
 from app.services.ledger_entry import (
     collect_existing_tags,
@@ -447,6 +448,8 @@ def _handle_duplicate_external_note(
     item: NormalizedTx,
     ext_note: Optional[str],
     ctx: _IngestionBatchContext,
+    *,
+    fetcher: Optional[FxRateFetcher] = None,
 ) -> bool:
     if not ext_note or (
         ext_note not in ctx.existing_external_notes and ext_note not in ctx.seen_external_notes
@@ -456,7 +459,9 @@ def _handle_duplicate_external_note(
         ctx.matched_existing.append(ctx.existing_tx_by_note[ext_note])
     if ext_note in ctx.existing_btc_by_note and ext_note not in ctx.seen_external_notes:
         ctx.seen_external_notes.add(ext_note)
-        if _refresh_existing_btc_transaction(db, account, item, ctx.existing_btc_by_note[ext_note]):
+        if _refresh_existing_btc_transaction(
+            db, account, item, ctx.existing_btc_by_note[ext_note], fetcher=fetcher
+        ):
             ctx.reconcile_needed = True
     ctx.skipped += 1
     return True
@@ -625,6 +630,8 @@ def _persist_new_ingested_tx(
     ctx: _IngestionBatchContext,
     skip_llm: bool,
     gateway: AiGateway | None,
+    *,
+    fetcher: Optional[FxRateFetcher] = None,
 ) -> None:
     ctx.seen_hashes.add(raw_hash)
     if ext_note:
@@ -642,7 +649,11 @@ def _persist_new_ingested_tx(
     tx_fx_rate = item.exchange_rate
     if tx_fx_rate is None and tx_currency != "NZD":
         resolved = get_exchange_rate(
-            db, rate_date=item.transaction_date, from_currency=tx_currency, to_currency="NZD"
+            db,
+            rate_date=item.transaction_date,
+            from_currency=tx_currency,
+            to_currency="NZD",
+            fetcher=fetcher,
         )
         if resolved is not None:
             tx_fx_rate = resolved[0]
@@ -673,6 +684,8 @@ def _finalize_ingestion_batch(
     db: Session,
     account: Account,
     ctx: _IngestionBatchContext,
+    *,
+    fetcher: Optional[FxRateFetcher] = None,
 ) -> None:
     account.last_synced_at = datetime.now(timezone.utc)
     db.commit()
@@ -683,13 +696,13 @@ def _finalize_ingestion_batch(
     if not (ctx.created or ctx.reconcile_needed):
         return
     reconcile_unlinked_receipts(db)
-    reconcile_transfers(db)
+    reconcile_transfers(db, fetcher=fetcher)
     if not ctx.matched_tx_rules:
         return
     counterpart_updated = False
     for tx, matched_rule in ctx.matched_tx_rules:
         db.refresh(tx)
-        if apply_counterpart_account_for_rule(db, tx, matched_rule):
+        if apply_counterpart_account_for_rule(db, tx, matched_rule, fetcher=fetcher):
             counterpart_updated = True
     if counterpart_updated:
         db.commit()
@@ -706,6 +719,7 @@ def ingest_normalized_transactions_detailed(
     *,
     skip_llm: bool = False,
     gateway: AiGateway | None = None,
+    fx_fetcher: Optional[FxRateFetcher] = None,
 ) -> tuple[int, int, list[Transaction], list[Transaction]]:
     """Deduplicate, categorize, persist, enrich, and reconcile normalized transactions."""
     if not items:
@@ -713,21 +727,39 @@ def ingest_normalized_transactions_detailed(
         db.commit()
         return 0, 0, [], []
 
-    ctx = _load_ingestion_batch_context(db, account, items, skip_llm)
-    for item in items:
-        item_ext_keys = _extract_external_note_keys(item.notes)
-        ext_note = item_ext_keys[0] if item_ext_keys else None
-        if _handle_duplicate_external_note(db, account, item, ext_note, ctx):
-            continue
-        item_currency = (item.currency or account.currency or "NZD")[:3].upper()
-        if _handle_dbs_cross_source_match(item, item_currency, ctx, skip_llm, gateway):
-            continue
-        raw_hash = _resolve_unique_raw_hash(db, account, item, ext_note, ctx)
-        if raw_hash is None:
-            continue
-        _persist_new_ingested_tx(db, account, item, raw_hash, ext_note, ctx, skip_llm, gateway)
+    fetcher_ctx = (
+        nullcontext(fx_fetcher)
+        if fx_fetcher is not None
+        else HttpFxRateFetcher(wise_api_token=settings.wise_api_token)
+    )
+    with fetcher_ctx as active_fetcher:
+        ctx = _load_ingestion_batch_context(db, account, items, skip_llm)
+        for item in items:
+            item_ext_keys = _extract_external_note_keys(item.notes)
+            ext_note = item_ext_keys[0] if item_ext_keys else None
+            if _handle_duplicate_external_note(
+                db, account, item, ext_note, ctx, fetcher=active_fetcher
+            ):
+                continue
+            item_currency = (item.currency or account.currency or "NZD")[:3].upper()
+            if _handle_dbs_cross_source_match(item, item_currency, ctx, skip_llm, gateway):
+                continue
+            raw_hash = _resolve_unique_raw_hash(db, account, item, ext_note, ctx)
+            if raw_hash is None:
+                continue
+            _persist_new_ingested_tx(
+                db,
+                account,
+                item,
+                raw_hash,
+                ext_note,
+                ctx,
+                skip_llm,
+                gateway,
+                fetcher=active_fetcher,
+            )
 
-    _finalize_ingestion_batch(db, account, ctx)
+        _finalize_ingestion_batch(db, account, ctx, fetcher=active_fetcher)
     return len(ctx.created), ctx.skipped, ctx.created, ctx.matched_existing
 
 
@@ -738,6 +770,7 @@ def ingest_normalized_transactions(
     *,
     skip_llm: bool = False,
     gateway: AiGateway | None = None,
+    fx_fetcher: Optional[FxRateFetcher] = None,
 ) -> tuple[int, int, list[Transaction]]:
     """Deduplicate, categorize, persist, and reconcile normalized transactions."""
     created_count, skipped_count, created, _ = ingest_normalized_transactions_detailed(
@@ -746,6 +779,7 @@ def ingest_normalized_transactions(
         items,
         skip_llm=skip_llm,
         gateway=gateway,
+        fx_fetcher=fx_fetcher,
     )
     return created_count, skipped_count, created
 
@@ -761,6 +795,7 @@ def upsert_account_snapshot(
     notes: Optional[str] = None,
     exchange_rate: Optional[float] = None,
     preserve_existing_notes_if_none: bool = True,
+    fx_fetcher: Optional[FxRateFetcher] = None,
 ) -> AssetSnapshot:
     """Insert or update the balance snapshot for an account on a given date."""
     normalized_currency = (currency or account.currency or "NZD")[:10].upper()
@@ -774,6 +809,7 @@ def upsert_account_snapshot(
                 rate_date=snapshot_date,
                 from_currency=normalized_currency,
                 to_currency="NZD",
+                fetcher=fx_fetcher,
             )
             if resolved is not None and resolved[0] > 0:
                 fx_rate = float(resolved[0])

@@ -8,7 +8,7 @@ from typing import Optional
 from sqlalchemy.orm import Session
 
 from app.models import Transaction
-from app.services.fx_service import FxRateFetcher, get_exchange_rate
+from app.services.fx_service import FxRateFetcher, resolve_reporting_rate
 
 
 @dataclass(frozen=True)
@@ -26,19 +26,12 @@ def resolve_unlinked_reporting_rate(
     fetcher: Optional[FxRateFetcher] = None,
 ) -> Optional[float]:
     """Return None for NZD or resolved currency-to-NZD rate rounded to 8 decimals."""
-    normalized = (leg.currency or "NZD").strip().upper()
-    if normalized == "NZD":
-        return None
-    resolved = get_exchange_rate(
+    return resolve_reporting_rate(
         db,
-        rate_date=leg.transaction_date,
-        from_currency=normalized,
-        to_currency="NZD",
+        leg.currency,
+        leg.transaction_date,
         fetcher=fetcher,
     )
-    if resolved is not None and resolved[0] > 0:
-        return round(float(resolved[0]), 8)
-    return None
 
 
 def link_transfer_pair(
