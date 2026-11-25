@@ -20,6 +20,7 @@ from app.services.category_taxonomy._types import (
     CategoryValidationError,
 )
 from app.services.category_taxonomy.budget_sync import (
+    load_categories_by_lower,
     resolve_budget_rule_category,
     resolve_budget_rule_period,
     sync_budget_rule_amortization,
@@ -82,6 +83,7 @@ __all__ = [
     "get_parent_category",
     "get_root_category",
     "list_categories",
+    "load_categories_by_lower",
     "normalize_akahu_category",
     "normalize_existing_legacy_categories",
     "resolve_budget_rule_category",
