@@ -8,8 +8,8 @@ from datetime import date, datetime
 from typing import Optional
 
 from app.services.statement_parser import StatementParseResult
+from app.services.transfer_reconciliation.constants import TRANSFER_CATEGORIES
 
-TRANSFER_CATEGORIES: tuple[str, ...] = ("transfers", "transfer")
 MAX_SPLIT_CATEGORY_LENGTH = 50
 
 
