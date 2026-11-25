@@ -52,22 +52,6 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("PLUTUS_BTC_WATCH_SOURCES", "PLUTUS_BTC_XPUB", "BTC_WATCH_SOURCES"),
     )
     sync_interval_hours: int = 6
-    discord_bot_token: str | None = Field(
-        default=None,
-        validation_alias=AliasChoices("PLUTUS_DISCORD_BOT_TOKEN", "DISCORD_BOT_TOKEN"),
-    )
-    discord_wealth_channel_id: str | None = Field(
-        default=None,
-        validation_alias=AliasChoices(
-            "PLUTUS_DISCORD_WEALTH_CHANNEL_ID",
-            "DISCORD_CHANNEL_WEALTH_ID",
-            "DISCORD_WEALTH_CHANNEL_ID",
-        ),
-    )
-    discord_user_id: str | None = Field(
-        default=None,
-        validation_alias=AliasChoices("PLUTUS_DISCORD_USER_ID", "DISCORD_USER_ID"),
-    )
 
     model_config = SettingsConfigDict(
         env_prefix="PLUTUS_",
