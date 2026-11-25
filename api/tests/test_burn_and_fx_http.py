@@ -16,7 +16,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.db import Base, get_db
 from app.main import app
 from app.models import Account, AssetSnapshot, Transaction
-from app.services import burn_service
 from app.services.connectors.wise import normalize_wise_feed
 from app.services.fx_service import repair_transaction_fx_rates, to_nzd_amount
 

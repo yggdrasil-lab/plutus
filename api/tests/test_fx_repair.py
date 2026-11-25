@@ -2,6 +2,7 @@
 
 from datetime import date, timedelta
 from pathlib import Path
+import importlib.util
 import sys
 import unittest
 
@@ -13,7 +14,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.db import Base
 from app.models import Account, Transaction
-from app.services import burn_service
 from app.services.fx_repair import (
     repair_crypto_transfers_and_rates,
     repair_transaction_fx_rates,
@@ -86,8 +86,8 @@ class TestFxRepairAndThreading(unittest.TestCase):
         self.db.close()
         Base.metadata.drop_all(bind=self.engine)
 
-    def test_burn_service_no_longer_defines_repair_transaction_fx_rates(self) -> None:
-        self.assertFalse(hasattr(burn_service, "repair_transaction_fx_rates"))
+    def test_legacy_burn_service_module_is_retired(self) -> None:
+        self.assertIsNone(importlib.util.find_spec("app.services.burn_service"))
 
     def test_transfer_keywords_compose_crypto_tokens_without_duplicates(self) -> None:
         self.assertEqual(len(TRANSFER_KEYWORD_TOKENS), 37)

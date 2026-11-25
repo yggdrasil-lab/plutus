@@ -20,7 +20,6 @@ from starlette.routing import Route
 from app.config import settings
 from app.models import Account, AssetSnapshot
 from app.services.ai_gateway import AiGateway
-from app.services.burn_service import get_latest_account_balances
 from app.services.ingestion_service import upsert_account_snapshot
 from app.services.ledger_entry import (
     MCP_EXPENSE_WRITE_POLICY,
@@ -28,10 +27,8 @@ from app.services.ledger_entry import (
     record_transaction,
 )
 from app.services.runway import (
-    calculate_compounding_runway,
-    calculate_emergency_runway,
     calculate_time_banked,
-    calculate_weekly_growth_rate,
+    get_runway_snapshot,
 )
 from app.services.spending_projection import project_burn
 from app.services.transfer_service import reconcile_transfers
@@ -75,36 +72,45 @@ def _run_plutus_get_runway(
     db: Session | None = None,
     reference_date: date | None = None,
 ) -> str:
-    """Compute MCP runway summary JSON using unified project_burn and latest balances."""
-    today = reference_date or date.today()
+    """Compute MCP runway summary JSON from the unified RunwaySnapshot service."""
     with _session_scope(db) as session:
-        balances = get_latest_account_balances(session)
-        burn = project_burn(session, reference_date=today)
-        weekly_burn = burn.effective_weekly_burn
-        cash_bal, growth_bal, locked_bal = balances["cash"], balances["growth"], balances["locked"]
-        total_liquid = cash_bal + growth_bal
-
-        emergency_weeks = calculate_emergency_runway(cash_bal, weekly_burn)
-        growth_weeks, is_perpetual = calculate_compounding_runway(
-            accessible_assets=total_liquid,
-            weekly_burn=weekly_burn,
-            annual_real_return=annual_real_return,
+        snapshot = get_runway_snapshot(
+            session,
+            as_of=reference_date,
+            annual_return=annual_real_return,
         )
-        weekly_yield = round(total_liquid * calculate_weekly_growth_rate(annual_real_return), 2)
         summary = {
-            "as_of_date": today.isoformat(),
-            "primary_runway_weeks": "Infinite (Perpetual Freedom)" if is_perpetual else (growth_weeks or emergency_weeks),
-            "primary_runway_years": "Infinite" if is_perpetual else round((growth_weeks or emergency_weeks) / 52.0, 2),
-            "is_perpetual": is_perpetual,
-            "weekly_burn_rate_nzd": weekly_burn,
-            "portfolio_weekly_yield_nzd": weekly_yield,
-            "time_banked_this_week": calculate_time_banked(burn.weekly_budget_target, burn.this_week_spend),
+            "as_of_date": snapshot.as_of_date.isoformat(),
+            "primary_runway_weeks": (
+                "Infinite (Perpetual Freedom)"
+                if snapshot.is_perpetual
+                else snapshot.primary_runway_weeks
+            ),
+            "primary_runway_years": (
+                "Infinite" if snapshot.is_perpetual else snapshot.primary_runway_years
+            ),
+            "is_perpetual": snapshot.is_perpetual,
+            "weekly_burn_rate_nzd": snapshot.effective_weekly_burn,
+            "observed_weekly_burn_nzd": snapshot.observed_weekly_burn,
+            "effective_weekly_burn_nzd": snapshot.effective_weekly_burn,
+            "weekly_spend_this_week_nzd": snapshot.this_week_spend,
+            "weekly_budget_target_nzd": snapshot.weekly_budget_target,
+            "portfolio_weekly_yield_nzd": snapshot.perpetual_threshold_weekly_income,
+            "time_banked_this_week": snapshot.time_banked_this_week,
             "breakdown": {
-                "emergency_cash_weeks": emergency_weeks,
-                "cash_balance_nzd": cash_bal,
-                "growth_balance_nzd": growth_bal,
-                "locked_balance_nzd": locked_bal,
-                "total_liquid_nzd": total_liquid,
+                "emergency_cash_weeks": snapshot.emergency_weeks,
+                "growth_weeks": snapshot.growth_weeks,
+                "locked_weeks": snapshot.locked_weeks,
+                "cash_balance_nzd": snapshot.cash_balance,
+                "growth_balance_nzd": snapshot.growth_balance,
+                "locked_balance_nzd": snapshot.locked_balance,
+                "total_liquid_nzd": snapshot.total_liquid_balance,
+                "total_liabilities_nzd": snapshot.total_liabilities,
+                "net_worth_nzd": snapshot.net_worth,
+                "variable_weekly_burn_nzd": snapshot.variable_weekly_burn,
+                "recurring_weekly_burn_nzd": snapshot.recurring_weekly_burn,
+                "this_week_variable_spend_nzd": snapshot.this_week_variable_spend,
+                "tier_labels": snapshot.tier_labels.as_dict(),
             },
         }
         return json.dumps(summary, indent=2)
