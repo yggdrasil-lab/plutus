@@ -8,7 +8,6 @@ from pathlib import Path
 from alembic import command as alembic_command
 from alembic.config import Config as AlembicConfig
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.db import SessionLocal
@@ -75,16 +74,6 @@ app = FastAPI(
     description="Central wealth, ledger, asset valuation, and runway engine for Yggdrasil.",
     version="1.0.0",
     lifespan=lifespan,
-)
-
-# CORS configuration allowing Midas PWA and local development
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["X-Total-Count"],
 )
 
 # Mount REST endpoints
