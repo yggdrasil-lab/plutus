@@ -38,8 +38,10 @@ from app.services.ledger_entry.tags import (
 from app.services.receipt_ingestion.matching import reconcile_unlinked_receipts
 from app.services.rules_engine import matches_rule
 from app.services.statement_parser import auto_categorize, generate_transaction_hash
-from app.services.transfer_reconciliation import apply_counterpart_account_for_rule
-from app.services.transfer_service import reconcile_transfers
+from app.services.transfer_reconciliation import (
+    apply_counterpart_account_for_rule,
+    reconcile_transfers,
+)
 
 
 @dataclass(frozen=True)
@@ -347,7 +349,7 @@ def _run_post_write_reconciliation(
     """Run post-write receipt/transfer matching and rule counterpart mirroring."""
     if policy.reconcile_post_write:
         reconcile_unlinked_receipts(db)
-        reconcile_transfers(db)
+        reconcile_transfers(db, fetcher=fx_fetcher)
     if (
         policy.apply_counterpart_rules
         and matched_rule is not None

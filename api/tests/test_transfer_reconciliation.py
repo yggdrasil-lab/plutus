@@ -4,6 +4,7 @@ from datetime import date
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
@@ -14,14 +15,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.db import Base
 from app.models import Account, CategorizationRule, Transaction
 from app.services import rules_engine
+from app.services.fx_service import cache_exchange_rate
 from app.services.ingestion_service import NormalizedTx, _refresh_existing_btc_transaction
 from app.services.transfer_reconciliation import (
     CRYPTO_CURRENCIES,
     TRANSFER_CATEGORIES,
+    TRANSFER_KEYWORD_TOKENS,
+    TransferCandidate,
     UnlinkTransferResult,
     apply_counterpart_account_for_rule,
+    build_reconciliation_candidate_filter,
+    compute_implied_crypto_fee,
+    fx_rate_precision,
+    is_plausible_offline_fx_rate,
+    is_transfer_like,
     link_transfer_pair,
+    match_transfer_pair,
+    reconcile_transfers,
     resolve_unlinked_reporting_rate,
+    score_cross_currency_match,
+    score_same_currency_match,
+    score_transfer_match,
     unlink_transfer_pair,
 )
 from app.services.transfer_service import repair_crypto_transfers_and_rates
@@ -638,6 +652,377 @@ class TestTransferReconciliation(unittest.TestCase):
         self.assertIsNone(sgd_partner.fee_amount)
         self.assertEqual(float(sgd_partner.exchange_rate), 1.295)
         self.assertEqual(float(btc_b.exchange_rate), 171234.5)
+
+
+class TestTransferScoringAndMatching(unittest.TestCase):
+    def setUp(self) -> None:
+        Base.metadata.create_all(bind=engine)
+        self.db = TestingSessionLocal()
+        self.acc_nzd = Account(
+            name="Checking NZD",
+            account_type="checking",
+            tier="cash",
+            institution="Bank A",
+            currency="NZD",
+        )
+        self.acc_nzd_savings = Account(
+            name="Savings NZD",
+            account_type="savings",
+            tier="cash",
+            institution="Bank A",
+            currency="NZD",
+        )
+        self.acc_sgd = Account(
+            name="Checking SGD",
+            account_type="checking",
+            tier="cash",
+            institution="Bank B",
+            currency="SGD",
+        )
+        self.acc_php = Account(
+            name="Savings PHP",
+            account_type="savings",
+            tier="cash",
+            institution="Bank C",
+            currency="PHP",
+        )
+        self.acc_btc = Account(
+            name="Cold Wallet BTC",
+            account_type="crypto",
+            tier="growth",
+            institution="Bitcoin On-Chain",
+            currency="BTC",
+        )
+        self.db.add_all([self.acc_nzd, self.acc_nzd_savings, self.acc_sgd, self.acc_php, self.acc_btc])
+        self.db.commit()
+        for acc in (self.acc_nzd, self.acc_nzd_savings, self.acc_sgd, self.acc_php, self.acc_btc):
+            self.db.refresh(acc)
+
+    def tearDown(self) -> None:
+        self.db.close()
+        Base.metadata.drop_all(bind=engine)
+
+    def _add_tx(
+        self,
+        *,
+        tx_date: date,
+        account_id: int,
+        amount: float,
+        currency: str,
+        merchant: str,
+        raw_hash: str,
+        category: str = "Transfers",
+        raw_description: str | None = None,
+        exchange_rate: float | None = None,
+        fee_amount: float | None = None,
+    ) -> Transaction:
+        tx = Transaction(
+            transaction_date=tx_date,
+            account_id=account_id,
+            amount=amount,
+            currency=currency,
+            merchant=merchant,
+            raw_description=raw_description or merchant,
+            category=category,
+            raw_hash=raw_hash,
+            exchange_rate=exchange_rate,
+            fee_amount=fee_amount,
+        )
+        self.db.add(tx)
+        self.db.flush()
+        return tx
+
+    def test_scoring_module_has_zero_sqlalchemy_imports(self) -> None:
+        import ast
+
+        scoring_path = (
+            Path(__file__).resolve().parent.parent
+            / "app"
+            / "services"
+            / "transfer_reconciliation"
+            / "scoring.py"
+        )
+        tree = ast.parse(scoring_path.read_text(encoding="utf-8"))
+        imported_roots: list[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported_roots.extend(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported_roots.append(node.module.split(".")[0])
+        self.assertNotIn("sqlalchemy", imported_roots)
+        self.assertEqual(fx_rate_precision(0.005), 8)
+        self.assertEqual(fx_rate_precision(0.5), 6)
+        self.assertEqual(fx_rate_precision(1.25), 4)
+
+    def test_score_same_currency_exact_fee_subaccount_and_ties(self) -> None:
+        d = date(2026, 11, 10)
+        anchor = TransferCandidate(1, 10, d, -200.0, "NZD", "Transfers", "Bank Transfer")
+        exact = TransferCandidate(2, 20, d, 200.0, "NZD", "General", "Direct Credit")
+        noisy = TransferCandidate(3, 20, d, 200.03, "NZD", "General", "Direct Credit")
+        later = TransferCandidate(4, 20, date(2026, 11, 11), 200.0, "NZD", "General", "Direct Credit")
+        decision = score_same_currency_match(anchor, [later, noisy, exact])
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.partner_id, 2)
+        self.assertEqual(decision.score, (0, 0.0))
+        self.assertEqual(decision.outflow_exchange_rate, 1.0)
+        self.assertEqual(decision.inflow_exchange_rate, 1.0)
+
+        fee_anchor = TransferCandidate(10, 10, d, -205.0, "NZD", "Transfers", "Bank Transfer", fee_amount=5.0)
+        fee_decision = score_same_currency_match(fee_anchor, [exact])
+        self.assertIsNotNone(fee_decision)
+        self.assertEqual(fee_decision.partner_id, 2)
+        self.assertIsNone(fee_decision.outflow_fee_amount)
+
+        same_acc_out = TransferCandidate(
+            20, 10, d, -85.0, "SGD", "Transfers", "Funds Transfer",
+            raw_description="Funds Transfer [Savings (1001)]",
+        )
+        same_tag_in = TransferCandidate(
+            21, 10, d, 85.0, "SGD", "Transfers", "Funds Transfer",
+            raw_description="Funds Transfer [Savings (1001)]",
+        )
+        diff_tag_in = TransferCandidate(
+            22, 10, d, 85.0, "SGD", "Transfers", "Funds Transfer",
+            raw_description="Funds Transfer [Multiplier (2002)]",
+        )
+        self.assertIsNone(score_same_currency_match(same_acc_out, [same_tag_in]))
+        sub_decision = score_same_currency_match(same_acc_out, [same_tag_in, diff_tag_in])
+        self.assertIsNotNone(sub_decision)
+        self.assertEqual(sub_decision.partner_id, 22)
+
+    def test_score_transfer_match_prefers_same_currency_over_cross_currency(self) -> None:
+        d = date(2026, 11, 10)
+        anchor = TransferCandidate(1, 10, d, -200.0, "NZD", "Transfers", "Transfer")
+        usd_cand = TransferCandidate(2, 30, d, 120.0, "USD", "General", "Wise USD Credit")
+        nzd_cand = TransferCandidate(3, 20, d, 200.0, "NZD", "General", "Transfer In")
+        decision = score_transfer_match(
+            anchor,
+            [usd_cand, nzd_cand],
+            lookup_market_rate=lambda _d, _src, _dst: 0.60,
+        )
+        self.assertIsNotNone(decision)
+        self.assertTrue(decision.is_same_currency)
+        self.assertEqual(decision.partner_id, 3)
+
+    def test_score_cross_currency_market_explicit_offline_and_crypto_fee(self) -> None:
+        d = date(2026, 11, 11)
+        sgd_out = TransferCandidate(1, 10, d, -100.0, "SGD", "Transfers", "Wise Remit")
+        nzd_close = TransferCandidate(2, 20, d, 128.0, "NZD", "General", "Wise Credit")
+        nzd_far = TransferCandidate(3, 20, d, 149.0, "NZD", "General", "Wise Credit")
+        nzd_tie_better = TransferCandidate(4, 20, d, 127.95, "NZD", "General", "Wise Credit")
+        res = score_cross_currency_match(
+            sgd_out,
+            [nzd_far, nzd_close, nzd_tie_better],
+            lookup_market_rate=lambda _d, _src, _dst: 1.28,
+        )
+        self.assertIsNotNone(res)
+        self.assertEqual(res.partner_id, 2)
+        self.assertEqual(res.outflow_exchange_rate, 1.28)
+        self.assertIsNone(
+            score_cross_currency_match(
+                sgd_out,
+                [nzd_far],
+                lookup_market_rate=lambda _d, _src, _dst: 1.28,
+            )
+        )
+
+        # Explicit pre-populated NZD outflow rate short-circuits market lookup within 8%, falls back >8%
+        explicit_out = TransferCandidate(5, 10, d, -100.0, "SGD", "Transfers", "Wise", exchange_rate=1.30)
+        lookup_calls: list[tuple[date, str, str]] = []
+
+        def _spy_lookup(rd: date, src: str, dst: str) -> float:
+            lookup_calls.append((rd, src, dst))
+            return 1.28
+
+        explicit_hit = score_cross_currency_match(explicit_out, [nzd_close], lookup_market_rate=_spy_lookup)
+        self.assertIsNotNone(explicit_hit)
+        self.assertEqual(explicit_hit.outflow_exchange_rate, 1.30)
+        self.assertEqual(lookup_calls, [])
+
+        bad_explicit_out = TransferCandidate(6, 10, d, -100.0, "SGD", "Transfers", "Wise", exchange_rate=2.00)
+        fallback_hit = score_cross_currency_match(bad_explicit_out, [nzd_close], lookup_market_rate=_spy_lookup)
+        self.assertIsNotNone(fallback_hit)
+        self.assertEqual(len(lookup_calls), 1)
+
+        # Offline plausibility: fiat, high-denom PHP, crypto requires counterparty keyword
+        self.assertTrue(is_plausible_offline_fx_rate("SGD", "NZD", 1.28))
+        self.assertTrue(is_plausible_offline_fx_rate("SGD", "PHP", 43.5))
+        self.assertFalse(is_plausible_offline_fx_rate("NZD", "BTC", 0.000006, counterparty_text="Alex Tan"))
+        self.assertTrue(is_plausible_offline_fx_rate("NZD", "BTC", 0.000006, counterparty_text="Lightning Pay"))
+
+        # NZD->crypto quotes 8dp NZD/BTC and compute_implied_crypto_fee enforces bounds
+        nzd_btc_out = TransferCandidate(7, 10, d, -5000.0, "NZD", "Transfers", "Lightning Pay")
+        btc_in = TransferCandidate(8, 30, d, 0.035, "BTC", "General", "BTC Deposit")
+        btc_decision = score_cross_currency_match(
+            nzd_btc_out,
+            [btc_in],
+            lookup_market_rate=lambda _d, _src, _dst: 1.0 / 140000.0,
+        )
+        self.assertIsNotNone(btc_decision)
+        self.assertEqual(btc_decision.outflow_exchange_rate, round(5000.0 / 0.035, 8))
+        self.assertEqual(compute_implied_crypto_fee(out_amount=5000.0, in_amount=0.035, market_rate=140000.0), 100.0)
+        self.assertIsNone(compute_implied_crypto_fee(out_amount=100.0, in_amount=0.000712, market_rate=140000.0))
+        self.assertIsNone(compute_implied_crypto_fee(out_amount=1000.0, in_amount=0.005, market_rate=140000.0))
+
+    def test_unified_keyword_filter_and_is_transfer_like(self) -> None:
+        d = date(2026, 11, 13)
+        self.assertEqual(len(TRANSFER_KEYWORD_TOKENS), 37)
+        self.assertFalse(
+            is_transfer_like(category="Transfers", merchant="BASE REWARDS", raw_description=None)
+        )
+        self.assertFalse(
+            is_transfer_like(category="Groceries", merchant="Transfer", raw_description=None)
+        )
+        for idx, token in enumerate(TRANSFER_KEYWORD_TOKENS):
+            with self.subTest(token=token):
+                self.assertTrue(
+                    is_transfer_like(category="General", merchant=f"Alex {token} test", raw_description=None)
+                )
+                self.assertTrue(
+                    is_transfer_like(category="General", merchant="Alex Tan", raw_description=f"Ref {token}")
+                )
+                tx_m = self._add_tx(
+                    tx_date=d,
+                    account_id=self.acc_nzd.id,
+                    amount=-10.0,
+                    currency="NZD",
+                    merchant=f"Pay {token}",
+                    raw_hash=f"kw-m-{idx}",
+                    category="General",
+                    raw_description="Plain ref",
+                )
+                tx_d = self._add_tx(
+                    tx_date=d,
+                    account_id=self.acc_nzd.id,
+                    amount=-10.0,
+                    currency="NZD",
+                    merchant="Plain merchant",
+                    raw_hash=f"kw-d-{idx}",
+                    category="General",
+                    raw_description=f"Memo {token}",
+                )
+                self.db.flush()
+                matched_ids = set(
+                    self.db.scalars(
+                        select(Transaction.id).where(build_reconciliation_candidate_filter())
+                    ).all()
+                )
+                self.assertIn(tx_m.id, matched_ids)
+                self.assertIn(tx_d.id, matched_ids)
+
+    def test_end_to_end_match_transfer_pair_with_fake_fetcher(self) -> None:
+        d = date(2026, 11, 18)
+        fetcher = _FakeFxFetcher(
+            {
+                (d, "BTC", "NZD"): (140000.0, "fake"),
+                (d, "NZD", "BTC"): (1.0 / 140000.0, "fake"),
+            }
+        )
+        cache_exchange_rate(
+            self.db, rate_date=d, from_currency="BTC", to_currency="NZD", rate=140000.0, source="fake"
+        )
+        p3_out = self._add_tx(
+            tx_date=d,
+            account_id=self.acc_nzd.id,
+            amount=-5000.0,
+            currency="NZD",
+            merchant="Lightning Pay",
+            raw_hash="e2e-p3-out",
+        )
+        p3_in = self._add_tx(
+            tx_date=d,
+            account_id=self.acc_btc.id,
+            amount=0.035,
+            currency="BTC",
+            merchant="Bitcoin Deposit",
+            raw_hash="e2e-p3-in",
+            category="General",
+        )
+        self.db.commit()
+
+        partner = match_transfer_pair(p3_out, self.db, fetcher=fetcher, commit=True)
+        self.assertIsNotNone(partner)
+        self.assertEqual(partner.id, p3_in.id)
+        self.assertAlmostEqual(float(p3_out.fee_amount), 100.0, places=2)
+        self.assertAlmostEqual(float(p3_out.exchange_rate), 140000.0, places=2)
+        self.assertAlmostEqual(float(p3_in.exchange_rate), 140000.0, places=2)
+        self.assertEqual(p3_in.category, "Transfers")
+
+    def test_reconcile_transfers_single_commit_on_autoflush_false(self) -> None:
+        d = date(2026, 11, 19)
+        fetcher = _FakeFxFetcher({})
+        cache_exchange_rate(
+            self.db, rate_date=d, from_currency="SGD", to_currency="NZD", rate=1.28, source="fake"
+        )
+        p1_out = self._add_tx(
+            tx_date=d,
+            account_id=self.acc_nzd.id,
+            amount=-250.0,
+            currency="NZD",
+            merchant="Transfer to Savings",
+            raw_hash="sc-p1-out",
+        )
+        p1_in = self._add_tx(
+            tx_date=d,
+            account_id=self.acc_nzd_savings.id,
+            amount=250.0,
+            currency="NZD",
+            merchant="Direct Credit",
+            raw_hash="sc-p1-in",
+            category="General",
+        )
+        p2_out = self._add_tx(
+            tx_date=d,
+            account_id=self.acc_sgd.id,
+            amount=-100.0,
+            currency="SGD",
+            merchant="Wise Transfer",
+            raw_hash="sc-p2-out",
+        )
+        p2_in = self._add_tx(
+            tx_date=d,
+            account_id=self.acc_nzd.id,
+            amount=128.0,
+            currency="NZD",
+            merchant="Wise Inflow",
+            raw_hash="sc-p2-in",
+            category="General",
+        )
+        p3_out = self._add_tx(
+            tx_date=d,
+            account_id=self.acc_nzd.id,
+            amount=-250.0,
+            currency="NZD",
+            merchant="Transfer to Savings",
+            raw_hash="sc-p3-out",
+        )
+        p3_in = self._add_tx(
+            tx_date=d,
+            account_id=self.acc_nzd_savings.id,
+            amount=250.0,
+            currency="NZD",
+            merchant="Direct Credit",
+            raw_hash="sc-p3-in",
+            category="General",
+        )
+        self.db.commit()
+
+        with patch.object(self.db, "commit", wraps=self.db.commit) as commit_spy:
+            matched_count = reconcile_transfers(self.db, fetcher=fetcher)
+            self.assertEqual(matched_count, 3)
+            self.assertEqual(commit_spy.call_count, 1)
+            second_count = reconcile_transfers(self.db, fetcher=fetcher)
+            self.assertEqual(second_count, 0)
+            self.assertEqual(commit_spy.call_count, 1)
+
+        for tx in (p1_out, p1_in, p2_out, p2_in, p3_out, p3_in):
+            self.db.refresh(tx)
+        self.assertEqual(p1_out.linked_transaction_id, p1_in.id)
+        self.assertEqual(p3_out.linked_transaction_id, p3_in.id)
+        self.assertNotEqual(p1_out.linked_transaction_id, p3_in.id)
+        self.assertEqual(p2_out.linked_transaction_id, p2_in.id)
+        self.assertEqual(p2_in.category, "Transfers")
+        self.assertAlmostEqual(float(p2_out.exchange_rate), 1.28, places=4)
 
 
 if __name__ == "__main__":
