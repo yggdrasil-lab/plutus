@@ -958,3 +958,44 @@ def test_lent_loan_chronological_interest_with_topup_and_split_disbursement():
         assert status_data["total_paid_amount"] == 324.0
     finally:
         app.dependency_overrides.clear()
+
+
+def test_loans_http_crud_contract_parity():
+    client, _ = _build_test_client()
+    try:
+        created = client.post(
+            "/loans",
+            json={
+                "name": "  Commuter Bike  ",
+                "lender": "  Alpha Credit  ",
+                "loan_type": "borrowed",
+                "principal_amount": 1200.0,
+                "annual_interest_rate": 0.0,
+                "term_months": 12,
+                "monthly_payment": 100.0,
+                "start_date": "2025-01-01",
+            },
+        )
+        assert created.status_code == 201
+        loan_id = created.json()["id"]
+        assert created.json()["name"] == "Commuter Bike"
+        assert created.json()["lender"] == "Alpha Credit"
+
+        null_name = client.patch(f"/loans/{loan_id}", json={"name": None})
+        assert null_name.status_code == 422
+        assert null_name.json()["detail"] == "name cannot be null."
+
+        missing_patch = client.patch("/loans/99999", json={"name": "Missing"})
+        assert missing_patch.status_code == 404
+        assert missing_patch.json()["detail"] == "Loan not found"
+
+        missing_delete = client.delete("/loans/99999")
+        assert missing_delete.status_code == 404
+        assert missing_delete.json()["detail"] == "Loan not found"
+
+        deleted = client.delete(f"/loans/{loan_id}")
+        assert deleted.status_code == 204
+        assert client.patch(f"/loans/{loan_id}", json={"name": "Gone"}).status_code == 404
+        assert client.get("/loans").json()["loans"] == []
+    finally:
+        app.dependency_overrides.clear()

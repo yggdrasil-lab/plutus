@@ -1,8 +1,9 @@
 """Amortization schedule, countdown, and net worth calculations for loans."""
 
 import calendar
+from collections.abc import Mapping
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Optional
 
@@ -21,6 +22,50 @@ from app.services.fx_service import (
 
 class LoanFxConversionError(ValueError):
     """Raised when a cross-currency loan payment or disbursement cannot be converted."""
+
+
+class LoanNotFoundError(LookupError):
+    """Raised when a requested loan does not exist."""
+
+
+class LoanValidationError(ValueError):
+    """Raised when loan attributes violate domain invariants."""
+
+
+_VALID_LOAN_TYPES = frozenset({"borrowed", "lent"})
+_NON_NULLABLE_UPDATE_FIELDS = frozenset(
+    {
+        "name",
+        "lender",
+        "loan_type",
+        "principal_amount",
+        "annual_interest_rate",
+        "term_months",
+        "monthly_payment",
+        "start_date",
+        "is_active",
+    }
+)
+_NULLABLE_UPDATE_FIELDS = frozenset({"asset_value", "notes"})
+_ALLOWED_UPDATE_FIELDS = _NON_NULLABLE_UPDATE_FIELDS | _NULLABLE_UPDATE_FIELDS
+
+
+@dataclass(frozen=True)
+class LoanCreateInput:
+    """Validated domain payload for creating a new loan."""
+
+    name: str
+    lender: str
+    principal_amount: float
+    start_date: date
+    loan_type: str = "borrowed"
+    annual_interest_rate: float = 0.0
+    term_months: int = 0
+    monthly_payment: float = 0.0
+    asset_value: Optional[float] = None
+    currency: str = "NZD"
+    notes: Optional[str] = None
+    is_active: bool = True
 
 
 @dataclass(frozen=True)
@@ -154,6 +199,19 @@ class _ScheduleProjection:
     payoff_date: Optional[date]
     remaining_interest: float
     weekly_payment_equivalent: float
+
+
+@dataclass
+class _ReplayState:
+    """Mutable loop accumulator for chronological loan ledger replay."""
+
+    balance: float
+    disbursement_total: float = 0.0
+    payments_made: int = 0
+    interest_paid_total: float = 0.0
+    total_paid: float = 0.0
+    repayment_entries: list[LoanPaymentSnapshot] = field(default_factory=list)
+    disbursement_entries: list[LoanPaymentSnapshot] = field(default_factory=list)
 
 
 def add_months(base_date: date, months: int) -> date:
@@ -465,6 +523,71 @@ def _apply_repayment_step(
     return new_balance, interest, applied, snapshot
 
 
+def _resolve_fetcher_context(fetcher: Optional[FxRateFetcher]):
+    """Return an active FX fetcher context manager without masking missing config."""
+    if fetcher is not None:
+        return nullcontext(fetcher)
+    return HttpFxRateFetcher(wise_api_token=settings.wise_api_token)
+
+
+def _record_disbursement(
+    state: _ReplayState,
+    item: _LoanLedgerItem,
+    params: _LoanParams,
+    *,
+    db: Optional[Session],
+    fetcher: FxRateFetcher,
+) -> None:
+    """Accumulate one disbursement advance into the replay state."""
+    applied = _item_applied_amount(item, params.currency, db=db, fetcher=fetcher)
+    state.balance += applied
+    state.disbursement_total += applied
+    state.disbursement_entries.append(
+        _build_payment_snapshot(
+            item,
+            applied_amount=applied,
+            entry_type="disbursement",
+            loan_currency=params.currency,
+        )
+    )
+
+
+def _record_repayment(
+    state: _ReplayState,
+    item: _LoanLedgerItem,
+    params: _LoanParams,
+    *,
+    db: Optional[Session],
+    fetcher: FxRateFetcher,
+) -> None:
+    """Accumulate one repayment step into the replay state."""
+    state.balance, interest, applied, snapshot = _apply_repayment_step(
+        item, state.balance, params, db=db, fetcher=fetcher
+    )
+    state.interest_paid_total += interest
+    state.total_paid += applied
+    state.payments_made += 1
+    state.repayment_entries.append(snapshot)
+
+
+def _finalize_amortization(
+    state: _ReplayState,
+    effective_principal: float,
+    repayment_items: list[_LoanLedgerItem],
+) -> _AmortizationResult:
+    """Freeze replay state into an immutable _AmortizationResult."""
+    return _AmortizationResult(
+        effective_principal=effective_principal,
+        balance=state.balance,
+        payments_made=state.payments_made,
+        interest_paid_total=state.interest_paid_total,
+        total_paid=state.total_paid,
+        last_payment_date=repayment_items[-1].transaction_date if repayment_items else None,
+        linked_payments=tuple(reversed(state.repayment_entries)),
+        disbursements=tuple(reversed(state.disbursement_entries)),
+    )
+
+
 def _replay_lent_with_disbursements(
     params: _LoanParams,
     repayment_items: list[_LoanLedgerItem],
@@ -479,48 +602,13 @@ def _replay_lent_with_disbursements(
         *((False, item) for item in repayment_items),
     ]
     events.sort(key=lambda pair: (*_ledger_sort_key(pair[1]), 0 if pair[0] else 1))
-
-    balance = 0.0
-    disbursement_total = 0.0
-    payments_made = 0
-    interest_paid_total = 0.0
-    total_paid = 0.0
-    repayment_entries: list[LoanPaymentSnapshot] = []
-    disbursement_entries: list[LoanPaymentSnapshot] = []
-
+    state = _ReplayState(balance=0.0)
     for is_disbursement, item in events:
         if is_disbursement:
-            applied = _item_applied_amount(item, params.currency, db=db, fetcher=fetcher)
-            balance += applied
-            disbursement_total += applied
-            disbursement_entries.append(
-                _build_payment_snapshot(
-                    item,
-                    applied_amount=applied,
-                    entry_type="disbursement",
-                    loan_currency=params.currency,
-                )
-            )
-            continue
-
-        balance, interest, applied, snapshot = _apply_repayment_step(
-            item, balance, params, db=db, fetcher=fetcher
-        )
-        interest_paid_total += interest
-        total_paid += applied
-        payments_made += 1
-        repayment_entries.append(snapshot)
-
-    return _AmortizationResult(
-        effective_principal=round(disbursement_total, 2),
-        balance=balance,
-        payments_made=payments_made,
-        interest_paid_total=interest_paid_total,
-        total_paid=total_paid,
-        last_payment_date=repayment_items[-1].transaction_date if repayment_items else None,
-        linked_payments=tuple(reversed(repayment_entries)),
-        disbursements=tuple(reversed(disbursement_entries)),
-    )
+            _record_disbursement(state, item, params, db=db, fetcher=fetcher)
+        else:
+            _record_repayment(state, item, params, db=db, fetcher=fetcher)
+    return _finalize_amortization(state, round(state.disbursement_total, 2), repayment_items)
 
 
 def _replay_standard_repayments(
@@ -531,30 +619,22 @@ def _replay_standard_repayments(
     fetcher: FxRateFetcher,
 ) -> _AmortizationResult:
     """Replay chronological repayments starting from declared principal."""
-    balance = params.principal
-    payments_made = 0
-    interest_paid_total = 0.0
-    total_paid = 0.0
-    repayment_entries: list[LoanPaymentSnapshot] = []
-
+    state = _ReplayState(balance=params.principal)
     for item in repayment_items:
-        balance, interest, applied, snapshot = _apply_repayment_step(
-            item, balance, params, db=db, fetcher=fetcher
-        )
-        interest_paid_total += interest
-        total_paid += applied
-        payments_made += 1
-        repayment_entries.append(snapshot)
+        _record_repayment(state, item, params, db=db, fetcher=fetcher)
+    return _finalize_amortization(state, params.principal, repayment_items)
 
-    return _AmortizationResult(
-        effective_principal=params.principal,
-        balance=balance,
-        payments_made=payments_made,
-        interest_paid_total=interest_paid_total,
-        total_paid=total_paid,
-        last_payment_date=repayment_items[-1].transaction_date if repayment_items else None,
-        linked_payments=tuple(reversed(repayment_entries)),
-        disbursements=(),
+
+def _open_term_schedule_projection(amortization: _AmortizationResult) -> _ScheduleProjection:
+    """Return schedule projection for an open-term lent loan (term == 0)."""
+    payoff_date = amortization.last_payment_date if amortization.balance <= 0.0 else None
+    return _ScheduleProjection(
+        payments_remaining=0,
+        next_payment_date=None,
+        is_payment_due=False,
+        payoff_date=payoff_date,
+        remaining_interest=0.0,
+        weekly_payment_equivalent=0.0,
     )
 
 
@@ -565,31 +645,17 @@ def _compute_schedule_projection(
 ) -> _ScheduleProjection:
     """Compute remaining payments, next due date, payoff date, and weekly equivalent."""
     if params.loan_type == "lent" and params.term == 0:
-        payoff_date = (
-            amortization.last_payment_date if amortization.balance <= 0.0 else None
-        )
-        return _ScheduleProjection(
-            payments_remaining=0,
-            next_payment_date=None,
-            is_payment_due=False,
-            payoff_date=payoff_date,
-            remaining_interest=0.0,
-            weekly_payment_equivalent=0.0,
-        )
+        return _open_term_schedule_projection(amortization)
 
     remaining_principal = round(amortization.balance, 2)
     payments_remaining = (
         0 if amortization.balance <= 0.0 else max(0, params.term - amortization.payments_made)
     )
     next_payment_date = (
-        add_months(params.start_date, amortization.payments_made)
-        if payments_remaining > 0
-        else None
+        add_months(params.start_date, amortization.payments_made) if payments_remaining > 0 else None
     )
     is_payment_due = bool(
-        payments_remaining > 0
-        and next_payment_date is not None
-        and next_payment_date <= as_of
+        payments_remaining > 0 and next_payment_date is not None and next_payment_date <= as_of
     )
     payoff_date = (
         amortization.last_payment_date
@@ -597,14 +663,9 @@ def _compute_schedule_projection(
         else add_months(params.start_date, max(0, params.term - 1))
     )
     remaining_interest = round(
-        max(0.0, (params.monthly_payment * payments_remaining) - remaining_principal),
-        2,
+        max(0.0, (params.monthly_payment * payments_remaining) - remaining_principal), 2
     )
-    weekly_equiv = (
-        round(params.monthly_payment * 12.0 / 52.0, 2)
-        if payments_remaining > 0
-        else 0.0
-    )
+    weekly_equiv = round(params.monthly_payment * 12.0 / 52.0, 2) if payments_remaining > 0 else 0.0
     return _ScheduleProjection(
         payments_remaining=payments_remaining,
         next_payment_date=next_payment_date,
@@ -612,6 +673,43 @@ def _compute_schedule_projection(
         payoff_date=payoff_date,
         remaining_interest=remaining_interest,
         weekly_payment_equivalent=weekly_equiv,
+    )
+
+
+def _build_loan_status_snapshot(
+    params: _LoanParams,
+    amortization: _AmortizationResult,
+    schedule: _ScheduleProjection,
+) -> LoanStatusSnapshot:
+    """Assemble an immutable LoanStatusSnapshot from replay and schedule outputs."""
+    remaining_principal = round(amortization.balance, 2)
+    principal_paid = round(max(0.0, amortization.effective_principal - remaining_principal), 2)
+    net_worth_impact = (
+        0.0
+        if params.loan_type == "lent"
+        else round((params.asset_value or 0.0) - remaining_principal, 2)
+    )
+    return LoanStatusSnapshot(
+        id=params.loan_id, name=params.name, lender=params.lender,
+        loan_type=params.loan_type, principal_amount=amortization.effective_principal,
+        annual_interest_rate=params.annual_rate, term_months=params.term,
+        monthly_payment=params.monthly_payment, start_date=params.start_date,
+        asset_value=params.asset_value, currency=params.currency,
+        notes=params.notes, is_active=params.is_active,
+        payments_made=amortization.payments_made,
+        payments_remaining=schedule.payments_remaining,
+        payoff_date=schedule.payoff_date,
+        next_payment_date=schedule.next_payment_date,
+        remaining_principal=remaining_principal, principal_paid=principal_paid,
+        total_paid_amount=round(amortization.total_paid, 2),
+        interest_paid=round(amortization.interest_paid_total, 2),
+        remaining_interest=schedule.remaining_interest,
+        weekly_payment_equivalent=schedule.weekly_payment_equivalent,
+        net_worth_impact=net_worth_impact,
+        last_payment_date=amortization.last_payment_date,
+        is_payment_due=schedule.is_payment_due,
+        linked_payments=amortization.linked_payments,
+        disbursements=amortization.disbursements,
     )
 
 
@@ -625,71 +723,48 @@ def compute_loan_status(
 ) -> LoanStatusSnapshot:
     """Compute detached loan amortization, payment countdown, and net worth impact."""
     params = _extract_loan_params(loan)
-    ledger_items = _extract_ledger_items(loan, linked_transactions)
     repayment_items, disbursement_items = _partition_ledger_items(
-        ledger_items, params.loan_type
+        _extract_ledger_items(loan, linked_transactions), params.loan_type
     )
-
-    fetcher_ctx = (
-        nullcontext(fetcher)
-        if fetcher is not None
-        else HttpFxRateFetcher(wise_api_token=settings.wise_api_token)
-    )
-    with fetcher_ctx as active_fetcher:
+    with _resolve_fetcher_context(fetcher) as active_fetcher:
         if params.loan_type == "lent" and disbursement_items:
             amortization = _replay_lent_with_disbursements(
-                params,
-                repayment_items,
-                disbursement_items,
-                db=db,
-                fetcher=active_fetcher,
+                params, repayment_items, disbursement_items, db=db, fetcher=active_fetcher
             )
         else:
             amortization = _replay_standard_repayments(
-                params,
-                repayment_items,
-                db=db,
-                fetcher=active_fetcher,
+                params, repayment_items, db=db, fetcher=active_fetcher
             )
-
     schedule = _compute_schedule_projection(params, amortization, as_of)
-    remaining_principal = round(amortization.balance, 2)
-    principal_paid = round(max(0.0, amortization.effective_principal - remaining_principal), 2)
-    net_worth_impact = (
-        0.0
-        if params.loan_type == "lent"
-        else round((params.asset_value or 0.0) - remaining_principal, 2)
-    )
+    return _build_loan_status_snapshot(params, amortization, schedule)
 
-    return LoanStatusSnapshot(
-        id=params.loan_id,
-        name=params.name,
-        lender=params.lender,
-        loan_type=params.loan_type,
-        principal_amount=amortization.effective_principal,
-        annual_interest_rate=params.annual_rate,
-        term_months=params.term,
-        monthly_payment=params.monthly_payment,
-        start_date=params.start_date,
-        asset_value=params.asset_value,
-        currency=params.currency,
-        notes=params.notes,
-        is_active=params.is_active,
-        payments_made=amortization.payments_made,
-        payments_remaining=schedule.payments_remaining,
-        payoff_date=schedule.payoff_date,
-        next_payment_date=schedule.next_payment_date,
-        remaining_principal=remaining_principal,
-        principal_paid=principal_paid,
-        total_paid_amount=round(amortization.total_paid, 2),
-        interest_paid=round(amortization.interest_paid_total, 2),
-        remaining_interest=schedule.remaining_interest,
-        weekly_payment_equivalent=schedule.weekly_payment_equivalent,
-        net_worth_impact=net_worth_impact,
-        last_payment_date=amortization.last_payment_date,
-        is_payment_due=schedule.is_payment_due,
-        linked_payments=amortization.linked_payments,
-        disbursements=amortization.disbursements,
+
+def _build_portfolio_summary(items: tuple[LoanStatusSnapshot, ...]) -> LoanPortfolioSummary:
+    """Aggregate detached active loan snapshots into a LoanPortfolioSummary."""
+    borrowed = tuple(item for item in items if item.loan_type == "borrowed")
+    total_liabilities = round(sum(item.remaining_principal for item in borrowed), 2)
+    total_receivables = round(
+        sum(item.remaining_principal for item in items if item.loan_type == "lent"), 2
+    )
+    total_asset_value = round(sum(item.asset_value or 0.0 for item in borrowed), 2)
+    total_monthly = round(
+        sum(item.monthly_payment for item in borrowed if item.payments_remaining > 0), 2
+    )
+    total_weekly = round(sum(item.weekly_payment_equivalent for item in borrowed), 2)
+    payoff_dates = [
+        item.payoff_date
+        for item in borrowed
+        if item.payments_remaining > 0 and item.payoff_date is not None
+    ]
+    return LoanPortfolioSummary(
+        loans=items,
+        total_liabilities=total_liabilities,
+        total_receivables=total_receivables,
+        total_asset_value=total_asset_value,
+        net_loan_impact=round(total_asset_value - total_liabilities, 2),
+        total_monthly_payment=total_monthly,
+        total_weekly_payment=total_weekly,
+        latest_payoff_date=max(payoff_dates) if payoff_dates else None,
     )
 
 
@@ -701,50 +776,163 @@ def summarize_loans(
     fetcher: Optional[FxRateFetcher] = None,
 ) -> LoanPortfolioSummary:
     """Compute detached individual loan snapshots and active portfolio rollups."""
-    fetcher_ctx = (
-        nullcontext(fetcher)
-        if fetcher is not None
-        else HttpFxRateFetcher(wise_api_token=settings.wise_api_token)
-    )
-    with fetcher_ctx as active_fetcher:
+    with _resolve_fetcher_context(fetcher) as active_fetcher:
         items = tuple(
             compute_loan_status(loan, as_of, db=db, fetcher=active_fetcher)
             for loan in loans
             if loan.is_active
         )
+    return _build_portfolio_summary(items)
 
-    borrowed_items = tuple(item for item in items if item.loan_type == "borrowed")
-    total_liabilities = round(sum(item.remaining_principal for item in borrowed_items), 2)
-    total_receivables = round(
-        sum(item.remaining_principal for item in items if item.loan_type == "lent"),
-        2,
-    )
-    total_asset_value = round(sum(item.asset_value or 0.0 for item in borrowed_items), 2)
-    total_monthly_payment = round(
-        sum(item.monthly_payment for item in borrowed_items if item.payments_remaining > 0),
-        2,
-    )
-    total_weekly_payment = round(
-        sum(item.weekly_payment_equivalent for item in borrowed_items),
-        2,
-    )
-    payoff_dates = [
-        item.payoff_date
-        for item in borrowed_items
-        if item.payments_remaining > 0 and item.payoff_date is not None
-    ]
-    latest_payoff = max(payoff_dates) if payoff_dates else None
 
-    return LoanPortfolioSummary(
-        loans=items,
-        total_liabilities=total_liabilities,
-        total_receivables=total_receivables,
-        total_asset_value=total_asset_value,
-        net_loan_impact=round(total_asset_value - total_liabilities, 2),
-        total_monthly_payment=total_monthly_payment,
-        total_weekly_payment=total_weekly_payment,
-        latest_payoff_date=latest_payoff,
+def _normalize_loan_type(value: Any) -> str:
+    """Normalize and validate a loan_type string against allowed values."""
+    if not isinstance(value, str):
+        raise LoanValidationError("loan_type must be 'borrowed' or 'lent'.")
+    normalized = value.strip().lower()
+    if normalized not in _VALID_LOAN_TYPES:
+        raise LoanValidationError("loan_type must be 'borrowed' or 'lent'.")
+    return normalized
+
+
+def _validate_loan_invariants(
+    *,
+    name: str,
+    lender: str,
+    loan_type: str,
+    principal_amount: float,
+    annual_interest_rate: float,
+    term_months: int,
+    monthly_payment: float,
+    asset_value: Optional[float],
+) -> None:
+    """Enforce core loan domain invariants before persisting or mutating ORM state."""
+    if not isinstance(name, str) or not name.strip():
+        raise LoanValidationError("name must not be blank.")
+    if not isinstance(lender, str) or not lender.strip():
+        raise LoanValidationError("lender must not be blank.")
+    if loan_type not in _VALID_LOAN_TYPES:
+        raise LoanValidationError("loan_type must be 'borrowed' or 'lent'.")
+    if principal_amount <= 0.0:
+        raise LoanValidationError("principal_amount must be > 0.")
+    if annual_interest_rate < 0.0 or annual_interest_rate > 1.0:
+        raise LoanValidationError("annual_interest_rate must be between 0 and 1.")
+    if term_months < 0 or term_months > 600:
+        raise LoanValidationError("term_months must be between 0 and 600.")
+    if monthly_payment < 0.0:
+        raise LoanValidationError("monthly_payment must be >= 0.")
+    if asset_value is not None and asset_value < 0.0:
+        raise LoanValidationError("asset_value must be >= 0.")
+    if loan_type == "borrowed" and (int(term_months) < 1 or float(monthly_payment) <= 0.0):
+        raise LoanValidationError(
+            "Borrowed loans require term_months >= 1 and monthly_payment > 0."
+        )
+
+
+def _prepare_loan_updates(loan: Loan, updates: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate and stage partial loan updates without mutating the ORM instance."""
+    unknown_keys = sorted(set(updates.keys()) - _ALLOWED_UPDATE_FIELDS)
+    if unknown_keys:
+        raise LoanValidationError(
+            f"Unsupported loan update field(s): {', '.join(unknown_keys)}."
+        )
+    staged: dict[str, Any] = {}
+    for field_name, raw_value in updates.items():
+        if field_name in _NON_NULLABLE_UPDATE_FIELDS and raw_value is None:
+            raise LoanValidationError(f"{field_name} cannot be null.")
+        if field_name == "loan_type":
+            staged[field_name] = _normalize_loan_type(raw_value)
+        elif isinstance(raw_value, str):
+            staged[field_name] = raw_value.strip()
+        else:
+            staged[field_name] = raw_value
+
+    merged_asset = (
+        staged["asset_value"]
+        if "asset_value" in staged
+        else (float(loan.asset_value) if loan.asset_value is not None else None)
     )
+    _validate_loan_invariants(
+        name=staged.get("name", loan.name),
+        lender=staged.get("lender", loan.lender),
+        loan_type=staged.get("loan_type", _normalize_loan_type(loan.loan_type)),
+        principal_amount=float(staged.get("principal_amount", loan.principal_amount)),
+        annual_interest_rate=float(staged.get("annual_interest_rate", loan.annual_interest_rate)),
+        term_months=int(staged.get("term_months", loan.term_months)),
+        monthly_payment=float(staged.get("monthly_payment", loan.monthly_payment)),
+        asset_value=float(merged_asset) if merged_asset is not None else None,
+    )
+    return staged
+
+
+def create_loan(
+    db: Session,
+    data: LoanCreateInput,
+    *,
+    as_of: Optional[date] = None,
+    fetcher: Optional[FxRateFetcher] = None,
+) -> LoanStatusSnapshot:
+    """Validate, persist, and return a detached status snapshot for a new loan."""
+    name = data.name.strip() if isinstance(data.name, str) else ""
+    lender = data.lender.strip() if isinstance(data.lender, str) else ""
+    notes = data.notes.strip() if isinstance(data.notes, str) else None
+    currency = (data.currency or "").strip().upper()[:3] or "NZD"
+    loan_type = _normalize_loan_type(data.loan_type)
+    _validate_loan_invariants(
+        name=name,
+        lender=lender,
+        loan_type=loan_type,
+        principal_amount=float(data.principal_amount),
+        annual_interest_rate=float(data.annual_interest_rate),
+        term_months=int(data.term_months),
+        monthly_payment=float(data.monthly_payment),
+        asset_value=float(data.asset_value) if data.asset_value is not None else None,
+    )
+    loan = Loan(
+        name=name, lender=lender, loan_type=loan_type,
+        principal_amount=data.principal_amount,
+        annual_interest_rate=data.annual_interest_rate,
+        term_months=data.term_months, monthly_payment=data.monthly_payment,
+        start_date=data.start_date, asset_value=data.asset_value,
+        currency=currency, notes=notes, is_active=data.is_active,
+    )
+    db.add(loan)
+    db.commit()
+    snapshot = get_loan_status(db, loan.id, as_of=as_of, fetcher=fetcher)
+    if snapshot is None:
+        raise LoanNotFoundError("Loan not found")
+    return snapshot
+
+
+def update_loan(
+    db: Session,
+    loan_id: int,
+    updates: Mapping[str, Any],
+    *,
+    as_of: Optional[date] = None,
+    fetcher: Optional[FxRateFetcher] = None,
+) -> LoanStatusSnapshot:
+    """Validate and apply partial updates to an existing loan, returning its snapshot."""
+    loan = db.get(Loan, loan_id)
+    if loan is None:
+        raise LoanNotFoundError("Loan not found")
+    staged = _prepare_loan_updates(loan, updates)
+    for field_name, value in staged.items():
+        setattr(loan, field_name, value)
+    db.commit()
+    snapshot = get_loan_status(db, loan.id, as_of=as_of, fetcher=fetcher)
+    if snapshot is None:
+        raise LoanNotFoundError("Loan not found")
+    return snapshot
+
+
+def delete_loan(db: Session, loan_id: int) -> None:
+    """Delete an existing loan record or raise LoanNotFoundError."""
+    loan = db.get(Loan, loan_id)
+    if loan is None:
+        raise LoanNotFoundError("Loan not found")
+    db.delete(loan)
+    db.commit()
 
 
 def get_loan_status(
