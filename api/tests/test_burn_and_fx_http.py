@@ -31,7 +31,7 @@ class StubFxFetcher:
         return (rate, "stub") if rate is not None else None
 
 
-class TestBurnService(unittest.TestCase):
+class TestBurnAndFxHttpContracts(unittest.TestCase):
     def setUp(self):
         self.engine = create_engine(
             "sqlite:///:memory:",

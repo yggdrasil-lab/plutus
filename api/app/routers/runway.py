@@ -18,15 +18,7 @@ from app.schemas import (
 from app.services.ai_gateway import AiGateway, get_ai_gateway
 from app.services.category_taxonomy import get_active_categories
 from app.services.llm_synthesizer import synthesize_runway_scenario_llm
-from app.services.loan_service import get_loan_portfolio_summary
-from app.services.runway import (
-    BASELINE_ANNUAL_RETURN,
-    calculate_compounding_runway,
-    calculate_emergency_runway,
-    get_balance_tier_snapshot,
-    get_runway_snapshot,
-)
-from app.services.spending_projection import project_burn
+from app.services.runway import get_runway_snapshot, simulate_runway_scenario
 
 router = APIRouter(prefix="/runway", tags=["Runway & Freedom Clock"])
 
@@ -35,7 +27,7 @@ router = APIRouter(prefix="/runway", tags=["Runway & Freedom Clock"])
 def get_current_runway(
     as_of: Optional[date] = Query(default=None),
     annual_return: Optional[float] = Query(
-        default=BASELINE_ANNUAL_RETURN,
+        default=None,
         ge=0.0,
         le=0.3,
         description="Real annual expected return",
@@ -43,8 +35,7 @@ def get_current_runway(
     db: Session = Depends(get_db),
 ):
     """Calculate current financial runway in weeks based on asset balances, burn rate, and growth."""
-    expected_return = annual_return if annual_return is not None else BASELINE_ANNUAL_RETURN
-    snapshot = get_runway_snapshot(db, as_of=as_of, annual_return=expected_return)
+    snapshot = get_runway_snapshot(db, as_of=as_of, annual_return=annual_return)
     breakdown = RunwayTierBreakdown(
         cash_balance=snapshot.cash_balance,
         growth_balance=snapshot.growth_balance,
@@ -77,60 +68,27 @@ def get_current_runway(
 
 
 @router.post("/simulate", response_model=RunwayScenarioResponse)
-def simulate_runway_scenario(
+def simulate_runway_scenario_endpoint(
     payload: RunwayScenarioRequest,
     db: Session = Depends(get_db),
 ):
     """Simulate what-if changes to weekly burn rate, expected growth, or lump sum capital."""
-    today = date.today()
-    balances = get_balance_tier_snapshot(db)
-    weekly_burn = project_burn(db, reference_date=today).effective_weekly_burn
-
-    baseline_liquid = balances.total_liquid_balance
-    locked_bal = balances.locked_balance
-    loan_summary = get_loan_portfolio_summary(db, as_of=today)
-    total_liabilities = loan_summary.total_liabilities
-    loan_weekly_relief = loan_summary.total_weekly_payment
-
-    baseline_weeks, baseline_perpetual = calculate_compounding_runway(
-        accessible_assets=baseline_liquid,
-        weekly_burn=weekly_burn,
-        annual_real_return=BASELINE_ANNUAL_RETURN,
+    simulation = simulate_runway_scenario(
+        db,
+        weekly_burn_adjustment=payload.weekly_burn_adjustment,
+        custom_annual_return=payload.custom_annual_return,
+        lump_sum_adjustment=payload.lump_sum_adjustment,
+        pay_off_loans=payload.pay_off_loans,
     )
-
-    burn_delta = payload.weekly_burn_adjustment - (loan_weekly_relief if payload.pay_off_loans else 0.0)
-    liquid_delta = payload.lump_sum_adjustment - (total_liabilities if payload.pay_off_loans else 0.0)
-    simulated_burn = max(1.0, weekly_burn + burn_delta)
-    simulated_liquid = max(0.0, baseline_liquid + liquid_delta)
-    simulated_return = (
-        payload.custom_annual_return
-        if payload.custom_annual_return is not None
-        else BASELINE_ANNUAL_RETURN
-    )
-
-    sim_weeks, is_perpetual = calculate_compounding_runway(
-        accessible_assets=simulated_liquid,
-        weekly_burn=simulated_burn,
-        annual_real_return=simulated_return,
-    )
-    sim_years = round(sim_weeks / 52.0, 2) if sim_weeks is not None else None
-
-    delta_weeks: Optional[float] = None
-    if not is_perpetual and not baseline_perpetual and sim_weeks is not None and baseline_weeks is not None:
-        delta_weeks = round(sim_weeks - baseline_weeks, 2)
-
-    remaining_liabilities = 0.0 if payload.pay_off_loans else total_liabilities
-    simulated_net_worth = round(simulated_liquid + locked_bal - remaining_liabilities, 2)
-
     return RunwayScenarioResponse(
-        simulated_runway_weeks=sim_weeks,
-        simulated_runway_years=sim_years,
-        is_perpetual=is_perpetual,
-        delta_weeks_compared_to_baseline=delta_weeks,
-        loan_free_date=loan_summary.latest_payoff_date,
-        loan_weekly_relief=loan_weekly_relief,
-        total_liabilities=remaining_liabilities,
-        simulated_net_worth=simulated_net_worth,
+        simulated_runway_weeks=simulation.simulated_runway_weeks,
+        simulated_runway_years=simulation.simulated_runway_years,
+        is_perpetual=simulation.is_perpetual,
+        delta_weeks_compared_to_baseline=simulation.delta_weeks_compared_to_baseline,
+        loan_free_date=simulation.loan_free_date,
+        loan_weekly_relief=simulation.loan_weekly_relief,
+        total_liabilities=simulation.remaining_liabilities,
+        simulated_net_worth=simulation.simulated_net_worth,
     )
 
 
@@ -141,33 +99,15 @@ def trigger_runway_synthesis(
     ai_gateway: AiGateway = Depends(get_ai_gateway),
 ):
     """Force on-demand research-grounded AI synthesis of financial freedom scenario and recommendations."""
-    balances = get_balance_tier_snapshot(db)
-    weekly_burn = project_burn(db, reference_date=date.today()).effective_weekly_burn
-    cash_bal = balances.cash_balance
-    growth_bal = balances.growth_balance
-    locked_bal = balances.locked_balance
-    total_liquid = balances.total_liquid_balance
-    emergency_weeks = calculate_emergency_runway(cash_bal, weekly_burn)
-    growth_weeks, is_perpetual = calculate_compounding_runway(
-        accessible_assets=total_liquid,
-        weekly_burn=weekly_burn,
-        annual_real_return=BASELINE_ANNUAL_RETURN,
+    simulation = simulate_runway_scenario(
+        db,
+        weekly_burn_adjustment=payload.weekly_burn_adjustment,
+        custom_annual_return=payload.custom_annual_return,
+        lump_sum_adjustment=payload.lump_sum_adjustment,
+        pay_off_loans=payload.pay_off_loans,
     )
-    runway_telemetry = {
-        "cash_balance": cash_bal,
-        "growth_balance": growth_bal,
-        "locked_balance": locked_bal,
-        "total_liquid_balance": total_liquid,
-        "weekly_burn_rate": weekly_burn,
-        "emergency_weeks": emergency_weeks,
-        "growth_weeks": growth_weeks,
-        "is_perpetual": is_perpetual,
-    }
     return synthesize_runway_scenario_llm(
-        runway_data=runway_telemetry,
-        burn_adjustment=payload.weekly_burn_adjustment,
-        annual_return=payload.custom_annual_return,
-        lump_sum=payload.lump_sum_adjustment,
+        simulation,
         custom_context=payload.custom_context,
         gateway=ai_gateway,
     )

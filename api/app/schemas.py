@@ -960,6 +960,7 @@ class RunwaySynthesizeRequest(BaseModel):
     weekly_burn_adjustment: float = Field(default=0.0, description="Proposed adjustment in $/week")
     custom_annual_return: Optional[float] = Field(default=None, ge=0.0, le=0.5, description="Custom real return rate")
     lump_sum_adjustment: float = Field(default=0.0, description="One-time asset injection or withdrawal")
+    pay_off_loans: bool = Field(default=False, description="Simulate paying off active loans from liquid assets")
     custom_context: Optional[str] = Field(default=None, description="User notes, lifestyle shifts, or sabbatical goals")
 
 
