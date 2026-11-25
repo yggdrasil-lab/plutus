@@ -25,13 +25,14 @@ from app.services.fx_service import FxRateFetcher, HttpFxRateFetcher, get_exchan
 from app.services.jev_client import classify_transaction_jev_with_tags, get_extra_jev_categories
 from app.services.ledger_entry import (
     collect_existing_tags,
+    generate_transaction_hash,
     normalize_tags,
     parse_rule_tags,
     strip_redundant_tags,
 )
 from app.services.receipt_ingestion import reconcile_unlinked_receipts
 from app.services.rules_engine import evaluate_rules
-from app.services.statement_parser import auto_categorize, generate_transaction_hash
+from app.services.statement_parser import auto_categorize
 from app.services.transfer_reconciliation import (
     apply_counterpart_account_for_rule,
     unlink_transfer_pair,

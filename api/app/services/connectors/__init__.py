@@ -7,3 +7,12 @@ class ConnectorConfigError(RuntimeError):
 
 class ConnectorUpstreamError(RuntimeError):
     """Raised when an upstream provider API returns an unexpected error."""
+
+
+from app.services.connectors.dates import parse_iso_date
+
+__all__ = [
+    "ConnectorConfigError",
+    "ConnectorUpstreamError",
+    "parse_iso_date",
+]

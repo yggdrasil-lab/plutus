@@ -15,6 +15,8 @@ from app.services.ledger_entry._types import (
     StatementUploadResult,
 )
 from app.services.statement_parser import (
+    PdfDocumentExtractor,
+    StatementParseError,
     StatementParseResult,
     parse_csv_statement,
     parse_pdf_statement,
@@ -204,21 +206,39 @@ def commit_parsed_statement(
     )
 
 
+def _parse_uploaded_statement(
+    filename: str,
+    payload: StatementUploadInput,
+    *,
+    pdf_extractor: Optional[PdfDocumentExtractor],
+) -> StatementParseResult:
+    """Parse uploaded PDF or CSV bytes and translate StatementParseError into HTTP 400 error."""
+    try:
+        if filename.endswith(".pdf"):
+            return parse_pdf_statement(
+                payload.content,
+                institution=payload.institution,
+                pdf_extractor=pdf_extractor,
+            )
+        if filename.endswith(".csv"):
+            text_content = payload.content.decode("utf-8", errors="replace")
+            return parse_csv_statement(text_content, institution=payload.institution)
+    except StatementParseError as exc:
+        raise LedgerEntryBadRequestError(str(exc)) from exc
+    raise LedgerEntryBadRequestError(
+        "Unsupported file format. Please upload a .pdf or .csv statement."
+    )
+
+
 def process_statement_upload(
     db: Session,
     payload: StatementUploadInput,
+    *,
+    pdf_extractor: Optional[PdfDocumentExtractor] = None,
 ) -> StatementUploadResult:
     """Parse a PDF or CSV statement upload, apply overrides, and optionally commit to the ledger."""
     filename = (payload.filename or "").lower()
-    if filename.endswith(".pdf"):
-        parse_result = parse_pdf_statement(payload.content, institution=payload.institution)
-    elif filename.endswith(".csv"):
-        text_content = payload.content.decode("utf-8", errors="replace")
-        parse_result = parse_csv_statement(text_content, institution=payload.institution)
-    else:
-        raise LedgerEntryBadRequestError(
-            "Unsupported file format. Please upload a .pdf or .csv statement."
-        )
+    parse_result = _parse_uploaded_statement(filename, payload, pdf_extractor=pdf_extractor)
 
     if payload.closing_balance is not None:
         parse_result.closing_balance = payload.closing_balance

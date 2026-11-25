@@ -3,16 +3,19 @@
 # ============================================================================
 # 1. IMPORTS & CONSTANTS
 # ============================================================================
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from typing import Optional
-from zoneinfo import ZoneInfo
 
 import httpx
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.schemas import SyncResult
-from app.services.connectors import ConnectorConfigError, ConnectorUpstreamError
+from app.services.connectors import (
+    ConnectorConfigError,
+    ConnectorUpstreamError,
+    parse_iso_date,
+)
 from app.services.ingestion_service import (
     BankFeedGateway,
     ExternalAccountSpec,
@@ -141,16 +144,6 @@ class HttpWiseGateway:
 # ============================================================================
 # 3. PURE NORMALIZERS (Zero I/O)
 # ============================================================================
-def _parse_iso_date(value: Optional[str]) -> date:
-    """Parse Wise ISO-8601 UTC timestamp into the configured local date (e.g. Pacific/Auckland)."""
-    if not value:
-        return datetime.now(ZoneInfo(settings.timezone)).date()
-    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if dt.tzinfo is not None:
-        dt = dt.astimezone(ZoneInfo(settings.timezone))
-    return dt.date()
-
-
 def _extract_wise_merchant(tx: dict) -> tuple[str, str]:
     """Extract (merchant, raw_description) from a Wise statement transaction."""
     details = tx.get("details") or {}
@@ -212,7 +205,7 @@ def normalize_wise_feed(
         )
         txs.append(
             NormalizedTx(
-                transaction_date=_parse_iso_date(tx.get("date")),
+                transaction_date=parse_iso_date(tx.get("date")),
                 amount=float(tx_amount),
                 currency=tx_currency,
                 merchant=merchant,
