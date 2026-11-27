@@ -43,6 +43,8 @@ class StatementParseResult:
     end_date: Optional[date] = None
     opening_balance: Optional[float] = None
     closing_balance: Optional[float] = None
+    closing_balance_is_credit: bool = False
+    account_type: Optional[str] = None
     currency: str = "NZD"
 
 

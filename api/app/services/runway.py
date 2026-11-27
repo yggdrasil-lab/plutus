@@ -1,7 +1,7 @@
 """Financial runway, batched balance-tier snapshot, and unified telemetry engine."""
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import date
 import math
 from typing import Any, Optional
@@ -11,6 +11,13 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models import Account, AssetSnapshot
+from app.schemas.accounts import REVOLVING_CREDIT_ACCOUNT_TYPES
+from app.services.credit_telemetry import (
+    CreditFxResolutionError,
+    compute_account_credit_telemetry,
+    is_revolving_credit_with_limit,
+    resolve_credit_fx_rate,
+)
 from app.services.loan_service import get_loan_portfolio_summary
 from app.services.spending_projection import BurnProjection, project_burn
 
@@ -52,6 +59,32 @@ class AccountBalanceSnapshot:
 
 
 @dataclass(frozen=True)
+class CreditBackstopSnapshot:
+    """Detached, immutable revolving credit limit and emergency backstop telemetry in NZD."""
+
+    total_credit_limit_nzd: float = 0.0
+    total_credit_owed_nzd: float = 0.0
+    total_available_credit_nzd: float = 0.0
+    credit_utilization_pct: float = 0.0
+    backstop_weeks: float = 0.0
+    credit_card_available_nzd: float = 0.0
+    credit_line_available_nzd: float = 0.0
+    account_count: int = 0
+
+    def as_dict(self) -> dict[str, float | int]:
+        return {
+            "total_credit_limit_nzd": self.total_credit_limit_nzd,
+            "total_credit_owed_nzd": self.total_credit_owed_nzd,
+            "total_available_credit_nzd": self.total_available_credit_nzd,
+            "credit_utilization_pct": self.credit_utilization_pct,
+            "backstop_weeks": self.backstop_weeks,
+            "credit_card_available_nzd": self.credit_card_available_nzd,
+            "credit_line_available_nzd": self.credit_line_available_nzd,
+            "account_count": self.account_count,
+        }
+
+
+@dataclass(frozen=True)
 class BalanceTierSnapshot:
     """Detached, immutable rollup of active account balances across liquidity tiers."""
 
@@ -61,6 +94,7 @@ class BalanceTierSnapshot:
     total_liquid_balance: float
     tier_labels: TierLabels
     accounts: tuple[AccountBalanceSnapshot, ...]
+    credit_backstop: CreditBackstopSnapshot = field(default_factory=CreditBackstopSnapshot)
 
 
 @dataclass(frozen=True)
@@ -94,6 +128,7 @@ class RunwaySnapshot:
     tier_labels: TierLabels
     loan_free_date: Optional[date] = None
     loan_weekly_relief: float = 0.0
+    credit_backstop: CreditBackstopSnapshot = field(default_factory=CreditBackstopSnapshot)
 
 
 @dataclass(frozen=True)
@@ -189,6 +224,7 @@ def get_balance_tier_snapshot(
         AssetSnapshot.snapshot_date,
         AssetSnapshot.balance,
         AssetSnapshot.balance_nzd,
+        AssetSnapshot.exchange_rate,
         func.row_number()
         .over(
             partition_by=AssetSnapshot.account_id,
@@ -207,9 +243,11 @@ def get_balance_tier_snapshot(
             Account.account_type.label("account_type"),
             Account.tier.label("tier"),
             Account.currency.label("currency"),
+            Account.credit_limit.label("credit_limit"),
             ranked_snapshots.c.snapshot_date.label("snapshot_date"),
             ranked_snapshots.c.balance.label("balance"),
             ranked_snapshots.c.balance_nzd.label("balance_nzd"),
+            ranked_snapshots.c.exchange_rate.label("exchange_rate"),
         )
         .select_from(Account)
         .outerjoin(
@@ -223,7 +261,7 @@ def get_balance_tier_snapshot(
         .order_by(Account.id)
     )
     rows = db.execute(stmt).all()
-    return _build_balance_tier_snapshot(rows)
+    return _build_balance_tier_snapshot(rows, db=db, rate_date=as_of or date.today())
 
 
 def get_runway_snapshot(
@@ -339,7 +377,7 @@ def _resolve_tier_labels(accounts: Sequence[AccountBalanceSnapshot]) -> TierLabe
     cash_names = [
         acc.account_name
         for acc in accounts
-        if acc.tier == "cash" and acc.account_type != "credit_card"
+        if acc.tier == "cash" and acc.account_type not in REVOLVING_CREDIT_ACCOUNT_TYPES
     ]
     growth_names = [acc.account_name for acc in accounts if acc.tier == "growth"]
     locked_names = [acc.account_name for acc in accounts if acc.tier == "locked"]
@@ -350,7 +388,89 @@ def _resolve_tier_labels(accounts: Sequence[AccountBalanceSnapshot]) -> TierLabe
     )
 
 
-def _build_balance_tier_snapshot(rows: Sequence[Any]) -> BalanceTierSnapshot:
+def _resolve_row_credit_fx(
+    row: Any,
+    *,
+    db: Optional[Session],
+    rate_date: date,
+    rate_cache: dict[tuple[str, date], Optional[float]],
+) -> float:
+    snap_fx = getattr(row, "exchange_rate", None)
+    if db is not None:
+        return resolve_credit_fx_rate(
+            db,
+            currency=str(row.currency),
+            rate_date=rate_date,
+            account_name=str(row.account_name),
+            snapshot_exchange_rate=snap_fx,
+            rate_cache=rate_cache,
+        )
+    if str(row.currency).strip().upper() == "NZD":
+        return 1.0
+    if snap_fx is not None and float(snap_fx) > 0.0 and float(snap_fx) != 1.0:
+        return float(snap_fx)
+    raise CreditFxResolutionError(f"Cannot resolve {row.currency}->NZD FX rate without DB session.")
+
+
+def _build_credit_backstop_snapshot(
+    rows: Sequence[Any],
+    *,
+    db: Optional[Session],
+    rate_date: date,
+) -> CreditBackstopSnapshot:
+    """Compute detached NZD credit backstop totals across active revolving credit accounts."""
+    limit_nzd_total = 0.0
+    owed_nzd_total = 0.0
+    available_nzd_total = 0.0
+    card_available_nzd = 0.0
+    line_available_nzd = 0.0
+    account_count = 0
+    rate_cache: dict[tuple[str, date], Optional[float]] = {}
+
+    for row in rows:
+        credit_limit = getattr(row, "credit_limit", None)
+        if not is_revolving_credit_with_limit(row.account_type, credit_limit):
+            continue
+        fx_rate = _resolve_row_credit_fx(row, db=db, rate_date=rate_date, rate_cache=rate_cache)
+        latest_balance = float(row.balance) if row.balance is not None else None
+        telemetry = compute_account_credit_telemetry(
+            account_type=str(row.account_type),
+            credit_limit=float(credit_limit),
+            latest_balance=latest_balance,
+            fx_rate=fx_rate,
+        )
+        if telemetry is None:
+            continue
+        account_count += 1
+        limit_nzd_total += telemetry.credit_limit_nzd
+        owed_nzd_total += telemetry.credit_owed_nzd
+        available_nzd_total += telemetry.available_credit_nzd
+        if str(row.account_type).strip().lower() == "credit_card":
+            card_available_nzd += telemetry.available_credit_nzd
+        else:
+            line_available_nzd += telemetry.available_credit_nzd
+
+    rounded_limit = round(limit_nzd_total, 2)
+    rounded_owed = round(owed_nzd_total, 2)
+    utilization_pct = round((rounded_owed / rounded_limit) * 100.0, 2) if rounded_limit > 0.0 else 0.0
+    return CreditBackstopSnapshot(
+        total_credit_limit_nzd=rounded_limit,
+        total_credit_owed_nzd=rounded_owed,
+        total_available_credit_nzd=round(available_nzd_total, 2),
+        credit_utilization_pct=utilization_pct,
+        backstop_weeks=0.0,
+        credit_card_available_nzd=round(card_available_nzd, 2),
+        credit_line_available_nzd=round(line_available_nzd, 2),
+        account_count=account_count,
+    )
+
+
+def _build_balance_tier_snapshot(
+    rows: Sequence[Any],
+    *,
+    db: Optional[Session] = None,
+    rate_date: Optional[date] = None,
+) -> BalanceTierSnapshot:
     """Materialize detached account snapshots, rounded tier totals, and display labels."""
     totals: dict[str, float] = {tier: 0.0 for tier in VALID_LIQUIDITY_TIERS}
     accounts: list[AccountBalanceSnapshot] = []
@@ -377,6 +497,11 @@ def _build_balance_tier_snapshot(rows: Sequence[Any]) -> BalanceTierSnapshot:
     locked_balance = round(totals["locked"], 2)
     total_liquid_balance = round(cash_balance + growth_balance, 2)
     account_tuple = tuple(accounts)
+    credit_backstop = _build_credit_backstop_snapshot(
+        rows,
+        db=db,
+        rate_date=rate_date or date.today(),
+    )
     return BalanceTierSnapshot(
         cash_balance=cash_balance,
         growth_balance=growth_balance,
@@ -384,6 +509,7 @@ def _build_balance_tier_snapshot(rows: Sequence[Any]) -> BalanceTierSnapshot:
         total_liquid_balance=total_liquid_balance,
         tier_labels=_resolve_tier_labels(account_tuple),
         accounts=account_tuple,
+        credit_backstop=credit_backstop,
     )
 
 
@@ -419,6 +545,12 @@ def _assemble_runway_snapshot(
         balances.total_liquid_balance + balances.locked_balance - total_liabilities, 2
     )
     time_banked = calculate_time_banked(burn.weekly_budget_target, burn.this_week_spend)
+    backstop_weeks = (
+        round(balances.credit_backstop.total_available_credit_nzd / weekly_burn, 1)
+        if weekly_burn > 0
+        else 0.0
+    )
+    credit_backstop = replace(balances.credit_backstop, backstop_weeks=backstop_weeks)
 
     return RunwaySnapshot(
         as_of_date=as_of_date,
@@ -448,4 +580,5 @@ def _assemble_runway_snapshot(
         tier_labels=balances.tier_labels,
         loan_free_date=loan_free_date,
         loan_weekly_relief=loan_weekly_relief,
+        credit_backstop=credit_backstop,
     )

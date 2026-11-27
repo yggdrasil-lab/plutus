@@ -2,6 +2,7 @@
 
 from ._common import RECURRENCE_CHOICES, normalize_recurrence, parse_tags_if_string
 from .accounts import (
+    REVOLVING_CREDIT_ACCOUNT_TYPES,
     VALID_ACCOUNT_TIERS,
     VALID_ACCOUNT_TYPES,
     AccountBase,
@@ -90,6 +91,7 @@ from .rules import (
     normalize_rule_direction,
 )
 from .runway import (
+    CreditBackstopSummary,
     RunwayAiSynthesisRead,
     RunwayResponse,
     RunwayScenarioRequest,
@@ -137,6 +139,7 @@ __all__ = [
     "ClassifyUncategorizedItem",
     "ClassifyUncategorizedRequest",
     "ClassifyUncategorizedResponse",
+    "CreditBackstopSummary",
     "DbsAlertPayload",
     "DbsAlertResult",
     "EmailAttachmentPayload",
@@ -162,6 +165,7 @@ __all__ = [
     "ProductUpdate",
     "QuickLogRequest",
     "RECURRENCE_CHOICES",
+    "REVOLVING_CREDIT_ACCOUNT_TYPES",
     "ReceiptBase",
     "ReceiptCreate",
     "ReceiptItemBase",

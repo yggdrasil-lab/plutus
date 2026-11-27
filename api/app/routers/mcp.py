@@ -21,6 +21,7 @@ from starlette.routing import Route
 from app.config import settings
 from app.models import Account, AssetSnapshot
 from app.services.ai_gateway import AiGateway
+from app.services.credit_telemetry import CreditFxResolutionError
 from app.services.ingestion_service import upsert_account_snapshot
 from app.services.ledger_entry import (
     MCP_EXPENSE_WRITE_POLICY,
@@ -77,11 +78,14 @@ def _run_plutus_get_runway(
 ) -> str:
     """Compute MCP runway summary JSON from the unified RunwaySnapshot service."""
     with _session_scope(db) as session:
-        snapshot = get_runway_snapshot(
-            session,
-            as_of=reference_date,
-            annual_return=annual_real_return,
-        )
+        try:
+            snapshot = get_runway_snapshot(
+                session,
+                as_of=reference_date,
+                annual_return=annual_real_return,
+            )
+        except CreditFxResolutionError as exc:
+            raise ToolError(str(exc)) from exc
         summary = {
             "as_of_date": snapshot.as_of_date.isoformat(),
             "primary_runway_weeks": (
@@ -114,6 +118,7 @@ def _run_plutus_get_runway(
                 "recurring_weekly_burn_nzd": snapshot.recurring_weekly_burn,
                 "this_week_variable_spend_nzd": snapshot.this_week_variable_spend,
                 "tier_labels": snapshot.tier_labels.as_dict(),
+                "credit_backstop": snapshot.credit_backstop.as_dict(),
             },
         }
         return json.dumps(summary, indent=2)

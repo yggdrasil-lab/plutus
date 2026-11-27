@@ -35,6 +35,7 @@ from app.schemas import (
     ClassifyUncategorizedItem,
     ClassifyUncategorizedRequest,
     ClassifyUncategorizedResponse,
+    CreditBackstopSummary,
     DbsAlertPayload,
     DbsAlertResult,
     EmailAttachmentPayload,
@@ -60,6 +61,7 @@ from app.schemas import (
     ProductUpdate,
     QuickLogRequest,
     RECURRENCE_CHOICES,
+    REVOLVING_CREDIT_ACCOUNT_TYPES,
     ReceiptBase,
     ReceiptCreate,
     ReceiptItemBase,
@@ -147,6 +149,7 @@ EXPECTED_PUBLIC_SYMBOLS = {
     "ClassifyUncategorizedItem",
     "ClassifyUncategorizedRequest",
     "ClassifyUncategorizedResponse",
+    "CreditBackstopSummary",
     "DbsAlertPayload",
     "DbsAlertResult",
     "EmailAttachmentPayload",
@@ -172,6 +175,7 @@ EXPECTED_PUBLIC_SYMBOLS = {
     "ProductUpdate",
     "QuickLogRequest",
     "RECURRENCE_CHOICES",
+    "REVOLVING_CREDIT_ACCOUNT_TYPES",
     "ReceiptBase",
     "ReceiptCreate",
     "ReceiptItemBase",
@@ -223,6 +227,7 @@ EXPECTED_PUBLIC_SYMBOLS = {
 SUBMODULE_SYMBOL_MAP = {
     accounts_mod: [
         "VALID_ACCOUNT_TYPES",
+        "REVOLVING_CREDIT_ACCOUNT_TYPES",
         "VALID_ACCOUNT_TIERS",
         "normalize_account_type",
         "normalize_account_tier",
@@ -306,6 +311,7 @@ SUBMODULE_SYMBOL_MAP = {
         "ProductStatisticsResponse",
     ],
     runway_mod: [
+        "CreditBackstopSummary",
         "RunwayTierBreakdown",
         "RunwayResponse",
         "RunwayScenarioRequest",

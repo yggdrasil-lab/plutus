@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import Account
+from app.schemas.accounts import REVOLVING_CREDIT_ACCOUNT_TYPES
 from app.services.ledger_entry._types import (
     LedgerEntryBadRequestError,
     StatementUploadInput,
@@ -79,7 +80,10 @@ def _create_statement_account(
 ) -> Account:
     """Create and persist a new Account derived from statement metadata and overrides."""
     resolved_tier = _resolve_account_tier(target_institution, tier)
-    resolved_type, expected_return = _resolve_type_and_return(resolved_tier, account_type)
+    resolved_type, expected_return = _resolve_type_and_return(
+        resolved_tier,
+        account_type or parse_result.account_type,
+    )
     resolved_name = account_name or (
         f"{target_institution} {parse_result.account_name}"
         if parse_result.account_name
@@ -186,11 +190,18 @@ def commit_parsed_statement(
     if parse_result.closing_balance is not None and parse_result.end_date is not None:
         normalized_filename = filename.lower()
         snap_source = "statement_pdf" if normalized_filename.endswith(".pdf") else "statement_csv"
+        closing_balance = float(parse_result.closing_balance)
+        if (
+            account.account_type in REVOLVING_CREDIT_ACCOUNT_TYPES
+            and closing_balance > 0.0
+            and not parse_result.closing_balance_is_credit
+        ):
+            closing_balance = -closing_balance
         upsert_account_snapshot(
             db,
             account=account,
             snapshot_date=parse_result.end_date,
-            balance=parse_result.closing_balance,
+            balance=closing_balance,
             currency=parse_result.currency,
             source=snap_source,
             notes=f"Auto-anchored from {normalized_filename}",
