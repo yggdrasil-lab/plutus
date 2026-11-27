@@ -35,6 +35,7 @@ from .categories import (
     CategoryUpdate,
     normalize_amortize_period,
 )
+from .fx import FxRateEntryRead, FxRatesRead
 from .integrations import (
     VALID_EMAIL_ROUTE_TARGETS,
     DbsAlertPayload,
@@ -139,6 +140,8 @@ __all__ = [
     "DbsAlertPayload",
     "DbsAlertResult",
     "EmailAttachmentPayload",
+    "FxRateEntryRead",
+    "FxRatesRead",
     "InboundEmailDispatchPayload",
     "InboundEmailDispatchResult",
     "InstitutionInfo",

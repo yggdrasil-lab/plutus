@@ -11,7 +11,7 @@ from fastapi import FastAPI
 
 from app.config import settings
 from app.db import SessionLocal
-from app.routers import accounts, budgets, categories, health, institutions, integrations, loans, mcp, products, receipts, rules, runway, transactions
+from app.routers import accounts, budgets, categories, fx, health, institutions, integrations, loans, mcp, products, receipts, rules, runway, transactions
 from app.services.ai_gateway import MuninnHttpAdapter
 from app.services.category_taxonomy import normalize_existing_legacy_categories
 from app.services.fx_repair import run_startup_fx_repairs
@@ -88,6 +88,7 @@ app.include_router(rules.router)
 app.include_router(receipts.router)
 app.include_router(products.router)
 app.include_router(runway.router)
+app.include_router(fx.router)
 app.include_router(integrations.router)
 
 
