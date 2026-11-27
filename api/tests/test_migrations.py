@@ -92,6 +92,7 @@ def test_alembic_upgrade_head_creates_loans_and_commits(tmp_path: Path, monkeypa
     assert "loan_payment_amount" in tx_columns
     assert "loan_type" in loan_columns
     assert "account_number_last4" in account_columns
+    assert "credit_limit" in account_columns
     assert "order_number" in receipt_columns
     assert "source_email_message_id" in receipt_columns
     assert "document_type" in receipt_columns
@@ -120,7 +121,7 @@ def test_alembic_upgrade_head_creates_loans_and_commits(tmp_path: Path, monkeypa
         "created_at",
     }.issubset(split_columns)
     assert version is not None
-    assert version[0] == "0021_receipt_document_type"
+    assert version[0] == "0022_account_credit_limit"
 
     parent_by_name = {name: parent for name, parent, _ in seeded_categories}
     system_by_name = {name: bool(is_sys) for name, _, is_sys in seeded_categories}
@@ -130,6 +131,18 @@ def test_alembic_upgrade_head_creates_loans_and_commits(tmp_path: Path, monkeypa
     assert parent_by_name.get("Fees & Admin") == "Finance"
     assert parent_by_name.get("Debt & Loans") == "Finance"
     assert system_by_name.get("Debt & Loans") is True
+
+    # Verify 0022 -> 0021 downgrade removes credit_limit cleanly
+    alembic_command.downgrade(cfg, "0021_receipt_document_type")
+    with sqlite3.connect(db_file) as conn:
+        v21 = conn.execute("SELECT version_num FROM alembic_version").fetchone()
+        v21_account_cols = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(accounts)").fetchall()
+        }
+    assert v21 is not None
+    assert v21[0] == "0021_receipt_document_type"
+    assert "credit_limit" not in v21_account_cols
 
     # Verify 0021 -> 0020 downgrade removes document_type + index and preserves pre-existing receipts
     alembic_command.downgrade(cfg, "0020_email_ingestion")
@@ -215,9 +228,10 @@ def test_alembic_upgrade_head_creates_loans_and_commits(tmp_path: Path, monkeypa
             "SELECT merchant, document_type FROM receipts"
         ).fetchall()
     assert reup_ver is not None
-    assert reup_ver[0] == "0021_receipt_document_type"
+    assert reup_ver[0] == "0022_account_credit_limit"
     assert "ingested_emails" in reup_tables
     assert "account_number_last4" in reup_account_cols
+    assert "credit_limit" in reup_account_cols
     assert {"order_number", "source_email_message_id", "document_type"}.issubset(reup_receipt_cols)
     assert "ix_receipts_document_type" in reup_receipt_indexes
     assert acc_types["DBS Live Fresh Visa"] == "credit_card"

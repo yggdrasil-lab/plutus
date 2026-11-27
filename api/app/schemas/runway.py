@@ -6,6 +6,17 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 
+class CreditBackstopSummary(BaseModel):
+    total_credit_limit_nzd: float = 0.0
+    total_credit_owed_nzd: float = 0.0
+    total_available_credit_nzd: float = 0.0
+    credit_utilization_pct: float = 0.0
+    backstop_weeks: float = 0.0
+    credit_card_available_nzd: float = 0.0
+    credit_line_available_nzd: float = 0.0
+    account_count: int = 0
+
+
 class RunwayTierBreakdown(BaseModel):
     cash_balance: float
     growth_balance: float
@@ -23,6 +34,7 @@ class RunwayTierBreakdown(BaseModel):
     recurring_weekly_burn: float = 0.0
     this_week_variable_spend: float = 0.0
     tier_labels: dict[str, str] = Field(default_factory=dict)
+    credit_backstop: CreditBackstopSummary = Field(default_factory=CreditBackstopSummary)
 
 
 class RunwayResponse(BaseModel):

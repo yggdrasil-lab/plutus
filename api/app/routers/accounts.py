@@ -17,6 +17,7 @@ from app.schemas import (
     AssetSnapshotRead,
 )
 from app.services.account_payouts import build_account_reads
+from app.services.credit_telemetry import CreditFxResolutionError
 from app.services.ingestion_service import upsert_account_snapshot
 
 router = APIRouter(prefix="/accounts", tags=["Accounts"])
@@ -32,7 +33,13 @@ def list_accounts(
     if is_active is not None:
         stmt = stmt.where(Account.is_active == is_active)
     accounts = list(db.scalars(stmt.order_by(Account.tier, Account.name)).all())
-    return build_account_reads(db, accounts)
+    try:
+        return build_account_reads(db, accounts)
+    except CreditFxResolutionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
 
 
 @router.post("", response_model=AccountRead, status_code=status.HTTP_201_CREATED)
@@ -43,9 +50,18 @@ def create_account(
     """Create a new financial account or asset bucket."""
     account = Account(**payload.model_dump())
     db.add(account)
+    db.flush()
+    try:
+        dto = build_account_reads(db, [account])[0]
+    except CreditFxResolutionError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
     db.commit()
     db.refresh(account)
-    return account
+    return dto
 
 
 @router.get("/{account_id}", response_model=AccountRead)
@@ -54,7 +70,13 @@ def get_account(account_id: int, db: Session = Depends(get_db)):
     account = db.get(Account, account_id)
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
-    return build_account_reads(db, [account])[0]
+    try:
+        return build_account_reads(db, [account])[0]
+    except CreditFxResolutionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
 
 
 @router.patch("/{account_id}", response_model=AccountRead)
@@ -63,7 +85,7 @@ def update_account(
     payload: AccountUpdate,
     db: Session = Depends(get_db),
 ):
-    """Update editable account metadata such as tier, account_type, name, or expected return."""
+    """Update editable account metadata such as tier, account_type, name, credit_limit, or expected return."""
     account = db.get(Account, account_id)
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
@@ -85,13 +107,25 @@ def update_account(
                 )
             setattr(account, field, val)
 
+    if "credit_limit" in payload.model_fields_set:
+        account.credit_limit = payload.credit_limit
+
     if "account_number_last4" in payload.model_fields_set:
         raw_last4 = payload.account_number_last4
         account.account_number_last4 = raw_last4.strip()[:64] if raw_last4 and raw_last4.strip() else None
 
+    db.flush()
+    try:
+        dto = build_account_reads(db, [account])[0]
+    except CreditFxResolutionError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
     db.commit()
     db.refresh(account)
-    return build_account_reads(db, [account])[0]
+    return dto
 
 
 @router.post("/{account_id}/snapshots", response_model=AssetSnapshotRead, status_code=status.HTTP_201_CREATED)

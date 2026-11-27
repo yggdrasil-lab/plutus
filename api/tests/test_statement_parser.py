@@ -285,10 +285,12 @@ CLOSING BALANCE 117.78
         result = parse_dbs_statement(page_text, detected_inst="DBS Bank")
         self.assertEqual(result.institution, "DBS Bank")
         self.assertEqual(result.account_name, "DBS Cashline")
+        self.assertEqual(result.account_type, "credit_line")
         self.assertEqual(result.account_number_masked, "082-300303-8")
         self.assertEqual(result.currency, "SGD")
         self.assertEqual(result.opening_balance, 228.42)
-        self.assertEqual(result.closing_balance, 117.78)
+        self.assertEqual(result.closing_balance, -117.78)
+        self.assertFalse(result.closing_balance_is_credit)
         self.assertEqual(result.transaction_count, 4)
         self.assertEqual(result.transactions[0].amount, 228.42)
         self.assertEqual(result.transactions[1].amount, -0.68)
@@ -314,16 +316,141 @@ REF NO 12345
         result = parse_statement_text(page_text, institution="auto")
         self.assertEqual(result.institution, "DBS Bank")
         self.assertEqual(result.account_name, "Live Fresh Dbs Visa Paywave Platinum Card")
+        self.assertEqual(result.account_type, "credit_card")
         self.assertEqual(result.account_number_masked, "4111 1111 1111 1001")
         self.assertEqual(result.currency, "SGD")
         self.assertEqual(result.opening_balance, 347.28)
-        self.assertEqual(result.closing_balance, 377.26)
+        self.assertEqual(result.closing_balance, -377.26)
+        self.assertFalse(result.closing_balance_is_credit)
         self.assertEqual(result.transaction_count, 5)
         self.assertEqual(result.transactions[0].amount, 347.15)
         self.assertEqual(result.transactions[1].amount, 0.13)
         self.assertEqual(result.transactions[2].amount, 0.65)
         self.assertEqual(result.transactions[3].amount, -17.99)
         self.assertEqual(result.transactions[4].amount, -23.98)
+
+    def test_credit_statement_cr_overpayment_and_nz_credit_card_sign_normalization(self):
+        """Verify CR overpayments remain positive and NZ credit cards ignore available credit lines."""
+        dbs_card_cr = """DBS Bank Ltd
+SYNTHETIC PLATINUM CARD NO: 4111 1111 1111 2002
+STATEMENT DATE 12 Nov 2026
+PREVIOUS BALANCE 50.00
+TOTAL: 120.00 CR
+10 NOV BILL PAYMENT 170.00 CR
+"""
+        dbs_res = parse_dbs_statement(dbs_card_cr, detected_inst="DBS Bank")
+        self.assertEqual(dbs_res.account_type, "credit_card")
+        self.assertEqual(dbs_res.closing_balance, 120.00)
+        self.assertTrue(dbs_res.closing_balance_is_credit)
+
+        cashline_cr = """DBS Bank Ltd
+CASHLINE ACCOUNT NO: 082-300303-9
+STATEMENT PRINTED ON 20 Nov 2026
+Total Outstanding Balance S$45.50 CR
+"""
+        cashline_res = parse_dbs_statement(cashline_cr, detected_inst="DBS Bank")
+        self.assertEqual(cashline_res.account_type, "credit_line")
+        self.assertEqual(cashline_res.closing_balance, 45.50)
+        self.assertTrue(cashline_res.closing_balance_is_credit)
+
+        nz_card_text = """NZ Synthetic Bank
+Low Rate Visa
+Card Number: 4111-XXXX-XXXX-1001
+Statement period 01 Nov 2026 - 30 Nov 2026
+Your available credit is $4,200.00 as at the closing date of this statement
+Closing balance: $800.00
+05 Nov 2026 GROCERY MARKET 120.00
+"""
+        nz_card_res = parse_nz_statement(nz_card_text, institution="ANZ")
+        self.assertEqual(nz_card_res.account_type, "credit_card")
+        self.assertEqual(nz_card_res.closing_balance, -800.00)
+        self.assertFalse(nz_card_res.closing_balance_is_credit)
+
+        nz_card_cr_text = """NZ Synthetic Bank
+Low Rate Visa
+Card Number: 4111-XXXX-XXXX-1001
+Statement period 01 Nov 2026 - 30 Nov 2026
+Your available credit is $5,125.00 as at the closing date of this statement
+Closing balance: $125.00 CR
+"""
+        nz_card_cr_res = parse_nz_statement(nz_card_cr_text, institution="ANZ")
+        self.assertEqual(nz_card_cr_res.account_type, "credit_card")
+        self.assertEqual(nz_card_cr_res.closing_balance, 125.00)
+        self.assertTrue(nz_card_cr_res.closing_balance_is_credit)
+
+    def test_commit_parsed_statement_normalizes_revolving_credit_snapshot_sign(self):
+        """Verify commit_parsed_statement negates non-CR positive balances on revolving credit accounts."""
+        from app.models import Account, AssetSnapshot
+        from app.services.ledger_entry import StatementUploadInput, process_statement_upload
+
+        engine = create_engine(
+            "sqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(bind=engine)
+        SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+        with SessionLocal() as db:
+            card_acc = Account(
+                name="NZ Synthetic Visa",
+                account_type="credit_card",
+                tier="cash",
+                institution="ANZ",
+                currency="NZD",
+                credit_limit=5000.0,
+                is_active=True,
+            )
+            db.add(card_acc)
+            db.commit()
+            db.refresh(card_acc)
+
+            # Manual positive closing_balance override without CR gets negated at commit
+            csv_bytes = b"Date,Payee,Amount\n2026-11-10,Coffee Shop,-12.50\n"
+            res = process_statement_upload(
+                db,
+                StatementUploadInput(
+                    filename="card.csv",
+                    content=csv_bytes,
+                    institution="ANZ",
+                    commit=True,
+                    account_id=card_acc.id,
+                    closing_balance=650.0,
+                ),
+            )
+            self.assertTrue(res.committed)
+            self.assertTrue(res.snapshot_upserted)
+            snap = db.query(AssetSnapshot).filter(AssetSnapshot.account_id == card_acc.id).one()
+            self.assertEqual(float(snap.balance), -650.0)
+
+            # Auto-created Cashline account receives account_type='credit_line' and negative balance
+            cashline_text = (
+                "DBS Bank Ltd\n"
+                "CASHLINE ACCOUNT NO: 082-300303-1\n"
+                "STATEMENT PRINTED ON 20 Nov 2026\n"
+                "Total Outstanding Balance S$210.00\n"
+                "19 Nov 2026 INTEREST CHARGED 10.00\n"
+            )
+
+            def fake_cashline_pdf(_b: bytes) -> PdfDocumentContent:
+                return PdfDocumentContent(pages=(PdfPageContent(text=cashline_text),))
+
+            cashline_res = process_statement_upload(
+                db,
+                StatementUploadInput(filename="cashline.pdf", content=b"%PDF", commit=True),
+                pdf_extractor=fake_cashline_pdf,
+            )
+            created_cashline = db.get(Account, cashline_res.account_id)
+            self.assertIsNotNone(created_cashline)
+            self.assertEqual(created_cashline.account_type, "credit_line")
+            cashline_snap = (
+                db.query(AssetSnapshot)
+                .filter(AssetSnapshot.account_id == created_cashline.id)
+                .one()
+            )
+            self.assertEqual(float(cashline_snap.balance), -210.0)
+
+        Base.metadata.drop_all(bind=engine)
 
     def test_pdf_extraction_fails_loudly(self):
         """Injected and default PDF extractors must raise PdfExtractionError on failure."""

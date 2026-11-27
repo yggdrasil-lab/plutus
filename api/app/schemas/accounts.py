@@ -6,7 +6,17 @@ from typing import Any, Optional
 from pydantic import BaseModel, Field, field_validator
 
 
-VALID_ACCOUNT_TYPES = {"checking", "savings", "brokerage", "kiwisaver", "crypto", "credit_card", "private_note"}
+REVOLVING_CREDIT_ACCOUNT_TYPES = frozenset({"credit_card", "credit_line"})
+VALID_ACCOUNT_TYPES = {
+    "checking",
+    "savings",
+    "brokerage",
+    "kiwisaver",
+    "crypto",
+    "credit_card",
+    "credit_line",
+    "private_note",
+}
 VALID_ACCOUNT_TIERS = {"cash", "growth", "locked"}
 
 
@@ -36,11 +46,12 @@ def normalize_account_tier(value: Any) -> Optional[str]:
 
 class AccountBase(BaseModel):
     name: str = Field(..., max_length=100)
-    account_type: str = Field(..., description="checking, savings, brokerage, kiwisaver, crypto, credit_card, private_note")
+    account_type: str = Field(..., description="checking, savings, brokerage, kiwisaver, crypto, credit_card, credit_line, private_note")
     tier: str = Field(default="cash", description="cash, growth, locked")
     institution: str = Field(..., max_length=100)
     currency: str = Field(default="NZD", max_length=3)
     expected_annual_return: float = Field(default=0.0, ge=0.0, le=1.0)
+    credit_limit: Optional[float] = Field(default=None, gt=0.0)
     is_active: bool = True
     account_number_last4: Optional[str] = Field(default=None, max_length=64)
 
@@ -67,10 +78,11 @@ class AccountCreate(AccountBase):
 
 class AccountUpdate(BaseModel):
     name: Optional[str] = Field(default=None, max_length=100)
-    account_type: Optional[str] = Field(default=None, description="checking, savings, brokerage, kiwisaver, crypto, credit_card, private_note")
+    account_type: Optional[str] = Field(default=None, description="checking, savings, brokerage, kiwisaver, crypto, credit_card, credit_line, private_note")
     tier: Optional[str] = Field(default=None, description="cash, growth, locked")
     institution: Optional[str] = Field(default=None, max_length=100)
     expected_annual_return: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    credit_limit: Optional[float] = Field(default=None, gt=0.0)
     is_active: Optional[bool] = None
     account_number_last4: Optional[str] = Field(default=None, max_length=64)
 
@@ -105,6 +117,12 @@ class AccountRead(AccountBase):
     payout_count: int = 0
     first_payout_date: Optional[date] = None
     last_payout_date: Optional[date] = None
+    credit_limit_nzd: Optional[float] = None
+    credit_owed_native: Optional[float] = None
+    credit_owed_nzd: Optional[float] = None
+    available_credit_native: Optional[float] = None
+    available_credit_nzd: Optional[float] = None
+    credit_utilization_pct: Optional[float] = None
     created_at: datetime
     updated_at: datetime
 
@@ -115,7 +133,7 @@ class AccountRead(AccountBase):
 class InstitutionInfo(BaseModel):
     name: str = Field(..., max_length=100)
     default_tier: str = Field(default="cash", description="cash, growth, locked")
-    default_type: str = Field(default="checking", description="checking, savings, brokerage, kiwisaver, crypto, credit_card, private_note")
+    default_type: str = Field(default="checking", description="checking, savings, brokerage, kiwisaver, crypto, credit_card, credit_line, private_note")
     currency: str = Field(default="NZD", max_length=3)
 
 

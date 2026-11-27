@@ -33,11 +33,12 @@ class Account(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     name: Mapped[str] = mapped_column(String(100), nullable=False)
-    account_type: Mapped[str] = mapped_column(String(30), nullable=False)  # checking, savings, brokerage, kiwisaver, crypto, credit_card, private_note
+    account_type: Mapped[str] = mapped_column(String(30), nullable=False)  # checking, savings, brokerage, kiwisaver, crypto, credit_card, credit_line, private_note
     tier: Mapped[str] = mapped_column(String(20), nullable=False, default="cash")  # cash, growth, locked
     institution: Mapped[str] = mapped_column(String(100), nullable=False)
     currency: Mapped[str] = mapped_column(String(3), nullable=False, default="NZD")
     expected_annual_return: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    credit_limit: Mapped[Optional[float]] = mapped_column(Numeric(18, 2), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     external_provider: Mapped[Optional[str]] = mapped_column(String(30), nullable=True, index=True)
     external_account_id: Mapped[Optional[str]] = mapped_column(String(150), nullable=True, index=True)

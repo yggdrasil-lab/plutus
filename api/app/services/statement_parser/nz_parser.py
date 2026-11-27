@@ -36,6 +36,10 @@ _IGNORE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^(?:Payment\s*dates\s*displayed|Low\s*Rate\s*Visa)", re.I),
     re.compile(r"^(?:APAutomaticPayment|ATAutomaticTellerMachine|ANZ\s*Bank|ASB\s*Bank|Bank\s*of\s*New\s*Zealand)", re.I),
 )
+_NZ_CREDIT_CARD_RE = re.compile(
+    r"\b(?:credit\s+card|credit\s+limit|minimum\s+payment|low\s+rate\s+visa|visa\s+platinum|mastercard|card\s+number|card\s+no\.?)\b",
+    re.I,
+)
 
 
 def _parse_date_formats(raw: str, formats: tuple[str, ...]) -> Optional[date]:
@@ -114,8 +118,8 @@ def _extract_statement_period(full_text: str) -> tuple[Optional[date], Optional[
     return start_date, end_date
 
 
-def _extract_nz_balances(full_text: str) -> tuple[Optional[float], Optional[float]]:
-    """Extract opening and closing balances from NZ statement summary lines."""
+def _extract_nz_balances(full_text: str) -> tuple[Optional[float], Optional[float], bool]:
+    """Extract opening balance, closing balance, and CR marker from NZ statement summary lines."""
     opening_balance: Optional[float] = None
     open_match = re.search(
         r"(?:Opening\s*balance|Balance\s*brought\s*forward)[\s:]*\$?([0-9,]+\.[0-9]{2})",
@@ -126,17 +130,22 @@ def _extract_nz_balances(full_text: str) -> tuple[Optional[float], Optional[floa
         opening_balance = float(open_match.group(1).replace(",", ""))
 
     closing_patterns = (
-        re.compile(r"Totals\s*at\s*end\s*of\s*period\s+\$?[0-9,]+\.[0-9]{2}\s+\$?[0-9,]+\.[0-9]{2}\s+\$?([0-9,]+\.[0-9]{2})", re.I),
-        re.compile(r"available\s+credit\s+is\s+\$?([0-9,]+\.[0-9]{2})\s+as\s+at\s+the\s+closing", re.I),
-        re.compile(r"(?:closing|ending)\s*balance[\s:]*\$?([0-9,]+\.[0-9]{2})", re.I),
+        re.compile(
+            r"Totals\s*at\s*end\s*of\s*period\s+\$?[0-9,]+\.[0-9]{2}\s+\$?[0-9,]+\.[0-9]{2}\s+\$?([0-9,]+\.[0-9]{2})(\s*CR\b)?",
+            re.I,
+        ),
+        re.compile(r"(?:closing|ending|new)\s*balance[\s:]*\$?([0-9,]+\.[0-9]{2})(\s*CR\b)?", re.I),
+        re.compile(r"(?:total\s+amount\s+due|total\s+owing)[\s:]*\$?([0-9,]+\.[0-9]{2})(\s*CR\b)?", re.I),
     )
     closing_balance: Optional[float] = None
+    closing_balance_is_credit = False
     for pattern in closing_patterns:
         match = pattern.search(full_text)
         if match:
             closing_balance = float(match.group(1).replace(",", ""))
+            closing_balance_is_credit = bool(match.lastindex and match.lastindex >= 2 and match.group(2))
             break
-    return opening_balance, closing_balance
+    return opening_balance, closing_balance, closing_balance_is_credit
 
 
 def _parse_unbordered_tx_date(
@@ -249,7 +258,8 @@ def parse_nz_statement(
     """Parse New Zealand and generic bank statement text plus optional bordered tables."""
     account_number_masked, account_name = _extract_nz_account_metadata(full_text)
     start_date, end_date = _extract_statement_period(full_text)
-    opening_balance, closing_balance = _extract_nz_balances(full_text)
+    opening_balance, closing_balance, closing_balance_is_credit = _extract_nz_balances(full_text)
+    is_credit_card = bool(_NZ_CREDIT_CARD_RE.search(full_text))
 
     parsed_transactions = _parse_table_transactions(tables)
     if not parsed_transactions:
@@ -262,6 +272,9 @@ def parse_nz_statement(
         if closing_balance is None and tracked_bal is not None:
             closing_balance = tracked_bal
 
+    if is_credit_card and closing_balance is not None and closing_balance > 0.0 and not closing_balance_is_credit:
+        closing_balance = -closing_balance
+
     if parsed_transactions:
         start_date = start_date or min(tx.transaction_date for tx in parsed_transactions)
         end_date = end_date or max(tx.transaction_date for tx in parsed_transactions)
@@ -270,10 +283,12 @@ def parse_nz_statement(
         institution=institution,
         account_number_masked=account_number_masked,
         account_name=account_name,
+        account_type="credit_card" if is_credit_card else None,
         start_date=start_date,
         end_date=end_date,
         opening_balance=opening_balance,
         closing_balance=closing_balance,
+        closing_balance_is_credit=closing_balance_is_credit if is_credit_card else False,
         transaction_count=len(parsed_transactions),
         transactions=parsed_transactions,
         currency=_detect_nz_currency(full_text, institution),

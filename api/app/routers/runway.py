@@ -3,11 +3,12 @@
 from datetime import date
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.schemas import (
+    CreditBackstopSummary,
     RunwayAiSynthesisRead,
     RunwayResponse,
     RunwayScenarioRequest,
@@ -17,6 +18,7 @@ from app.schemas import (
 )
 from app.services.ai_gateway import AiGateway, get_ai_gateway
 from app.services.category_taxonomy import get_active_categories
+from app.services.credit_telemetry import CreditFxResolutionError
 from app.services.llm_synthesizer import synthesize_runway_scenario_llm
 from app.services.runway import get_runway_snapshot, simulate_runway_scenario
 
@@ -35,7 +37,13 @@ def get_current_runway(
     db: Session = Depends(get_db),
 ):
     """Calculate current financial runway in weeks based on asset balances, burn rate, and growth."""
-    snapshot = get_runway_snapshot(db, as_of=as_of, annual_return=annual_return)
+    try:
+        snapshot = get_runway_snapshot(db, as_of=as_of, annual_return=annual_return)
+    except CreditFxResolutionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
     breakdown = RunwayTierBreakdown(
         cash_balance=snapshot.cash_balance,
         growth_balance=snapshot.growth_balance,
@@ -53,6 +61,7 @@ def get_current_runway(
         recurring_weekly_burn=snapshot.recurring_weekly_burn,
         this_week_variable_spend=snapshot.this_week_variable_spend,
         tier_labels=snapshot.tier_labels.as_dict(),
+        credit_backstop=CreditBackstopSummary(**snapshot.credit_backstop.as_dict()),
     )
     return RunwayResponse(
         as_of_date=snapshot.as_of_date,

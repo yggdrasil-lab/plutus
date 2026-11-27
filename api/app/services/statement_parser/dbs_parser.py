@@ -85,9 +85,25 @@ def _extract_first_float(patterns: tuple[re.Pattern[str], ...], full_text: str) 
     return None
 
 
+def _extract_credit_closing_balance(
+    patterns: tuple[re.Pattern[str], ...],
+    full_text: str,
+) -> tuple[Optional[float], bool]:
+    """Extract signed closing balance for DBS credit products (negative when owed, positive when CR)."""
+    for pattern in patterns:
+        match = pattern.search(full_text)
+        if match:
+            amount = float(match.group(1).replace(",", ""))
+            is_credit = bool(match.lastindex and match.lastindex >= 2 and match.group(2))
+            if is_credit:
+                return amount, True
+            return (-amount if amount > 0.0 else 0.0), False
+    return None, False
+
+
 def _extract_dbs_cashline_metadata(
     full_text: str,
-) -> tuple[Optional[str], Optional[date], Optional[float], Optional[float]]:
+) -> tuple[Optional[str], Optional[date], Optional[float], Optional[float], bool]:
     """Extract account number, statement date, opening, and closing balance for Cashline."""
     acc_m = re.search(r"CASHLINE\s+ACCOUNT\s+NO[.:\s]*\n?\s*([0-9-]+)", full_text, re.I)
     if not acc_m:
@@ -104,14 +120,17 @@ def _extract_dbs_cashline_metadata(
         (re.compile(r"PREVIOUS\s+BALANCE\s+([0-9,]+\.[0-9]{2})", re.I),),
         full_text,
     )
-    closing_balance = _extract_first_float(
+    closing_balance, closing_balance_is_credit = _extract_credit_closing_balance(
         (
-            re.compile(r"Total\s+Outstanding\s+Balance\s*\n?\s*S?\$?\s*([0-9,]+\.[0-9]{2})", re.I),
-            re.compile(r"CLOSING\s+BALANCE\s+([0-9,]+\.[0-9]{2})", re.I),
+            re.compile(
+                r"Total\s+Outstanding\s+Balance\s*\n?\s*S?\$?\s*([0-9,]+\.[0-9]{2})(\s*CR\b)?",
+                re.I,
+            ),
+            re.compile(r"CLOSING\s+BALANCE\s+([0-9,]+\.[0-9]{2})(\s*CR\b)?", re.I),
         ),
         full_text,
     )
-    return account_number_masked, stmt_date, opening_balance, closing_balance
+    return account_number_masked, stmt_date, opening_balance, closing_balance, closing_balance_is_credit
 
 
 def _parse_cashline_line(
@@ -145,7 +164,7 @@ def _parse_cashline_line(
 def _parse_dbs_cashline(full_text: str, detected_inst: str = "DBS Bank") -> StatementParseResult:
     """Parse DBS Cashline account statements."""
     currency = "SGD"
-    account_number_masked, stmt_date, opening_balance, closing_balance = (
+    account_number_masked, stmt_date, opening_balance, closing_balance, closing_balance_is_credit = (
         _extract_dbs_cashline_metadata(full_text)
     )
     lines = [line.strip() for line in full_text.splitlines() if line.strip()]
@@ -161,10 +180,12 @@ def _parse_dbs_cashline(full_text: str, detected_inst: str = "DBS Bank") -> Stat
         institution=detected_inst,
         account_number_masked=account_number_masked,
         account_name="DBS Cashline",
+        account_type="credit_line",
         start_date=min((tx.transaction_date for tx in parsed_transactions), default=stmt_date),
         end_date=stmt_date or max((tx.transaction_date for tx in parsed_transactions), default=None),
         opening_balance=opening_balance,
         closing_balance=closing_balance,
+        closing_balance_is_credit=closing_balance_is_credit,
         transaction_count=len(parsed_transactions),
         transactions=parsed_transactions,
         currency=currency,
@@ -173,7 +194,7 @@ def _parse_dbs_cashline(full_text: str, detected_inst: str = "DBS Bank") -> Stat
 
 def _extract_dbs_card_metadata(
     full_text: str,
-) -> tuple[str, Optional[str], Optional[date], Optional[float], Optional[float]]:
+) -> tuple[str, Optional[str], Optional[date], Optional[float], Optional[float], bool]:
     """Extract card name, masked card number, statement date, and balances."""
     card_name_m = re.search(r"([A-Z0-9 ]+CARD)\s+NO\.?:", full_text, re.I)
     account_name = card_name_m.group(1).strip().title() if card_name_m else "DBS Credit Card"
@@ -202,15 +223,15 @@ def _extract_dbs_card_metadata(
         (re.compile(r"PREVIOUS\s+BALANCE\s+([0-9,]+\.[0-9]{2})", re.I),),
         full_text,
     )
-    closing_balance = _extract_first_float(
+    closing_balance, closing_balance_is_credit = _extract_credit_closing_balance(
         (
-            re.compile(r"TOTAL:\s*([0-9,]+\.[0-9]{2})", re.I),
-            re.compile(r"GRAND\s+TOTAL\s+FOR\s+ALL\s+CARD\s+ACCOUNTS:\s*([0-9,]+\.[0-9]{2})", re.I),
-            re.compile(r"TOTAL\s+OUTSTANDING\s+BALANCE\s*\n?\s*\$?\s*([0-9,]+\.[0-9]{2})", re.I),
+            re.compile(r"TOTAL:\s*([0-9,]+\.[0-9]{2})(\s*CR\b)?", re.I),
+            re.compile(r"GRAND\s+TOTAL\s+FOR\s+ALL\s+CARD\s+ACCOUNTS:\s*([0-9,]+\.[0-9]{2})(\s*CR\b)?", re.I),
+            re.compile(r"TOTAL\s+OUTSTANDING\s+BALANCE\s*\n?\s*\$?\s*([0-9,]+\.[0-9]{2})(\s*CR\b)?", re.I),
         ),
         full_text,
     )
-    return account_name, account_number_masked, stmt_date, opening_balance, closing_balance
+    return account_name, account_number_masked, stmt_date, opening_balance, closing_balance, closing_balance_is_credit
 
 
 def _resolve_card_tx_date(
@@ -296,9 +317,14 @@ def _parse_dbs_card_lines(
 def _parse_dbs_card(full_text: str, detected_inst: str = "DBS Bank") -> StatementParseResult:
     """Parse DBS credit card statements."""
     currency = "SGD"
-    account_name, account_number_masked, stmt_date, opening_balance, closing_balance = (
-        _extract_dbs_card_metadata(full_text)
-    )
+    (
+        account_name,
+        account_number_masked,
+        stmt_date,
+        opening_balance,
+        closing_balance,
+        closing_balance_is_credit,
+    ) = _extract_dbs_card_metadata(full_text)
     year = stmt_date.year if stmt_date else datetime.now().year
     lines = [line.strip() for line in full_text.splitlines() if line.strip()]
     parsed_transactions = _parse_dbs_card_lines(lines, year, stmt_date, currency)
@@ -307,10 +333,12 @@ def _parse_dbs_card(full_text: str, detected_inst: str = "DBS Bank") -> Statemen
         institution=detected_inst,
         account_number_masked=account_number_masked,
         account_name=account_name,
+        account_type="credit_card",
         start_date=min((tx.transaction_date for tx in parsed_transactions), default=stmt_date),
         end_date=stmt_date or max((tx.transaction_date for tx in parsed_transactions), default=None),
         opening_balance=opening_balance,
         closing_balance=closing_balance,
+        closing_balance_is_credit=closing_balance_is_credit,
         transaction_count=len(parsed_transactions),
         transactions=parsed_transactions,
         currency=currency,
